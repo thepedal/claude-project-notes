@@ -36,27 +36,69 @@ going through the normalise/de-normalise step.
 
 ## 2. `ParameterDecl` MinValue must be ≥ 0
 
-ReBuzz validates parameter declarations at load time. A negative `MinValue`
-causes an `Invalid MinValue` exception during DLL scanning and the machine
-silently fails to appear in the browser — no obvious error is surfaced to the
-user.
+ReBuzz validates parameter declarations at load time. In older builds
+(pre-1819) a negative `MinValue` caused an `Invalid MinValue` exception
+during DLL scanning and the machine silently failed to appear in the browser.
 
-Parameters that represent negative dB values (threshold, EQ gain, etc.) must
-be stored as a positive offset with the conversion done in a property or helper:
+**Behaviour change in 1819-preview:** the machine loads successfully with a
+negative `MinValue`, but ReBuzz silently **offsets the stored parameter range**
+to make it non-negative. The property setter receives values in the range
+`0..(MaxValue − MinValue)` rather than `MinValue..MaxValue`. This is
+worse than the previous hard failure because:
+
+- The machine appears to work — no error is surfaced.
+- All DSP formulas that treat the raw property value as the actual dB value
+  compute the wrong result (wrong sign and magnitude).
+- The GUI display shows wrong values for the same reason.
+- The `DefValue` offset shifts too: a `DefValue = 0` with `MinValue = -48`
+  stores `48` as the default, not `0` — so a "flat" default is stored as a
+  large positive integer.
+
+**Concrete example from Pedal EQ v1.2:**
 
 ```csharp
-// WRONG — machine fails to load
-[ParameterDecl(MinValue = -60, MaxValue = 0, DefValue = -18)]
-public int Threshold { get; set; }
+// WRONG — MinValue=-48 causes ReBuzz to offset stored range to 0-96.
+// Setter receives 18 when user sets "-15.0 dB" (which is index 18 in the
+// 0-96 range). DSP computes 18 * 0.5 = +9.0 dB — applying a boost where
+// the user wanted a cut.
+[ParameterDecl(MinValue = -48, MaxValue = 48, DefValue = 0)]
+public int LSGain { get; set; } = 0;
 
-// CORRECT — store as dB below 0 dBFS (0 = 0 dBFS, 60 = −60 dBFS)
-[ParameterDecl(MinValue = 0, MaxValue = 60, DefValue = 18)]
-public int Threshold { get; set; }
-
-float ThresholdDb => -(float)Threshold;   // convert for DSP use
+double gainDb = LSGain * 0.5;   // WRONG: 18 * 0.5 = +9.0 dB, not -15.0 dB
 ```
 
-The same constraint applies to `DefValue` — it must be within [MinValue, MaxValue].
+**Correct pattern — non-negative range with explicit offset in DSP:**
+
+```csharp
+// CORRECT — MinValue=0, MaxValue=96, DefValue=48 (flat point).
+// Setter receives 18; formula (18-48)*0.5 = -15.0 dB. Correct.
+[ParameterDecl(
+    MinValue          = 0,
+    MaxValue          = 96,
+    DefValue          = 48,      // 48 = 0.0 dB (the flat/zero point)
+    ValueDescriptions = new[]    // 97 strings: index 0 = "-24.0 dB",
+    {                            //             index 48 = "0.0 dB",
+        "-24.0 dB", "-23.5 dB", //             index 96 = "+24.0 dB"
+        // ...
+        "0.0 dB",
+        // ...
+        "+24.0 dB"
+    })]
+public int LSGain { get; set; } = 48;   // initialise to flat
+
+double gainDb = (LSGain - 48) * 0.5;   // CORRECT: (18-48)*0.5 = -15.0 dB
+```
+
+The same offset applies **everywhere** the raw value is used: DSP coefficient
+calculations, output gain ramp (`(OutGain - 48) * 0.025f`), GUI display
+formulas, and `allFlat` fast-path checks (flat is `value == 48`, not
+`value == 0`).
+
+The `ValueDescriptions` array content does not change — it was always indexed
+0–96. Only the ParameterDecl min/max/default and the conversion formula change.
+
+The same constraint applies to `DefValue` — it must be within
+`[MinValue, MaxValue]`.
 
 ---
 

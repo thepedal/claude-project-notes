@@ -109,3 +109,57 @@ A space in `AssemblyName` produces a space in the list:
 identification, but the browser entry comes from the filename. Mismatched
 values cause the user to see different names in different places — keep
 them aligned unless there's a deliberate reason not to.
+
+---
+
+## 3. `<UseWPF>true</UseWPF>` — required for any machine with a GUI
+
+Any managed machine DLL that includes a WPF GUI class must add
+`<UseWPF>true</UseWPF>` to its `<PropertyGroup>`. Without it the .NET SDK
+does not pull in the WPF reference assemblies, and every WPF type
+(`UserControl`, `TextBlock`, `Brush`, `SolidColorBrush`, `FontFamily`,
+`DispatcherTimer`, `Freezable`, `Grid`, `StackPanel`, `Separator`, etc.) is
+invisible to the compiler, producing a wall of CS0234/CS0246 errors.
+
+```xml
+<PropertyGroup>
+  <TargetFramework>net10.0-windows</TargetFramework>   <!-- -windows suffix required -->
+  <UseWPF>true</UseWPF>
+  <!-- ... other properties ... -->
+</PropertyGroup>
+```
+
+The `net10.0-windows` (or any `-windows` suffixed) `TargetFramework` is also
+required — `<UseWPF>` has no effect on non-Windows TFMs.
+
+### 3.1 Mandatory csproj checklist for GUI machines
+
+GUI machines must satisfy **all** of the following in their `<PropertyGroup>`:
+
+```xml
+<TargetFramework>net10.0-windows</TargetFramework>
+<UseWPF>true</UseWPF>
+<DebugType>none</DebugType>
+<DebugSymbols>false</DebugSymbols>
+<GenerateDependencyFile>false</GenerateDependencyFile>
+```
+
+The last three are the standard per-machine rules from §1.2. `UseWPF` is the
+additional requirement for GUI machines.
+
+### 3.2 WPF types are NOT copied to the output folder
+
+WPF assemblies (`PresentationCore.dll`, `PresentationFramework.dll`,
+`WindowsBase.dll`) are part of the Windows .NET runtime and are present on
+every machine that can run ReBuzz. They must **not** be deployed alongside
+the machine DLL. Ensure all WPF `<Reference>` items (if any are explicit)
+carry `<Private>false</Private>`, and that the SDK-implicit WPF references
+are not being copied. The default `<UseWPF>true</UseWPF>` behaviour handles
+this correctly without any extra configuration.
+
+### 3.3 Easy to lose across uploads
+
+`<UseWPF>true</UseWPF>` is the single most common property to be lost when
+an older version of a `.csproj` is uploaded for editing. If a previously
+working GUI machine suddenly produces CS0234/CS0246 errors after a csproj
+change, check for this property first.

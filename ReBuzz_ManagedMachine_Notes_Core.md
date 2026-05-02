@@ -1,9 +1,10 @@
 # ReBuzz Managed Machine Development — Core Notes
 
 Source: ReBuzz 1817-preview source code + debugging session for Pedal Chord.
+Updated with findings from Pedal EQ v1.2 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
-Sections 1–24 are general findings that apply across managed machines.
+Sections 1–26 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -905,3 +906,209 @@ Reference field reads and writes are atomic in .NET (guaranteed for reference
 types on 32-bit and 64-bit platforms), so the audio thread reading a reference
 that the UI thread is replacing is safe — it will see either the old or the new
 value, never a torn pointer.
+
+---
+
+## 25. `IsStateless = true` hides parameters from the rack entirely
+
+`IsStateless` on a `ParameterDecl` does **not** mean "show in the rack but
+don't record to the pattern sequencer". It removes the parameter from the
+rack UI altogether. The parameter is invisible to the user and cannot be
+adjusted interactively.
+
+**Discovered:** Pedal EQ v1.2. Both `LMQ`/`HMQ` (Q per bell band) and the
+four solo controls were marked `IsStateless = true` on the mistaken belief
+that it would prevent unwanted sequencer writes while keeping the controls
+visible. All six parameters disappeared from the rack. The fix was to remove
+`IsStateless` from every parameter that needs to be user-adjustable.
+
+```csharp
+// WRONG — parameter disappears from the rack entirely
+[ParameterDecl(
+    Name              = "LM Q",
+    MinValue          = 0,
+    MaxValue          = 16,
+    DefValue          = 6,
+    IsStateless       = true,   // ← hides it
+    ValueDescriptions = new[] { "0.3", "0.4", ... })]
+public int LMQ { get; set; } = 6;
+
+// CORRECT — visible and adjustable in the rack
+[ParameterDecl(
+    Name              = "LM Q",
+    MinValue          = 0,
+    MaxValue          = 16,
+    DefValue          = 6,
+    ValueDescriptions = new[] { "0.3", "0.4", ... })]
+public int LMQ { get; set; } = 6;
+```
+
+**Current known use:** there is no documented mechanism for "show in rack but
+do not record automation to the pattern". If you need a parameter that is
+user-adjustable but not automatable, simply leave `IsStateless` off and
+accept that it appears in the pattern editor. `IsStateless` should only be
+used when the parameter is genuinely not intended for user interaction at all.
+
+---
+
+## 26. Machine GUI — `IMachineGUIFactory` discovery pattern
+
+Verified against ReBuzz 1819-preview source (`MachineDLL.cs`,
+`ParameterWindowVM.cs`, `IMachineGUIFactory.cs`, `IMachineGUI.cs`).
+
+### 26.1 How ReBuzz finds and displays a machine GUI
+
+When the parameter window opens for a machine, `MachineDLL.GUIFactory` scans
+the machine's assembly for an exported type implementing
+`BuzzGUI.Interfaces.IMachineGUIFactory`. If found, it instantiates the
+factory and calls `CreateGUI(host)`. The returned `IMachineGUI` is cast as
+`FrameworkElement` and embedded at the **top of the parameter window**
+(`ParameterWindowVM.EmbeddedGUI`).
+
+```
+Machine DLL assembly
+  └── PedalEQGuiFactory : IMachineGUIFactory   ← discovered by assembly scan
+        CreateGUI(host) → PedalEQGui            ← instantiated here
+                                                   Machine = machine set by ParameterWindowVM
+```
+
+The scanning code (from `MachineDLL.cs`):
+```csharp
+foreach (var type in assembly.GetExportedTypes())
+{
+    if (type.GetInterface("BuzzGUI.Interfaces.IMachineGUIFactory") != null)
+        return guiFactory = Activator.CreateInstance(type) as IMachineGUIFactory;
+}
+```
+
+### 26.2 Required interfaces and attributes
+
+**`IMachineGUIFactory`** (in `BuzzGUI.Interfaces`):
+```csharp
+public interface IMachineGUIFactory
+{
+    IMachineGUI CreateGUI(IMachineGUIHost host);
+}
+```
+
+**`[MachineGUIFactoryDecl]`** attribute (in `BuzzGUI.Interfaces`):
+```csharp
+[AttributeUsage(AttributeTargets.Class)]
+public class MachineGUIFactoryDecl : Attribute
+{
+    public bool PreferWindowedGUI;   // false = embedded in param window (default)
+    public bool IsGUIResizable;
+    public bool UseThemeStyles;
+}
+```
+
+**`IMachineGUI`** (in `BuzzGUI.Interfaces`) — has **one member only**:
+```csharp
+public interface IMachineGUI
+{
+    IMachine Machine { get; set; }   // set by ParameterWindowVM after CreateGUI()
+}
+```
+
+There is **no `Close` event** on `IMachineGUI`. Any such event in older
+examples is incorrect.
+
+**`IMachineGUIHost`** (in `BuzzGUI.Interfaces`):
+```csharp
+public interface IMachineGUIHost
+{
+    void DoAction(IAction a);
+}
+```
+
+**`IMachine.ManagedMachine`** — returns the `IBuzzMachine` instance. Cast
+this to your concrete machine class inside the `Machine` setter to get a
+direct reference for reading parameter properties:
+
+```csharp
+public IMachine Machine
+{
+    get => _machine;
+    set
+    {
+        _machine = value;
+        _eq = value?.ManagedMachine as PedalEQMachine;
+    }
+}
+```
+
+### 26.3 Minimal correct implementation
+
+```csharp
+// ── Factory ───────────────────────────────────────────────────────────────
+// PreferWindowedGUI = false (default) → GUI appears embedded in parameter
+// window above the sliders. Set true for a separate floating window.
+
+[MachineGUIFactoryDecl(PreferWindowedGUI = false)]
+public class MyMachineGuiFactory : IMachineGUIFactory
+{
+    public IMachineGUI CreateGUI(IMachineGUIHost host) => new MyMachineGui();
+}
+
+// ── GUI ───────────────────────────────────────────────────────────────────
+// Must be a FrameworkElement (e.g. UserControl) as well as IMachineGUI,
+// because ParameterWindowVM casts it: EmbeddedGUI = MachineGUI as FrameworkElement
+
+public class MyMachineGui : UserControl, IMachineGUI
+{
+    MyMachine   _machine;
+    IMachine    _iMachine;
+    DispatcherTimer _timer;
+
+    public IMachine Machine
+    {
+        get => _iMachine;
+        set { _iMachine = value; _machine = value?.ManagedMachine as MyMachine; }
+    }
+
+    public MyMachineGui()
+    {
+        // Build UI in code (no XAML needed) ...
+
+        _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+        _timer.Tick += (_, __) => Refresh();
+        _timer.Start();
+        Unloaded += (_, __) => _timer.Stop();
+    }
+
+    void Refresh()
+    {
+        if (_machine == null) return;
+        // Read _machine.MyProperty directly — int reads are atomic on x64,
+        // safe to call on the UI thread while audio thread writes them.
+    }
+}
+```
+
+### 26.4 Reading machine state in the GUI
+
+**Preferred:** read properties directly from the cast `IBuzzMachine` reference
+(`_machine.LSGain` etc.). Integer property reads are atomic on x64 — safe
+across the audio/UI thread boundary for display purposes with no locking.
+
+**Avoid:** `IParameter.GetValue(track)` returns the parameter's
+*last-played* value, not the current pvalue slot. For global parameters set
+via the rack this is usually correct, but it is an indirect and fragile path
+compared to reading the property getter directly.
+
+### 26.5 csproj requirement
+
+Any machine DLL that includes a GUI class must add `<UseWPF>true</UseWPF>`
+to its `<PropertyGroup>`. Without it the .NET SDK does not reference the WPF
+assemblies and all WPF types (`UserControl`, `TextBlock`, `Brush`,
+`DispatcherTimer`, etc.) are invisible to the compiler. See Build notes §3.
+
+### 26.6 Things that do NOT work
+
+- **`[MachineGUI(typeof(MyGui))]` attribute on the machine class** — this
+  attribute does not exist in `BuzzGUI.Interfaces` or `Buzz.MachineInterface`.
+- **`public UserControl GUI` property on the machine class** — ReBuzz does
+  not check for this via reflection.
+- **Scanning for `IMachineGUI` directly** — ReBuzz scans for
+  `IMachineGUIFactory`, not `IMachineGUI`. A class that only implements
+  `IMachineGUI` without a factory will not be discovered.
