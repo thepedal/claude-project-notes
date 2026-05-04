@@ -112,54 +112,128 @@ them aligned unless there's a deliberate reason not to.
 
 ---
 
-## 3. `<UseWPF>true</UseWPF>` — required for any machine with a GUI
+## 3. Preset bundle (`.prs.xml`) format
 
-Any managed machine DLL that includes a WPF GUI class must add
-`<UseWPF>true</UseWPF>` to its `<PropertyGroup>`. Without it the .NET SDK
-does not pull in the WPF reference assemblies, and every WPF type
-(`UserControl`, `TextBlock`, `Brush`, `SolidColorBrush`, `FontFamily`,
-`DispatcherTimer`, `Freezable`, `Grid`, `StackPanel`, `Separator`, etc.) is
-invisible to the compiler, producing a wall of CS0234/CS0246 errors.
+A managed machine can ship a preset bank as an XML file alongside the DLL.
+ReBuzz auto-loads it when the machine appears in the browser; presets show
+up under the right-click menu. The format is undocumented but stable —
+this section captures everything needed to write a generator script that
+produces files ReBuzz will accept.
+
+### 3.1 File naming and encoding
+
+- **Extension is `.prs.xml`**, not `.xml`. ReBuzz uses the double extension
+  to distinguish preset bundles from arbitrary XML in the gear folder. A
+  file named `MyMachine_Presets.xml` is silently ignored.
+- **Filename is otherwise free** — common convention is
+  `<MachineName>_Presets.prs.xml` but any base name works.
+- **Place alongside the `.dll`** in the same gear subfolder
+  (`Gear/Generators` or `Gear/Effects`).
+- **Encoding is UTF-8 with BOM.** A BOM-less UTF-8 file may load but
+  non-ASCII preset names can be misread; the safe choice is to write the
+  BOM explicitly. In Python:
+
+  ```python
+  with open(out_path, "w", encoding="utf-8-sig") as f: ...
+  ```
+
+### 3.2 Document structure
 
 ```xml
-<PropertyGroup>
-  <TargetFramework>net10.0-windows</TargetFramework>   <!-- -windows suffix required -->
-  <UseWPF>true</UseWPF>
-  <!-- ... other properties ... -->
-</PropertyGroup>
+<?xml version="1.0" encoding="utf-8"?>
+<PresetDictionary>
+  <Item Key="Preset Name 1">
+    <Preset Machine="My Machine">
+      <Parameters>
+        <Parameter Name="Algorithm" Group="1" Index="0"  Track="0" Value="3" />
+        <Parameter Name="Output"    Group="1" Index="1"  Track="0" Value="100" />
+        <!-- …one Parameter per global, in declaration order… -->
+      </Parameters>
+      <Attributes />
+      <Comment></Comment>
+    </Preset>
+  </Item>
+  <Item Key="Preset Name 2">
+    <!-- … -->
+  </Item>
+</PresetDictionary>
 ```
 
-The `net10.0-windows` (or any `-windows` suffixed) `TargetFramework` is also
-required — `<UseWPF>` has no effect on non-Windows TFMs.
+Field semantics:
 
-### 3.1 Mandatory csproj checklist for GUI machines
+- `Item Key` — preset display name (the string the user sees in the menu).
+  Must be unique within the file.
+- `Preset Machine` — must match `MachineDecl.Name` of the target machine
+  exactly (case-sensitive). Mismatch silently disables loading.
+- `Parameter Name` — must match the `ParameterDecl.Name` exactly.
+- `Parameter Group` — `1` for global parameters (the rack), `2` for track
+  parameters. Presets typically only persist globals (Group 1); per-track
+  values are part of the pattern data, not the preset.
+- `Parameter Index` — the parameter's position within its group, 0-based.
+  Order is the order properties/setters are declared in the source file
+  (see §3.3 for why this matters).
+- `Parameter Track` — `0` for globals. For track parameters, the track
+  index. Most preset files only contain globals so this is always `0`.
+- `Parameter Value` — the raw integer value as it would be stored in the
+  parameter (i.e. the pre-`MinValue`-offset value if the parameter is
+  declared with non-zero `MinValue`).
+- `Attributes` — present but typically empty. Reserved for ReBuzz-internal
+  per-preset attributes.
+- `Comment` — free-form text shown to the user when hovering. Empty is
+  fine.
 
-GUI machines must satisfy **all** of the following in their `<PropertyGroup>`:
+### 3.3 Parameter index stability — the one rule that bites
 
-```xml
-<TargetFramework>net10.0-windows</TargetFramework>
-<UseWPF>true</UseWPF>
-<DebugType>none</DebugType>
-<DebugSymbols>false</DebugSymbols>
-<GenerateDependencyFile>false</GenerateDependencyFile>
+ReBuzz looks up preset parameters by **Index**, not by Name. The Name is
+informational; it's the Index that drives the assignment. This means:
+
+- **Re-ordering parameter declarations breaks every existing preset.** A
+  preset that says `Index=5 Value=100` will write to whichever parameter
+  is now at index 5, regardless of name.
+- **Inserting a new parameter in the middle shifts every later index.**
+  Same problem.
+- **Always append new parameters to the end of the property list.** That
+  way existing preset indices stay valid; presets that don't know about
+  the new params just use the machine's `DefValue` for them.
+
+Keep a comment near the new parameters marking the version they were
+added in, so future edits know the appendage rule:
+
+```csharp
+// ── New in v1.2 — appended at the end so v1.0/v1.1 preset indices stay valid ──
+
+[ParameterDecl(Name = "Glide", MinValue = 0, MaxValue = 127, DefValue = 0)]
+public int Glide { get; set; } = 0;
 ```
 
-The last three are the standard per-machine rules from §1.2. `UseWPF` is the
-additional requirement for GUI machines.
+### 3.4 Generator-script pattern
 
-### 3.2 WPF types are NOT copied to the output folder
+For any non-trivial bank (more than five or six presets), maintain a
+Python (or similar) generator script rather than hand-editing XML.
+A `PARAM_INDEX` dict keyed by parameter name keeps the output in sync
+with the machine's declaration order; per-preset overrides are sparse
+dicts that only mention the parameters that differ from defaults.
 
-WPF assemblies (`PresentationCore.dll`, `PresentationFramework.dll`,
-`WindowsBase.dll`) are part of the Windows .NET runtime and are present on
-every machine that can run ReBuzz. They must **not** be deployed alongside
-the machine DLL. Ensure all WPF `<Reference>` items (if any are explicit)
-carry `<Private>false</Private>`, and that the SDK-implicit WPF references
-are not being copied. The default `<UseWPF>true</UseWPF>` behaviour handles
-this correctly without any extra configuration.
+```python
+PARAM_INDEX = {
+    "Algorithm": 0, "Output": 1, "Voices": 2,
+    # ... declaration-order list ...
+}
 
-### 3.3 Easy to lose across uploads
+PRESETS = {
+    "Hard Lead":   { "Algorithm": 3, "Op1Feedback": 75, ... },
+    "EP Tine":     { "Algorithm": 5, "Op3VelSens":  80, ... },
+    # ...
+}
 
-`<UseWPF>true</UseWPF>` is the single most common property to be lost when
-an older version of a `.csproj` is uploaded for editing. If a previously
-working GUI machine suddenly produces CS0234/CS0246 errors after a csproj
-change, check for this property first.
+# Emit declaration order; missing params fall back to per-machine defaults
+# tracked in DEFAULTS dict.
+```
+
+This way version bumps that add new parameters require only adding the
+new keys to `PARAM_INDEX` and any `OVERRIDES` dicts that want them — the
+rest of the bank stays untouched and continues producing identical XML.
+
+Keep the generator script alongside the source (e.g. `gen_presets.py`)
+but **do not deploy it** — it's not part of what ReBuzz needs at runtime.
+The deployed bundle is just `<Machine>_Presets.prs.xml` + `<Machine>.dll`.
