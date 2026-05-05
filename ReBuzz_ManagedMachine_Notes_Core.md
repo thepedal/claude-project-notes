@@ -2,6 +2,7 @@
 
 Source: ReBuzz 1817-preview source code + debugging session for Pedal Chord.
 Updated with findings from Pedal EQ v1.2 build (ReBuzz 1819-preview).
+Updated with findings from Pedal Dly PCM41 v1.0 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
 Sections 1–26 are general findings that apply across managed machines.
@@ -292,6 +293,49 @@ Type inference rules (from `MachineParameter.Create()`):
 - `int` with `MaxValue > 254` → `ParameterType.Word` (NoValue=65535)
 - `int` with `MaxValue <= 254` → `ParameterType.Byte` (NoValue=255)
 - `int` with `IsStateless=true, Min=0, Max=255` → `ParameterType.Byte` (NoValue=-1)
+
+**`MaxValue` ceilings — NoValue sentinels are off-limits**
+
+Both Byte and Word parameter types reserve their NoValue as an unsigned
+sentinel that ReBuzz writes to `pvalues` to mean "no event this tick".
+That sentinel value cannot be used as `MaxValue` — ReBuzz validates the
+declaration at load time and throws `Invalid MaxValue` if it is:
+
+| Type | NoValue sentinel | Effective `MaxValue` ceiling |
+|------|-----------------|------------------------------|
+| `ParameterType.Byte` (`MaxValue ≤ 254`) | 255 | **254** |
+| `ParameterType.Word` (`MaxValue > 254`) | 65535 | **65534** |
+
+```csharp
+// WRONG — 255 is NoValue for Byte; throws "Invalid MaxValue" at load
+[ParameterDecl(MinValue = 0, MaxValue = 255)]
+public int MyParam { get; set; }
+
+// CORRECT
+[ParameterDecl(MinValue = 0, MaxValue = 254)]
+public int MyParam { get; set; }
+
+// WRONG — 65535 is NoValue for Word; throws "Invalid MaxValue" at load
+[ParameterDecl(MinValue = 1, MaxValue = 65535)]
+public int MyWordParam { get; set; }
+
+// CORRECT
+[ParameterDecl(MinValue = 1, MaxValue = 65534)]
+public int MyWordParam { get; set; }
+```
+
+The error surfaces as:
+
+```
+System.Exception: <ParameterName>: Invalid MaxValue
+  at ReBuzz.ManagedMachine.MachineParameter.Error(...)
+  at ReBuzz.ManagedMachine.MachineParameter.Create(...)
+  at ReBuzz.ManagedMachine.ManagedMachineDLL.LoadManagedMachine(...)
+```
+
+The machine silently fails to appear in the browser with no further
+diagnostic. Check any parameter whose `MaxValue` is exactly 255 or 65535.
+65534 is the absolute ceiling for any non-Note integer parameter.
 
 For `ValueDescriptions`, `MinValue` and `MaxValue` are auto-set to
 `0` and `descriptions.Length - 1`.
