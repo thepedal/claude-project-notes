@@ -5,7 +5,7 @@ Updated with findings from Pedal EQ v1.2 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Dly PCM41 v1.0 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
-Sections 1–27 are general findings that apply across managed machines.
+Sections 1–28 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -1257,3 +1257,59 @@ updating envelope coefficients. The order matters:
    coef updates don't overwrite it.
 
 Reversing any of the steps introduces edge-case bugs.
+
+---
+
+## 28. Parameter `Name` and `Description` go through XML/XAML — avoid special characters
+
+ReBuzz serializes machine state to XML (preset bundles, song saves) and
+passes parameter descriptions to XAML for the rack tooltip layer. Special
+characters in `Name` or `Description` that have meaning in those formats
+can wedge the application at the moment they're parsed — typically the
+first interaction that touches the parameter (transport play, parameter
+window open, save). The machine still loads cleanly because the
+declarations themselves don't pass through the broken paths.
+
+**Discovered:** Pedal invFFT v0.3 used `Name = "Even/Odd"` and a Tilt
+description containing `<` and `>` (e.g. `<64 boosts lows, >64 boosts
+highs`). Build succeeded, the machine appeared in the browser and on
+the rack, but ReBuzz hung on the first attempt to play. Renaming to
+`"Balance"` and rewording the description without angle brackets
+resolved it.
+
+**Characters to avoid:**
+
+| Where         | Char(s)              | Reason                              |
+|---------------|----------------------|-------------------------------------|
+| `Name`        | `/`                  | breaks preset XML key lookup        |
+| `Name`        | `<` `>` `&` `"` `'`  | XML special characters              |
+| `Description` | `<` `>`              | XAML reads as element-tag delimiters |
+| `Description` | `&`                  | XAML entity-reference start         |
+| `Description` | `"`                  | XAML attribute delimiter            |
+
+Plain Unicode punctuation that does NOT cause problems in practice:
+em-dashes (`—`), en-dashes (`–`), curly quotes, ellipses, degree signs.
+These are used in many existing Pedal-series machines without issue.
+
+**Symptoms when one slips through:**
+- Machine builds successfully — no compile error.
+- Machine loads cleanly and appears in the rack.
+- First transport play hangs ReBuzz: audio thread blocks and the UI
+  becomes unresponsive together.
+- No exception in the debug console; no log entry; the parser blocks
+  silently or returns malformed state that breaks downstream code.
+
+**Safe pattern:**
+- **Names:** alphanumeric, spaces, hyphens. `"Amp Attack"`, `"Low-Mid Q"`,
+  `"Balance"`. If a name needs separation, prefer space or hyphen over
+  punctuation.
+- **Descriptions:** words instead of symbols. Replace `<64 boosts lows`
+  with `64 neutral, lower boosts lows`; replace `0..1 amplitude` with
+  `0 to 1 amplitude`; replace `≤ 50%` with `at or below 50 percent`.
+  Clarity is unaffected; debugging hours saved.
+
+The cost of being conservative here is zero — descriptions and names
+are human-readable strings whose presentation isn't materially worse
+for saying "or" instead of `/` or "less than" instead of `<`. The cost
+of ignoring the rule is a hang that's hard to attribute because the
+build succeeds and the machine loads.
