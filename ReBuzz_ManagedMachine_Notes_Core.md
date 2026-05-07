@@ -5,7 +5,7 @@ Updated with findings from Pedal EQ v1.2 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Dly PCM41 v1.0 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
-Sections 1–26 are general findings that apply across managed machines.
+Sections 1–27 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -1156,3 +1156,104 @@ assemblies and all WPF types (`UserControl`, `TextBlock`, `Brush`,
 - **Scanning for `IMachineGUI` directly** — ReBuzz scans for
   `IMachineGUIFactory`, not `IMachineGUI`. A class that only implements
   `IMachineGUI` without a factory will not be discovered.
+
+---
+
+## 27. Transport stop — `Work()` keeps running but setters don't
+
+When the user presses ReBuzz's Stop button, the pattern engine pauses (no more
+setter calls fire) but `Work()` keeps being invoked — the audio graph stays
+running so downstream tails and effects can finish rendering. Any voice with
+non-zero sustain rings on indefinitely until the user manually triggers a
+note-off, which they can't do from a stopped pattern.
+
+**The fix:** poll `IBuzz.Playing` at the top of `Work()` and on the falling
+edge force every active voice into a fast fade. Don't reuse the user's Release
+time — for a long-release patch (multi-second pad) the "voice fades over 8
+seconds after Stop" feels broken even if it's technically following the
+envelope. A fixed ~5 ms fade overrides the user setting cleanly.
+
+```csharp
+bool _wasPlaying;
+
+public bool Work(/* ... */)
+{
+    // ... drain pending pattern events first ...
+
+    int sr = host?.MasterInfo?.SamplesPerSec ?? 48000;
+
+    bool nowPlaying = _wasPlaying;
+    try { nowPlaying = host?.Machine?.Graph?.Buzz?.Playing ?? false; }
+    catch { /* keep previous value — never break audio on a poll glitch */ }
+    if (_wasPlaying && !nowPlaying) ForceFadeAllVoices(sr);
+    _wasPlaying = nowPlaying;
+
+    // ... rest of Work() ...
+}
+```
+
+This was first documented as a tracker-specific concern (Pedal Tracker §3) but
+applies to every synth voice with sustain — promoted here to make sure new
+synths get it from the start.
+
+### 27.1 Implementation choices for the fade itself
+
+- **Per-envelope forced-release flag.** Add a `ForcedRelease(sr)` method to
+  the envelope that sets stage to Release with a fixed ~5 ms coef, bypassing
+  the user's Release setting. NoteOn clears the flag so a fresh Play after
+  Stop attacks normally. Cleanest when the voice already has one or more
+  ADSRs. This is what Pedal invFFT does.
+- **Anti-click target-gain ramp.** If the voice already has a separate
+  click-prevention envelope ramping `CurrentGain → TargetGain` per sample
+  (the Pedal Tracker pattern), set `TargetGain=0` on Stop and let that ramp
+  handle the fade. Cheaper if the machinery already exists.
+- **HardReset.** Snap the envelope to Idle, output silence immediately.
+  Simplest, but produces an audible click on whatever amplitude the
+  OLA/voice buffers happen to hold at the moment of Stop. Not recommended
+  unless the voice's amplitude is guaranteed to be near zero by other means.
+
+5 ms is a good default fade duration. 1–2 ms can click on high-amplitude
+signals; 10 ms is still imperceptible as a fade. If clicks persist at 5 ms,
+the fade target is fighting an OLA-tail or filter ringing elsewhere —
+extending the fade to 10 ms is safe.
+
+### 27.2 Thread-safety of the polling read
+
+`IBuzz.Playing` is a plain bool getter, locally cached in ReBuzz with no IPC —
+safe to call on the audio thread. The `try/catch` around the chain is
+defensive: a null `host`, `Graph`, or `Buzz` during init or teardown shouldn't
+cascade into an audio-thread exception. On any failure, keep the previous
+value (`nowPlaying = _wasPlaying`) so the falling-edge detector doesn't fire
+spuriously.
+
+### 27.3 Initialisation and edge-case behaviour
+
+`_wasPlaying` defaults to `false`. The cases worth verifying:
+
+- **Machine loaded into an already-playing song.** First `Work()` sees
+  `nowPlaying=true, _wasPlaying=false` — no falling edge fires — and proceeds
+  normally. The next Stop press triggers the fade as expected.
+- **Machine loaded into a stopped song.** Both values stay `false`; no fade
+  fires until a Play→Stop transition happens.
+- **Rapid Play→Stop with no notes between.** Falling edge still fires, but
+  with no active envelopes there's nothing to fade. `ForcedRelease` should be
+  idempotent against Idle envelopes (early-return).
+
+No special init logic is needed; the falling-edge detector handles all states
+correctly from `_wasPlaying = false`.
+
+### 27.4 Where to place the polling
+
+At the top of `Work()`, *after* draining pending pattern events but *before*
+updating envelope coefficients. The order matters:
+
+1. **Pending events first.** A note-on right before Stop should still trigger;
+   the falling edge then fades it within the same buffer. Reversing the order
+   would force-release the still-pending note before it ever sounded.
+2. **Falling-edge check second.** Captures the Stop and triggers forced
+   release.
+3. **Coef updates third.** `UpdateCoefs` is dirty-checked against user
+   parameters; the forced-release coef should be held in a separate field so
+   coef updates don't overwrite it.
+
+Reversing any of the steps introduces edge-case bugs.
