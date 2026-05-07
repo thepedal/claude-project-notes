@@ -203,7 +203,6 @@ Field semantics:
   fine.
 
 ### 3.3 Parameter index stability — the one rule that bites
-<<<<<<< HEAD
 
 ReBuzz looks up preset parameters by **Index**, not by Name. The Name is
 informational; it's the Index that drives the assignment. This means:
@@ -293,59 +292,47 @@ suppressing alongside it:
 ```xml
 <NoWarn>MSB3277;CS0618</NoWarn>
 ```
-=======
 
-ReBuzz looks up preset parameters by **Index**, not by Name. The Name is
-informational; it's the Index that drives the assignment. This means:
+---
 
-- **Re-ordering parameter declarations breaks every existing preset.** A
-  preset that says `Index=5 Value=100` will write to whichever parameter
-  is now at index 5, regardless of name.
-- **Inserting a new parameter in the middle shifts every later index.**
-  Same problem.
-- **Always append new parameters to the end of the property list.** That
-  way existing preset indices stay valid; presets that don't know about
-  the new params just use the machine's `DefValue` for them.
+## 5. Delivery packaging — single zip, single subdir
 
-Keep a comment near the new parameters marking the version they were
-added in, so future edits know the appendage rule:
+When delivering a machine's source tree to the user (a new build, a
+rebuild, a patch — anything they'll download and extract), package it
+as a single `.zip` with **all files inside one subdirectory** at the
+root of the archive. The subdirectory name is the machine name in
+lowercase with spaces removed (e.g. "Pedal invFFT" → `pedalinvfft/`,
+"Pedal Comp" → `pedalcomp/`, "Pedal Dly PCM41" → `pedaldlypcm41/`).
 
-```csharp
-// ── New in v1.2 — appended at the end so v1.0/v1.1 preset indices stay valid ──
-
-[ParameterDecl(Name = "Glide", MinValue = 0, MaxValue = 127, DefValue = 0)]
-public int Glide { get; set; } = 0;
+```
+pedalinvfft.zip
+└── pedalinvfft/
+    ├── FFT.cs
+    ├── PedalInvFFT.cs
+    ├── PedalInvFFT.NET.csproj
+    └── README.md
 ```
 
-### 3.4 Generator-script pattern
+This rule applies to **every** managed machine delivery in this project.
+Reasons:
 
-For any non-trivial bank (more than five or six presets), maintain a
-Python (or similar) generator script rather than hand-editing XML.
-A `PARAM_INDEX` dict keyed by parameter name keeps the output in sync
-with the machine's declaration order; per-preset overrides are sparse
-dicts that only mention the parameters that differ from defaults.
+- **Single drag-and-drop extraction.** The user drops the zip into their
+  source tree and gets one tidy directory, not a scatter of loose files
+  into whatever folder they happened to extract from.
+- **No accidental file mixing.** Without the subdir, extracting a zip on
+  top of an existing machine's folder silently overwrites unrelated
+  files with the same name (e.g. `README.md`, `gen_presets.py`).
+- **Predictable naming.** Lowercase-no-spaces avoids shell-quoting
+  hassles and matches the on-disk convention already used for source
+  folders.
 
-```python
-PARAM_INDEX = {
-    "Algorithm": 0, "Output": 1, "Voices": 2,
-    # ... declaration-order list ...
-}
+Do not deliver loose files alongside the zip, and do not zip files
+without the wrapping subdir. If the user explicitly asks for a different
+layout in a specific case, follow the request — but the default for any
+unsolicited delivery, and for every initial build of a new machine, is
+the form above.
 
-PRESETS = {
-    "Hard Lead":   { "Algorithm": 3, "Op1Feedback": 75, ... },
-    "EP Tine":     { "Algorithm": 5, "Op3VelSens":  80, ... },
-    # ...
-}
-
-# Emit declaration order; missing params fall back to per-machine defaults
-# tracked in DEFAULTS dict.
-```
-
-This way version bumps that add new parameters require only adding the
-new keys to `PARAM_INDEX` and any `OVERRIDES` dicts that want them — the
-rest of the bank stays untouched and continues producing identical XML.
-
-Keep the generator script alongside the source (e.g. `gen_presets.py`)
-but **do not deploy it** — it's not part of what ReBuzz needs at runtime.
-The deployed bundle is just `<Machine>_Presets.prs.xml` + `<Machine>.dll`.
->>>>>>> 0f32f3d29e8c08ab0673c334a279cea0f5fa76d3
+The zip's filename matches the subdir name: `pedalinvfft.zip` contains
+`pedalinvfft/`, `pedalcomp.zip` contains `pedalcomp/`, etc. No version
+suffix in the filename — git history or a separate release-notes file
+tracks versions.
