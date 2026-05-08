@@ -1,9 +1,10 @@
 # ReBuzz Managed Machine Development — Pedal invFFT Addendum
 
-Source: ReBuzz 1819-preview source code + Pedal invFFT v1.0 build (a
-managed C# generator: monophonic K5000-inspired additive synth using
-inverse FFT with overlap-add resynthesis, 16 partials, with amp and
-brightness ADSRs, static spectrum shaping, formant filter, and glide).
+Source: ReBuzz 1819-preview source code + Pedal invFFT v2.0 build (an
+8-voice polyphonic extension of the v1.0 monophonic K5000-inspired
+additive synth using inverse FFT with overlap-add resynthesis,
+16 partials per voice, with amp and brightness ADSRs, static spectrum
+shaping, formant filter, and glide).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. References to `PedalComp §N`,
@@ -583,8 +584,13 @@ a lock for thread-safety) is the only thing that survives. See Core
 
 ```
 PedalInvFFT/
-├── PedalInvFFT.cs           ~480 lines  Machine, params, audio loop,
-│                                         RunHop, glide, transport stop
+├── PedalInvFFT.cs           ~390 lines  Machine, params, audio loop,
+│                                         voice orchestration, mix
+│                                         buffer, transport stop,
+│                                         chord-delivery polling (§18)
+├── Voice.cs                 ~280 lines  Per-voice state and rendering:
+│                                         OLA buf, phases, envelopes,
+│                                         glide, hop scheduling, RunHop
 ├── FFT.cs                    ~150 lines  Radix-2 in-place complex FFT
 ├── Envelope.cs               ~200 lines  Linear-attack, exp-decay/release
 │                                         ADSR with forced-release fade
@@ -593,39 +599,355 @@ PedalInvFFT/
 ```
 
 State worth listing explicitly — the fields that took the most
-thought to get right:
+thought to get right. The split between machine-level (shared) and
+voice-level (per-voice) is itself a design choice; see §16 for the
+reasoning.
 
 ```csharp
-// Synthesis state (per-hop and per-sample)
-readonly float[]  _specRe = new float[FFT_SIZE];        // Re spectrum
-readonly float[]  _specIm = new float[FFT_SIZE];        // Im spectrum
-readonly float[]  _olaBuf = new float[FFT_SIZE];        // OLA accumulator
-readonly float[]  _phases = new float[N_PARTIALS];      // per-partial phase
+// ── PedalInvFFTMachine: shared across voices ──────────────────────
+readonly float[] _specRe = new float[FFT_SIZE];        // Re scratch
+readonly float[] _specIm = new float[FFT_SIZE];        // Im scratch
+readonly FFT     _fft    = new FFT(FFT_SIZE);          // shared FFT
+readonly float[] _mixBuf = new float[16384];           // mix accumulator
+readonly Voice[] _voices;                              // N_VOICES = 8
 
-// Hop scheduling
-int   _samplesUntilNextHop = 0;          // 0 ⇒ run hop on next Work()
-int   _olaReadPos          = 0;          // drain index into _olaBuf
+bool _wasPlaying = false;                              // transport edge
 
-// Pitch and glide
-float _freqHz       = 440f;              // recomputed each RunHop
-float _currentMidi  = 60f;               // continuous semitones
-float _targetMidi   = 60f;               // glide target
+// Reflection-cached pvalues handle (§18)
+IParameter _ownNoteParam = null;
+ConcurrentDictionary<int,int> _ownNotePValues = null;
 
-// Envelopes
-readonly Envelope _ampEnv    = new Envelope();  // sample-rate, drain loop
-readonly Envelope _brightEnv = new Envelope();  // hop-rate, batched (§11)
+// ── Voice: per-voice state ────────────────────────────────────────
+readonly float[]  _olaBuf    = new float[FFT_SIZE];    // OLA accumulator
+readonly float[]  _phases    = new float[N_PARTIALS];  // per-partial phase
+readonly Envelope _ampEnv    = new Envelope();         // sample-rate
+readonly Envelope _brightEnv = new Envelope();         // hop-rate (§11)
 
-// Pending events (drained at top of Work — PedalSH101 §6.3)
-bool _hasNoteOn       = false;
+int   _samplesUntilNextHop = 0;                        // hop schedule
+int   _olaReadPos          = 0;                        // drain index
+float _freqHz              = 440f;                     // recomputed/RunHop
+float _currentMidi         = 60f;                      // continuous semis
+float _targetMidi          = 60f;                      // glide target
+
+bool _hasNoteOn       = false;                         // pending events
 bool _hasNoteOff      = false;
 byte _pendingBuzzNote = 0;
 
-// Transport edge detection (Core §27)
-bool _wasPlaying = false;
+readonly PedalInvFFTMachine _machine;                  // for param reads
 ```
 
-The two envelope instances differ only in how they're advanced, not in
-class or initialisation. The split between sample-rate and hop-rate
-update sites is the core architectural choice that makes the whole
-machine work cleanly — keeping the per-sample drain loop minimal is
-why CPU and timing both behave.
+The two envelope instances per voice differ only in how they're
+advanced, not in class or initialisation. The split between
+sample-rate (amp) and hop-rate (brightness) update sites is the core
+architectural choice that makes the per-voice DSP work cleanly —
+keeping the per-sample drain loop minimal is why CPU and timing both
+behave, and it's what made eight voices fit comfortably in the
+budget.
+
+---
+
+## 16. Polyphony architecture — Voice class and shared scratch
+
+v1.0 was monophonic. v2.0 lifted the per-voice DSP into a `Voice` class
+and gave the machine an array of them. The migration was deliberately
+staged: a structural refactor first (Voice class created, machine
+delegates through `_voices[0]`, N_VOICES still 1) so behavior stayed
+identical to v1.0, then a single two-line bump (N_VOICES = MaxTracks =
+8) to actually enable polyphony. Each step was independently testable.
+This is worth doing for any nontrivial refactor — bisecting "the
+refactor broke the sound" against "the polyphony broke the sound" is
+much harder when both happen in the same commit.
+
+### 16.1 Track-to-voice mapping is fixed
+
+Track index *is* voice index. `SetNote(value, track)` routes directly
+to `_voices[track]`. There is no dynamic voice allocation, no
+last-note-priority stealing, no "find an idle voice and use it" logic.
+Polyphony comes from the user placing notes on multiple tracker
+columns — the standard ReBuzz tracker convention, as in PedalM1 §1.
+
+The cost of this simplicity is that hammering the same track faster
+than the env can release retriggers the same voice every time, rather
+than spreading new notes across spare voices. For the K5000 / pad /
+lead use case Pedal invFFT targets, that's the right behavior — a
+track *is* a melodic line and shouldn't borrow other tracks' voices.
+A polyphonic synth aimed at fast keyboard playing would want a
+dynamic allocator instead.
+
+### 16.2 Shared scratch, per-voice OLA
+
+The choice that took thought was which buffers to share and which to
+make per-voice:
+
+| Buffer            | Per-voice or shared? | Reason                              |
+|-------------------|----------------------|-------------------------------------|
+| `_specRe/_specIm` | shared               | Cleared at top of every RunHop      |
+| `_fft`            | shared               | No state beyond read-only twiddles  |
+| `_olaBuf`         | per-voice            | Holds residual ringing across hops  |
+| `_phases`         | per-voice            | Continuous across hops (§6)         |
+| `_ampEnv`         | per-voice            | Tracks per-voice NoteOn/Off         |
+| `_brightEnv`      | per-voice            | Same                                |
+| Glide state       | per-voice            | Each voice's pitch evolves alone    |
+
+The shared scratch is safe because voices process strictly
+sequentially within `Work()`. Each voice's `RunHop` clears the
+scratch, fills it from its own state, inverse-transforms, and adds
+the result to its own per-voice OLA. The scratch is "owned" by
+whichever voice is currently calling `RunHop`; no cross-talk possible
+without parallelism, which the architecture doesn't have.
+
+If voices were ever parallelized (one thread per voice, mixing in a
+join step), the scratch would need to become per-voice too — or each
+voice would need its own short-lived stack scratch. At 8 voices the
+sequential cost is comfortable so this hasn't been worth doing.
+
+### 16.3 Mix buffer accumulation
+
+Voices accumulate into a `float[] _mixBuf` rather than writing
+directly to the `Sample[] output`. After the voice loop, a final
+pass converts each float to a `Sample(s, s)`. This pattern adds one
+buffer copy compared to writing direct, but it sidesteps the awkward
+`Sample` struct semantics for accumulation (`output[i] += s` doesn't
+compile cleanly when `output[i]` is a `Sample` and `s` is a float).
+The cost is negligible — `Array.Clear(_mixBuf, 0, n)` + n adds + n
+struct constructions, all linear in n.
+
+`_mixBuf` is allocated at machine construction at 16384 floats —
+4× the realistic ReBuzz max buffer of ~4096 samples. A guard at the
+top of `Work()` returns silence if `n` exceeds the buffer size,
+which would only happen if ReBuzz ever started passing larger
+chunks than current 1819-preview does. No audio-thread allocations.
+
+### 16.4 Memory and CPU budget
+
+Per-voice state at FFT_SIZE=2048, N_PARTIALS=16:
+- `_olaBuf`: 8 KB
+- `_phases`: 64 B
+- Two envelope instances: ~200 B
+- Misc scalars: ~50 B
+- Total: ~8.5 KB per voice
+
+Machine-level shared:
+- `_specRe`/`_specIm`: 16 KB total
+- `_mixBuf`: 64 KB
+- FFT twiddle tables: ~32 KB
+- Total: ~112 KB
+
+Eight voices × 8.5 KB + 112 KB ≈ 180 KB per machine instance. Well
+under any concern.
+
+CPU at 48 kHz with 8 active voices: roughly 5% of one modern desktop
+core, dominated by the per-voice FFTs (one per hop per voice = ~750
+FFTs per second). Half-active voices (Release tail) cost the same as
+fully active ones; only Idle and Sustain-at-zero voices are skipped
+entirely (§17).
+
+---
+
+## 17. IsActive vs IsAudible — silent-path gating in a polyphonic synth
+
+The v0.x silent-fast-path skipped the entire RunHop / drain machinery
+when `_ampEnv.IsActive` was false (envelope at Idle). That worked for
+v1.0 because the only way to silence the synth was to fully release
+the note. For v2.0 with multiple voices, the same predicate is wrong
+in a percussive-patch case that v1.0 had silently been wasting CPU on:
+
+> Patch with `Amp Sustain = 0` and short `Amp Decay`. Note triggers,
+> Decay drops level toward 0, env transitions to Sustain stage with
+> level pinned at 0. `IsActive` returns true (stage isn't Idle), so
+> RunHop keeps running and producing OLA content that gets multiplied
+> by 0 at the drain stage. Pure wasted work until NoteOff arrives.
+
+The fix splits the predicate. Two distinct properties, used at
+different sites:
+
+```csharp
+public bool IsActive => _ampEnv.IsActive;        // any non-Idle stage
+
+public bool IsAudible
+{
+    get
+    {
+        if (!_ampEnv.IsActive) return false;
+        if (_ampEnv.CurrentStage == Envelope.Stage.Sustain
+            && _ampEnv.Level <= 0f)
+            return false;
+        return true;
+    }
+}
+```
+
+| Stage   | Level     | IsActive | IsAudible | Renders? |
+|---------|-----------|----------|-----------|----------|
+| Idle    | 0         | false    | false     | no       |
+| Attack  | 0 → 1     | true     | true      | yes      |
+| Decay   | 1 → sus   | true     | true      | yes      |
+| Sustain | > 0       | true     | true      | yes      |
+| Sustain | **0**     | true     | **false** | **no**   |
+| Release | falling   | true     | true      | yes      |
+
+`IsAudible` gates the silent fast-path and the per-voice render
+decision. `IsActive` is kept for transport-stop iteration: a voice in
+Sustain-at-zero is parked but not Idle, so `ForcedRelease` should
+still fire on it — the env's internal Idle check makes the call a
+no-op anyway, but iterating on `IsActive` makes intent explicit.
+
+The Attack/Decay/Release stages always render, even at level zero,
+because their level is *changing* — Release entered at level 0 needs
+exactly one `Process` call to transition to Idle, and the gate has
+to let that one call through. Sustain is the only "parked" state
+where the env can sit at zero without anything happening, which is
+why it's the only stage with a level check.
+
+### 17.1 Why this is the right resolution
+
+The naïve fix would be to make Sustain-at-zero transition to Idle
+directly. That breaks NoteOff semantics — a note held with sustain=0
+should still respect the user's hold, in case `Bright Amount` is
+positive and the brightness env is still doing something audible
+(though the user can't currently hear it, the state is still
+"holding"). The split predicate keeps the state machine honest: the
+voice is still active, just not currently producing output.
+
+It also generalizes — if v3 ever adds a per-voice volume parameter,
+`IsAudible` would extend to "amp env active AND voice volume > 0".
+Centralizing the audibility logic in one property keeps that growth
+local.
+
+### 17.2 What about brightness env when voice render is skipped?
+
+When a voice is gated out by `IsAudible`, neither RunHop nor the
+drain loop runs, so `_brightEnv.Process` doesn't tick either. The
+brightness env state freezes at whatever it was last left at.
+
+This is fine in the Sustain-at-zero case because the user can't hear
+the voice anyway. When NoteOff drains in via `DrainEvents`, amp env
+transitions Sustain→Release at level 0; one Process call in Release
+detects level < threshold and snaps to Idle; brightness env
+transitions Sustain→Release in parallel and ticks normally during
+the (one-sample-long) Release rendering. By the time anything could
+become audible again, the brightness env has caught up. Worst case
+is a barely-perceptible discontinuity at the start of the next
+NoteOn, well below noise floor for any reasonable patch.
+
+If a future patch design genuinely needs the brightness env ticking
+during a silent Sustain (e.g. brightness env in Decay while amp env
+is Sustain-at-zero, where the user expects the brightness env to
+finish its decay even though no audio is heard), this gating will
+need rethinking. Hasn't come up.
+
+---
+
+## 18. Chord delivery — the Core §14 workaround in this synth
+
+Polyphonic playback from pattern data requires the Core §14 polling
+workaround. Without it, two notes on the same row across two tracks
+collapse to last-track-only because of the `parametersChanged`
+dictionary collision. Pedal invFFT's specific implementation:
+
+### 18.1 Lazy reflection bootstrap
+
+Reflection lookup happens lazily on first `SetNote` call rather than
+in the constructor. `host.Machine.ParameterGroups` is populated by
+ReBuzz's `CreateParameterDelegates()` *after* the machine
+constructor runs (Core §15), so a constructor-time lookup returns
+`null`. By the time any note is being delivered, the groups exist:
+
+```csharp
+IParameter _ownNoteParam = null;
+ConcurrentDictionary<int,int> _ownNotePValues = null;
+
+void TryInitPValues()
+{
+    try
+    {
+        if (_ownNoteParam == null)
+        {
+            var pg = host?.Machine?.ParameterGroups;
+            if (pg == null || pg.Count < 3) return;
+            _ownNoteParam = pg[2].Parameters.FirstOrDefault(
+                p => p?.Type == ParameterType.Note);
+        }
+        if (_ownNoteParam == null || _ownNotePValues != null) return;
+
+        var fi = _ownNoteParam.GetType().GetField("pvalues",
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        if (fi != null)
+            _ownNotePValues = fi.GetValue(_ownNoteParam)
+                as ConcurrentDictionary<int,int>;
+    }
+    catch { /* leave fields null; subsequent SetNote calls skip polling */ }
+}
+```
+
+The `try/catch` swallows any reflection failure silently. If the
+pvalues field gets renamed in a future ReBuzz, polling stops working
+and chord rows degrade to last-track-only — but the synth keeps
+running, monophonic per track. Better than throwing and breaking
+audio.
+
+### 18.2 Polling pattern in SetNote
+
+```csharp
+public void SetNote(Note value, int track)
+{
+    // Handle the firing track normally.
+    byte v = value.Value;
+    if (v == Note.Off)        _voices[track].QueueNoteOff();
+    else if (v != 0)          _voices[track].QueueNoteOn(v);
+
+    // Recover sibling tracks.
+    if (_ownNotePValues == null) TryInitPValues();
+    if (_ownNotePValues != null)
+    {
+        int noVal = _ownNoteParam.NoValue;
+        for (int t = 0; t < _voices.Length; t++)
+        {
+            if (t == track) continue;
+            if (_ownNotePValues.TryGetValue(t, out int pv)
+                && pv != noVal && pv != 0)
+            {
+                if (pv == Note.Off) _voices[t].QueueNoteOff();
+                else                _voices[t].QueueNoteOn((byte)pv);
+            }
+        }
+    }
+}
+```
+
+Three values to filter on:
+- `pv == 0` — `NoValue` for `Note` type. No event this row on this
+  track. Skip.
+- `pv == 255` — `Note.Off`. Queue NoteOff on this voice.
+- Anything else (1..156) — real note. Queue NoteOn with the byte.
+
+The `pv != noVal && pv != 0` double-check is defensive. NoValue is
+hardcoded to 0 for Note type (Core §3), so the two conditions are
+equivalent today, but keeping both means the code stays correct if
+ReBuzz ever changes the convention.
+
+### 18.3 Why no `!HasNoteOn && !HasNoteOff` guard
+
+PedalM1's polling has a guard checking the per-voice pending flags
+before overwriting (PedalM1 §6). PedalInvFFT's polling doesn't —
+because `QueueNoteOn` and `QueueNoteOff` are idempotent (they just
+set a flag and a byte), re-queuing the same value is a no-op.
+
+The guard would matter if SetNote could fire multiple times within
+a single Tick for the Note parameter, e.g. across sub-tick
+boundaries. It can't — `parametersChanged` collapses all per-tick
+writes for a given parameter into a single setter call. The polling
+loop runs exactly once per tick where any note-related setter
+fires, and re-running the same poll within that tick produces
+identical results, so idempotency is enough.
+
+If PedalInvFFT ever grows additional track parameters (per-track
+velocity, per-track detune, etc.), each one would need its own
+`_ownXxxParam` + `_ownXxxPValues` pair, and SetNote (or all
+relevant setters) would extend the polling loop accordingly. At
+that point the `!HasXxx` guards become useful for the same reason
+they do in PedalM1: the redundancy pattern (any setter firing
+recovers all the others) means the same sibling can be
+re-recovered from multiple polling sites within the same tick,
+and idempotency arguments only hold for individually idempotent
+operations. Cross-parameter consistency is a different question.
