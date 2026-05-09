@@ -1,9 +1,10 @@
 # ReBuzz Managed Machine Development — Pedal invFFT Addendum
 
-Source: ReBuzz 1819-preview source code + Pedal invFFT v2.1 build (the
-v2.0 8-voice polyphonic K5000-inspired iFFT/OLA additive synth, plus
-v2.1's inharmonic stretch parameter and per-partial harmonic
-micro-animation).
+Source: ReBuzz 1819-preview source code + Pedal invFFT v2.2 build (the
+v2.1 polyphonic K5000-inspired iFFT/OLA additive synth with stretch
+and animation, plus v2.2's per-voice key-synced LFO and six routing
+destinations — Pitch, Brightness, Stretch, Volume, Formant Centre,
+and Animation Depth — closing the modulation infrastructure).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. References to `PedalComp §N`,
@@ -617,11 +618,18 @@ IParameter _ownNoteParam = null;
 ConcurrentDictionary<int,int> _ownNotePValues = null;
 
 // ── Voice: per-voice state ────────────────────────────────────────
-readonly float[]  _olaBuf     = new float[FFT_SIZE];   // OLA accumulator
-readonly float[]  _phases     = new float[N_PARTIALS]; // per-partial phase
-readonly float[]  _animPhases = new float[N_PARTIALS]; // animation phase (§20)
-readonly Envelope _ampEnv     = new Envelope();        // sample-rate
-readonly Envelope _brightEnv  = new Envelope();        // hop-rate (§11)
+readonly float[]   _olaBuf     = new float[FFT_SIZE];   // OLA accumulator
+readonly float[]   _phases     = new float[N_PARTIALS]; // per-partial phase
+readonly float[]   _animPhases = new float[N_PARTIALS]; // animation phase (§20)
+readonly Envelope  _ampEnv     = new Envelope();        // sample-rate
+readonly Envelope  _brightEnv  = new Envelope();        // hop-rate (§11)
+
+// LFO state (§21). Sync offset is per-voice random for organic chord
+// LFO behavior; private RNG seeded uniquely per voice for S&H values.
+readonly float  _lfoSyncOffset;
+readonly Random _rng;
+float _lfoPhase;
+float _lfoSnH;
 
 int   _samplesUntilNextHop = 0;                        // hop schedule
 int   _olaReadPos          = 0;                        // drain index
@@ -1156,3 +1164,315 @@ captures the essential character. A future expansion could add
 multiple animation modes (random walk, multi-rate sine sum, sample
 & hold) via an Anim Mode parameter, getting closer to what the
 K5000 offered without fundamentally changing the architecture.
+
+---
+
+## 21. LFO architecture — per-voice, key-synced, hop-rate
+
+v2.2 step 1. Per-voice LFO state, computed once per RunHop, with the
+resulting value reused across however many routing destinations are
+active that hop. Three new parameters in step 1: LFO Rate, LFO Shape,
+LFO Pitch (the first routing destination).
+
+### 21.1 Per-voice rather than shared
+
+Each Voice owns its own LFO state (phase, S&H value, sync offset,
+private RNG). The alternative — a single machine-level LFO whose value
+is used by all voices — was rejected because it makes polyphonic
+chords feel mechanical: every voice modulates in lockstep, which is
+exactly what a multi-voice synth is meant to avoid. Per-voice LFOs
+let chords feel like an ensemble rather than one voice multiplied.
+
+The cost is small: three floats and a Random per voice (~50 bytes),
+plus one extra Sin call per voice per hop. At 8 voices × 94 hops/sec,
+~750 LFO computes per second — well under any concern.
+
+### 21.2 Key-sync to a per-voice random offset, not zero
+
+The LFO key-syncs on every NoteOn (resets phase to a target value).
+The conventional choice for the target is 0 — every note starts at
+LFO phase 0. For polyphony this creates a problem: when a chord
+strikes, all voices reset to phase 0 simultaneously, so the chord
+voices' LFOs are perfectly synchronized for at least one cycle. With
+vibrato active, the entire chord wobbles in unison — defeating the
+per-voice independence the architecture is supposed to give.
+
+The fix is a small but important variation: each voice picks a random
+phase at construction (`_lfoSyncOffset`), and NoteOn resets `_lfoPhase`
+to *that* value rather than to 0. The eight voices in a chord still
+key-sync, but they sync to eight different offsets, so the LFO phases
+are spread across the cycle. Chords with vibrato sound like an
+ensemble; chords with LFO Bright sweeps shimmer asymmetrically; chords
+with S&H stretch each pick their own random tuning per cycle.
+
+This is meaningfully better than a free-run LFO would be, too: free-run
+loses the predictability of "the LFO is at phase X right after each
+NoteOn", which matters for things like ramp shapes and S&H. The
+random-offset key-sync keeps that predictability per voice while
+breaking it across voices.
+
+### 21.3 Four shapes via parameter quarter-banding
+
+LFO Shape is a single 0..127 int parameter quarter-banded to four
+discrete shapes:
+
+```csharp
+int shapeBand = _machine.LFOShape / 32;     // 0..3
+switch (shapeBand)
+{
+    case 0: return MathF.Sin(_lfoPhase);
+    case 1: return 2f * MathF.Asin(MathF.Sin(_lfoPhase)) / MathF.PI;
+    case 2: return MathF.Sin(_lfoPhase) >= 0f ? 1f : -1f;
+    default: /* S&H */  ...
+}
+```
+
+| Range  | Shape           | Cost                       | Notes                      |
+|--------|-----------------|----------------------------|----------------------------|
+| 0..31  | Sine            | 1 Sin                      | Default; smooth            |
+| 32..63 | Triangle        | 1 Sin + 1 Asin             | Linear ramps; same zeros   |
+| 64..95 | Square          | 1 Sin + 1 compare          | Hard switching             |
+| 96..127| Sample & Hold   | 1 RNG call on phase wrap   | Random stepping            |
+
+Triangle uses `2·asin(sin(φ))/π` rather than a piecewise abs formula
+because it produces zero crossings at exactly the same phase points
+as the sine — which makes mixing or A/B'ing different shapes feel
+consistent. The extra Asin call is cheap.
+
+S&H samples a fresh value from the per-voice Random whenever the
+phase wraps a cycle. The held value is also refreshed at NoteOn so
+retriggered notes get a fresh random rather than whatever was held
+from the previous note's last cycle.
+
+### 21.4 Rate range capped at 10 Hz
+
+Rate is log-mapped from 0.1 Hz to 10 Hz, with default 64 giving
+~1 Hz. The cap at 10 Hz is below the conventional 20 Hz LFO ceiling
+because the LFO is computed at hop rate (~94 Hz at 48 kHz). At 10 Hz
+that's ~9 samples per LFO cycle — smooth. At 20 Hz it would be
+~5 samples — audible stair-stepping, especially with hard shapes
+(square, S&H). Better to cap below the perceptible-quantization
+threshold than to expose rates that produce artefacts.
+
+If audio-rate modulation is ever wanted (FM-style effects), it would
+need a per-sample rather than per-hop compute path — different
+infrastructure.
+
+### 21.5 Pitch modulation applied to MIDI, not Hz
+
+The first routing destination, LFO → Pitch:
+
+```csharp
+float pitchModSemi  = lfoVal * (_machine.LFOPitch - 64) / 64f * 3f;
+float effectiveMidi = _currentMidi + pitchModSemi;
+_freqHz = 440f * MathF.Pow(2f, (effectiveMidi - 69f) / 12f);
+```
+
+The modulation is applied to `_currentMidi` (continuous semitones)
+without mutating it, then `_freqHz` is computed from the modulated
+value. This composes cleanly with glide: glide tracks `_currentMidi`
+via the per-hop one-pole, the LFO wobbles around it, and `_freqHz`
+falls out of the combined value. Vibrato + glide does the right
+thing — the centre of the vibrato follows the slide.
+
+Doing this in MIDI space (one Pow call) rather than Hz space (would
+need `_freqHz *= MathF.Pow(2f, mod/12f)` after the original Pow) keeps
+the per-hop math simple.
+
+---
+
+## 22. LFO routing destinations — pattern and per-destination notes
+
+v2.2 step 2. Five additional routing destinations beyond Pitch, all
+following the same bipolar-depth pattern.
+
+### 22.1 The shared routing pattern
+
+Each destination has a depth parameter `LFO X`, defaulting to 64 (no
+modulation). The modulation amount is computed identically for all
+destinations:
+
+```csharp
+float xMod = lfoVal * (_machine.LFOX - 64) / 64f * MAX_SWING;
+```
+
+`(LFOX - 64) / 64f` gives a coefficient in `[-1, +1]` from the bipolar
+depth knob (negative below 64 inverts the modulation direction, positive
+above 64 sends it the natural way). Multiplied by `lfoVal` (also
+`[-1, +1]`) gives a normalized modulation in `[-1, +1]`. The
+destination-specific `MAX_SWING` scales it to the destination's natural
+units.
+
+The MAX_SWING values:
+
+| Destination     | MAX_SWING | Rationale                                           |
+|-----------------|-----------|-----------------------------------------------------|
+| LFO Pitch       | 3         | ±3 semitones — wide enough for siren, narrow
+                                 enough to dial subtle vibrato precisely             |
+| LFO Bright      | 63        | Full sweep in 0..127 param space                    |
+| LFO Stretch     | 32        | Half-sweep — full would push to extremes that
+                                 aren't always musical at the LFO rate               |
+| LFO Volume      | 0.5       | ±50% multiplicative — true tremolo without
+                                 silencing the voice at full deflection              |
+| LFO Formant     | 63        | Full sweep in 0..127 param space                    |
+| LFO Anim        | 63        | Full sweep — lets LFO turn animation on/off when
+                                 base depth is near 0, or wobble it in mid-range     |
+
+All depth knobs default to 64. With LFO Pitch at 64 and the other five
+also at 64, the LFO advances internally but routes nowhere — default
+sound is identical to v2.1.
+
+### 22.2 Where each destination applies in RunHop
+
+Most destinations modulate parameter values in their natural parameter
+spaces, then derived quantities are computed from the modulated value.
+This keeps the modulation perceptually even — for example, modulating
+Formant Centre in param space (before the log-to-Hz mapping) gives
+constant-octave-rate sweeps regardless of base centre frequency.
+
+```csharp
+// Pitch — modulates _currentMidi (semitones)
+float pitchModSemi  = lfoVal * (LFOPitch - 64) / 64f * 3f;
+float effectiveMidi = _currentMidi + pitchModSemi;
+_freqHz = 440f * MathF.Pow(2f, (effectiveMidi - 69f) / 12f);
+
+// Brightness — modulates the param value, then clamp + use
+float brightLfoMod    = lfoVal * (LFOBright - 64) / 64f * 63f;
+float effectiveBright = clamp(Brightness + brightEnvMod + brightLfoMod, 0, 127);
+
+// Stretch — modulates the param value, then derive the exponent
+float stretchLfoMod    = lfoVal * (LFOStretch - 64) / 64f * 32f;
+float effectiveStretch = Stretch + stretchLfoMod;
+float stretchExp       = 1f + (effectiveStretch - 64) / 64f * 0.3f;
+
+// Formant Centre — modulates the param value, then log-map to Hz
+float formantLfoMod   = lfoVal * (LFOFormant - 64) / 64f * 63f;
+float effectiveCentre = clamp(FormantCentre + formantLfoMod, 0, 127);
+formantCenterHz       = 100f * MathF.Pow(60f, effectiveCentre / 127f);
+
+// Anim Depth — modulates the param value, then the existing anim path
+//              picks up the modulated value
+float animLfoMod   = lfoVal * (LFOAnim - 64) / 64f * 63f;
+int   animDepthInt = clamp(AnimDepth + animLfoMod, 0, 127);
+
+// Volume — multiplicative; applied per-partial in the deposit loop
+float volMod = 1f + lfoVal * (LFOVolume - 64) / 64f * 0.5f;
+// ...then in partial loop: amp *= volMod;
+```
+
+LFO Volume is the one that modulates a derived quantity (per-partial
+amp in the deposit loop) rather than a parameter value. It applies
+uniformly across all partials, so the result is a pure tremolo
+amplitude swing rather than a spectrum-shape change. Multiplicative
+rather than additive because volume is naturally multiplicative — at
+full negative deflection (LFOVolume=0) when the LFO is at +1, the
+multiplier becomes 0.5 (half volume), and at LFO=-1 it becomes 1.5
+(50% boost).
+
+### 22.3 Why parameter-space modulation rather than derived-space
+
+For Brightness, Stretch, Formant Centre, and Anim Depth, the modulation
+is applied in the *parameter* space (0..127), not in the derived
+quantity (e.g. Hz, exponent). Reasons:
+
+- **Perceptual evenness.** A given LFO depth produces the same
+  perceptual range regardless of base setting. ±63 in Formant Centre
+  param space is always ~6 octaves of sweep, regardless of where the
+  centre is parked. ±63 directly in Hz would sweep barely an octave at
+  high settings and 6 octaves at low — same numerical depth, very
+  different musical effect.
+- **Clamping is straightforward.** Param values clamp to [0, 127]
+  trivially. Derived quantities have weirder valid ranges.
+- **It matches the existing parameter-change semantics.** Twisting the
+  Brightness knob and modulating it via LFO produce the same kind of
+  sweep — just one is automated.
+
+The exception is LFO Pitch, which modulates `_currentMidi` directly
+(semitone space) rather than the (nonexistent) "MIDI parameter". This
+is fine because semitone space *is* the perceptual space for pitch.
+
+### 22.4 LFO Anim — modulating the modulation
+
+The most distinctive of the destinations is LFO → Anim Depth. With
+base Anim Depth near 0 and LFO Anim active, the LFO pushes Anim Depth
+between 0 (animation off) and ±63 (moderate animation). The clamp to
+[0, 127] means negative excursions are absorbed at 0, so the LFO
+effectively switches animation on for half the cycle and off for the
+other half. This produces "shimmer pulsing in and out" textures that
+nothing else in the synth's surface can do.
+
+With base Anim Depth around 64 and LFO Anim active, the LFO wobbles
+animation between roughly 0 and 127 — so animation is always on but
+its intensity breathes. Different effect, also useful.
+
+### 22.5 CPU cost of full modulation
+
+When all six destinations are at full deflection, per voice per hop:
+
+- 1 LFO compute (Sin + maybe Asin or compare; one branch)
+- 6 multiply-add modulation computations
+- 1 extra Pow (for pitch — though there'd be one anyway)
+- 1 clamp per modulated parameter
+
+At 8 voices × 94 hops/sec, ~750 LFO + ~4500 modulation ops per second.
+Lost in the noise of the partial deposit loop, which dominates the
+per-voice cost.
+
+---
+
+## 23. The 64-preset bank — design and conventions
+
+v2.2 ships with `PedalInvFFT_Presets.prs.xml`, 64 presets generated
+from a Python script (`gen_presets.py`, kept in source but not
+deployed per Build §3.4). The bank covers:
+
+| Category    | Count | Purpose                                              |
+|-------------|-------|------------------------------------------------------|
+| Pad         | 10    | Slow attacks, sustained, brightness env, mild anim  |
+| Lead        | 8     | Fast attack, presence, vibrato/wah variants          |
+| Pluck       | 8     | Short attack/decay, percussive                       |
+| Bell        | 10    | Heavy stretch, brightness env, anim/LFO variants     |
+| Bass        | 4     | Low/mid spectrum, high partials rolled off           |
+| Vox         | 6     | Heavy formant, vowel character + animations          |
+| Anim        | 10    | Animation prominent, often LFO-modulated             |
+| FX          | 8     | Extreme settings, demonstrate feature interactions   |
+
+### 23.1 Preset naming convention
+
+Each preset is named `<Category> - <Description>`, e.g.
+`Pad - Soft Strings`, `Lead - Vibrato Sax`, `Bell - Crystal SH`. The
+hyphen-with-spaces form (rather than colons) is XML-safe per Core §28
+and gives a clean alphabetical sort within ReBuzz's preset menu —
+all Pads cluster together, all Bells cluster together, etc.
+
+### 23.2 Sparse override pattern
+
+The generator script defines each preset as a dict of name→value
+overrides, with unspecified parameters defaulting to the machine's
+`DefValue` (tracked separately in a `DEFAULTS` dict that mirrors the
+machine's source). This keeps preset definitions short and focused
+on what matters — a "Pad - Default" preset is six lines:
+
+```python
+"Pad - Default": {
+    "Volume": 56, "Amp Attack": 60, "Amp Release": 80,
+    "Brightness": 80, "Bright Decay": 95, "Bright Amount": 92,
+    "Anim Depth": 18,
+},
+```
+
+The XML emitter expands each preset to the full 28-parameter form
+that ReBuzz expects, filling in defaults for omitted keys.
+
+### 23.3 Forward compatibility with new parameters
+
+Build §3.3's append-only rule means new parameters (in future v2.3+
+work) get appended to the end of the declaration list and PARAM_INDEX.
+Existing preset overrides — keyed by name — still resolve to the same
+indices. Presets that don't mention the new parameter get its
+machine-level default, so old presets keep working without any
+edits.
+
+The implication for v2.2: when v2.3 lands with (say) spectral morph,
+this entire 64-preset bank stays valid. Some presets might benefit
+from being updated to use the new feature, but none will break.
