@@ -1,10 +1,9 @@
 # ReBuzz Managed Machine Development — Pedal invFFT Addendum
 
-Source: ReBuzz 1819-preview source code + Pedal invFFT v2.0 build (an
-8-voice polyphonic extension of the v1.0 monophonic K5000-inspired
-additive synth using inverse FFT with overlap-add resynthesis,
-16 partials per voice, with amp and brightness ADSRs, static spectrum
-shaping, formant filter, and glide).
+Source: ReBuzz 1819-preview source code + Pedal invFFT v2.1 build (the
+v2.0 8-voice polyphonic K5000-inspired iFFT/OLA additive synth, plus
+v2.1's inharmonic stretch parameter and per-partial harmonic
+micro-animation).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. References to `PedalComp §N`,
@@ -618,10 +617,11 @@ IParameter _ownNoteParam = null;
 ConcurrentDictionary<int,int> _ownNotePValues = null;
 
 // ── Voice: per-voice state ────────────────────────────────────────
-readonly float[]  _olaBuf    = new float[FFT_SIZE];    // OLA accumulator
-readonly float[]  _phases    = new float[N_PARTIALS];  // per-partial phase
-readonly Envelope _ampEnv    = new Envelope();         // sample-rate
-readonly Envelope _brightEnv = new Envelope();         // hop-rate (§11)
+readonly float[]  _olaBuf     = new float[FFT_SIZE];   // OLA accumulator
+readonly float[]  _phases     = new float[N_PARTIALS]; // per-partial phase
+readonly float[]  _animPhases = new float[N_PARTIALS]; // animation phase (§20)
+readonly Envelope _ampEnv     = new Envelope();        // sample-rate
+readonly Envelope _brightEnv  = new Envelope();        // hop-rate (§11)
 
 int   _samplesUntilNextHop = 0;                        // hop schedule
 int   _olaReadPos          = 0;                        // drain index
@@ -951,3 +951,208 @@ recovers all the others) means the same sibling can be
 re-recovered from multiple polling sites within the same tick,
 and idempotency arguments only hold for individually idempotent
 operations. Cross-parameter consistency is a different question.
+
+---
+
+## 19. Stretch — inharmonic partials via power-curve warping
+
+v2.1 step 1. A single parameter (`Stretch`, 0..127, default
+64=neutral) warps the partial-frequency formula from the harmonic
+series to arbitrary inharmonic ratios. Implementation is one line in
+`Voice.RunHop`:
+
+```csharp
+// Was: partialFreq = _freqHz * (p + 1)
+float stretchExp  = 1f + (_machine.Stretch - 64) / 64f * 0.3f;
+float partialFreq = _freqHz * MathF.Pow(p + 1, stretchExp);
+```
+
+### 19.1 Power-curve vs piano-physics
+
+The two natural formulas for inharmonic partials are:
+
+- **Piano-string** (Fletcher): `f_n = n · f₁ · √(1 + B · n²)` —
+  derives from string-stiffness physics, gives the asymptotically
+  progressive stretch real piano strings exhibit. B ≈ 0.0001 to
+  0.001 for typical strings.
+- **Power-curve**: `f_n = (n)^k · f₁` — pure mathematical scaling,
+  no physical motivation but always well-defined for any k > 0.
+
+Pedal invFFT uses power-curve. Reasons in priority order:
+
+1. **Symmetric**. k > 1 stretches, k < 1 compresses, both
+   well-defined. The piano formula needs clamping or branch logic
+   for negative B (compression) since `1 + B·n²` can go negative
+   for high n.
+2. **Smooth parameter sweep**. Linear in k gives perceptually smooth
+   parameter response. Piano B has a nonlinear relationship to
+   audible inharmonicity — small B values are inaudible, large B
+   values explode quickly.
+3. **Predictable at extremes**. At k = 1.3 the 16th partial sits
+   at ~28× the fundamental, dramatic but musical. The piano formula
+   at comparable inharmonicity goes nonlinear in ways that are
+   harder to dial in.
+
+The trade-off: power-curve doesn't reproduce specific real-world
+inharmonic timbres (piano stretch, bell ratios, gamelan tunings)
+directly. A future "Stretch Mode" parameter (README #6) could add
+piano, bell, gamelan, etc. as preset modes with their own formulas,
+keeping power-curve as the smooth-sweep default.
+
+### 19.2 Default preserves v2.0 sound
+
+At Stretch=64, `(_machine.Stretch - 64) / 64f * 0.3f = 0`, so
+stretchExp = 1.0 exactly. `MathF.Pow(p+1, 1.0)` returns p+1 within
+float precision. v2.0 patches loaded into a v2.1 build sound
+bit-near-identical at default Stretch.
+
+### 19.3 CPU cost
+
+One `Pow` call per partial per hop per voice. At 8 voices × 16
+partials × 94 hops/sec ≈ 12 000 Pow calls/sec. `MathF.Pow` is
+~50 ns on modern x64, so ~600 µs/sec total — well under 0.1% CPU.
+The exponent is hoisted out of the partial loop (computed once per
+RunHop), so the inner-loop cost is just the Pow itself.
+
+### 19.4 Interactions
+
+- **Brightness, Tilt, Balance** all act on the partial amplitudes;
+  they don't care about the partial frequencies. Compose cleanly.
+- **Formant filter** operates in absolute Hz, so a stretched partial
+  passes through the same formant peak it would have at a different
+  harmonic position — gives unusual vowel-with-attitude textures
+  at moderate stretch.
+- **Pitch (fundamental)**: unaffected. The first partial (`p=0`,
+  amplitude `1/(0+1) = 1`) sits at `_freqHz · 1^k = _freqHz`
+  regardless of Stretch. The played note is always the played note;
+  only the spectrum around it changes.
+- **Glide**: orthogonal. Glide moves `_freqHz`; Stretch warps the
+  partial structure built on top of it.
+- **Animation (§20)**: orthogonal. Animation modulates per-partial
+  amplitudes; Stretch sets per-partial frequencies. Combined, you
+  get bell timbres with their own slow shimmer.
+
+---
+
+## 20. Harmonic micro-animation — per-partial amplitude shimmer
+
+v2.1 step 2. Two parameters (`Anim Rate`, `Anim Depth`) plus a
+per-voice `_animPhases` array drive slow per-partial amplitude
+modulation. Each partial wobbles at its own rate, with the rate
+spread chosen to keep partials from synchronizing. Default Anim
+Depth = 0 turns the feature off entirely, preserving v2.0 sound.
+
+### 20.1 Why amplitude (not phase, not frequency)
+
+Three candidate modulation targets for per-partial animation:
+
+| Target    | Effect                               | Notes                       |
+|-----------|--------------------------------------|------------------------------|
+| Amplitude | Each partial pulses softly           | Most audible, cleanest fit  |
+| Phase     | Partials drift in alignment          | Subtle; mostly inaudible    |
+| Frequency | Partials detune slightly             | Fights iFFT/OLA crossfade   |
+
+Amplitude wins because it's the most directly audible at hop-rate
+update speeds and integrates with the existing per-partial amp
+chain without any architectural friction. Phase animation is
+reserved as a future feature (README #3) — different effect, not a
+substitute. Frequency animation is theoretically interesting but
+interacts with the per-frame OLA phase tracking in ways that need
+careful handling.
+
+### 20.2 Per-partial state
+
+Per voice: a `float[N_PARTIALS] _animPhases` array, randomized at
+construction with phases drawn independently from the spectral
+phase array `_phases`. 64 bytes per voice on top of v2.0's per-voice
+footprint (~8.5 KB). Eight voices × 64 bytes = 512 bytes additional
+state per machine instance — invisible.
+
+The phases are explicitly *not* reset on note retrigger. Animation
+is meant to be a slow background process, decoupled from note
+timing; resetting on retrigger would create a perceptible "starting
+state" each note that defeats the point of the feature (which is
+making sustained tones feel unmoored from event-driven structure).
+Initialized once at voice construction is enough.
+
+### 20.3 Per-partial rate spread
+
+Each partial advances at base rate × (0.7 + p × 0.04), giving rates
+in [0.7×, 1.3×] of the base, linearly spread across the 16 partials.
+The choice was between:
+
+- **Fixed irrational ratios** — pre-computed table of 16 numbers
+  with no rational relationships. Maximally non-synchronizing but
+  involves hand-designing the table.
+- **Linear spread** — simple, predictable. Partial 15's rate is
+  1.86× partial 0's. Not strictly irrational, but the ratios that
+  appear (1.86, 1.71, 1.57, …) are non-integer enough that practical
+  sync periods are minutes-to-hours rather than seconds.
+
+Linear spread won on simplicity. The non-synchronizing property
+needs to hold over musical timescales (~10–30 seconds of sustain),
+and the spread is plenty wide for that. Subjectively, the spectrum
+keeps evolving over long pads with no audible "I've heard this
+exact pattern before" moments.
+
+### 20.4 Why default-off
+
+Anim Depth = 0 means the feature is entirely off — the `if (animOn)`
+fast-path skips both the per-partial Sin and the phase advance.
+Default 0 was chosen for two reasons:
+
+1. **Preserve v2.0 sound at default values.** v2.0 patches loaded
+   into v2.1 sound identical until the user reaches for animation.
+   Same principle as Stretch=64.
+2. **Make discovery deliberate.** A subtle-on-by-default would let
+   the feature work but at a level too gentle for new users to
+   notice. Off-by-default forces engagement with the parameter,
+   which produces deliberate sound design rather than wondering
+   why patches sound slightly different.
+
+### 20.5 CPU cost when active
+
+Per voice per hop, when Anim Depth > 0:
+
+- 16 × `MathF.Sin` (~20 ns each) for the modulation factor
+- 16 × float arithmetic for phase advance and 2π wrap
+
+At 8 voices × 94 hops/sec × 16 partials, that's ~12 000 Sin/sec —
+well under 0.1% CPU. Hop-rate updates are inherently smooth in
+audio because the OLA averages across 4 hops, so the effective
+modulation is a hop-rate carrier mechanically smoothed by the
+overlap.
+
+When Anim Depth = 0 the entire branch is skipped — zero overhead
+at default settings.
+
+### 20.6 Interactions
+
+- **Stretch (§19)**: orthogonal and complementary. Stretch sets
+  where partials sit in frequency; Animation sets how their
+  amplitudes evolve in time. Bell timbres with animation get their
+  own slow shimmer, mimicking real bell physics where decoupled
+  modes interact.
+- **Brightness, Tilt, Balance, Formant**: all multiply into amp
+  before animation. Order is 1/n base → spectrum shaping →
+  animation → deposit. So animation's ±50% swing is relative to
+  whatever amp the spectrum-shape modifiers produced, which is the
+  natural composition.
+- **Brightness envelope**: per-voice and at hop rate. A note with
+  brightness env *and* animation engaged has two slow spectrum
+  modulations layered — env shaping the cutoff, animation rippling
+  individual partial amplitudes around it. They combine naturally.
+- **Per-voice independence**: each voice has its own `_animPhases`
+  array with independent random initial offsets. Polyphonic chords
+  get genuinely different shimmer per voice — chord textures feel
+  richer than just "the same patch played at three pitches".
+
+### 20.7 Connection to the K5000 lineage
+
+Kawai's K5000 had a "harmonic LFO" that modulated per-harmonic
+amplitudes for similar reasons. v2.1's animation is a small subset
+of that — single sine per partial, fixed rate spread — but it
+captures the essential character. A future expansion could add
+multiple animation modes (random walk, multi-rate sine sum, sample
+& hold) via an Anim Mode parameter, getting closer to what the
+K5000 offered without fundamentally changing the architecture.
