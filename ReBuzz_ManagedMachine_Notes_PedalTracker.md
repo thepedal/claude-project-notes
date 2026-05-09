@@ -1,13 +1,9 @@
-# ReBuzz Managed Machine Development — Pedal Tracker Addendum
+# ReBuzz Managed Machine Development — Pedal Tracker Notes
 
 Source: ReBuzz 1818-preview source code + multi-session debugging of Pedal Tracker
 (a managed C# generator modelled on BTDSys Matilde Tracker). These details
-extend the Core notes (`ReBuzz_ManagedMachine_Notes_Core.md`) with everything
-learned about pattern-data delivery, sub-tick timing, and Matilde-faithful playback.
-
-Sections numbered locally. References to `Core §N` point to
-`ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
-`§N` and `§N.M` and stay within this file.
+extend the original `ReBuzz_ManagedMachine_Notes.md` with everything learned
+about pattern-data delivery, sub-tick timing, and Matilde-faithful playback.
 
 ---
 
@@ -40,9 +36,9 @@ on the next tick (NoValue ≠ value), so consecutive identical pattern values
 DO fire setters. You don't need to worry about "value didn't change so setter
 got suppressed".
 
-### 1.3 The Core §14 workaround must extend beyond Note
+### 1.3 The §14 workaround must extend beyond Note
 
-The Core notes describe polling `pvalues` from inside `SetNote` to recover
+The original notes describe polling `pvalues` from inside `SetNote` to recover
 sibling-track notes that `parametersChanged` dropped. **This extends naturally
 to every track parameter.** Recover Wave, Volume, and effect columns the same
 way. In Pedal Tracker:
@@ -613,3 +609,904 @@ const float FADE_STEP = 1f / 64f;     // ~1.3 ms at 48 kHz, ~1.5 ms at 44.1
 const float NEAR_ZERO = 1e-4f;
 ```
 
+---
+
+## 11. Programmatic pattern manipulation across machines
+
+Added in v1.3 alongside the Matilde import feature. There are two real
+gotchas in this area; neither shows up in any obvious place.
+
+### 11.1 Each managed machine has its own dedicated pattern-editor instance
+
+The mental model "there's *the* Modern Pattern Editor in the song" is
+wrong. ReBuzz creates a fresh editor instance per managed machine
+(`ReBuzzCore.CreateEditor` at `ReBuzzCore.cs:1755`). Each editor instance
+has its own `MPEPatternsDB` containing only that machine's patterns.
+
+The editors are **hidden** from the public machine list. Their names start
+with `\u0001 + "pe"` (`\x01pe1`, `\x01pe2`, ...) and `SongCore.Machines`
+filters them out via `!m.Hidden`:
+
+```csharp
+public ReadOnlyCollection<IMachine> Machines =>
+    machinesList.Where(m => !m.Hidden && m.Ready).Cast<IMachine>().ToReadOnlyCollection();
+```
+
+So **searching `Buzz.Song.Machines` for the editor will never find it**.
+The first cut of MatildeImport tried this and failed at the lookup step.
+
+The right way: each `MachineCore` has a public `EditorMachine` property
+typed as the internal `MachineCore`. It's reachable via reflection on any
+`IMachine` instance:
+
+```csharp
+// MachineCore.EditorMachine — public getter, internal type.
+// Reflection finds it by name on the IMachine's runtime type.
+object editorIm = ReadAny(machine, "EditorMachine");
+// MachineCore : IMachine, so we can cast back and use the public API.
+IBuzzMachine editorMM = (editorIm as IMachine)?.ManagedMachine;
+// editorMM is now the ModernPatternEditorMachine instance for THIS machine.
+```
+
+Source and destination machines have different editor instances and
+different `MPEPatternsDB`s. Cross-machine pattern copy needs to read
+from one and write to the other:
+
+```csharp
+// Resolve once per side; keep two database refs and route by pattern.Machine.
+var (srcDb, ...) = ResolveOneSide(source, "source");
+var (dstDb, ...) = ResolveOneSide(destination, "destination");
+
+// When fetching MPEPattern wrappers later:
+object db = ReferenceEquals(p.Machine, srcMachine) ? srcDb : dstDb;
+mpePattern = getMpePatternMethod.Invoke(db, new object[] { p });
+```
+
+### 11.2 Public `IPatternColumn.SetEvents` doesn't update MPE's display
+
+There are **two parallel event lists** for any column on a managed
+machine:
+
+- `PatternColumnCore.patternEvents` (in ReBuzz core, what
+  `IPatternColumn.SetEvents` writes to).
+- `MPEPatternColumn.eventList` (in MPE, what the editor renders from
+  and what `MPEPatternColumn.PlayColumnEvents` dispatches at play time).
+
+MPE caches its own list and doesn't sync from the core's list when it
+changes. So writing through `IPatternColumn.SetEvents` updates ReBuzz
+core but **the user sees no change in the pattern editor and playback
+also doesn't pick it up** (since MPE drives playback by walking its own
+`eventList`, not the core's).
+
+To programmatically write pattern data, you have to drive MPE directly:
+
+```csharp
+// Per pattern:
+destination.CreatePattern(name, length);
+//   ^ fires IMachine.PatternAdded → MPE auto-creates an empty MPEPattern.
+
+var dstPattern = destination.Patterns.Last(p => p.Name == name);
+object dstMpePattern = getMpePattern.Invoke(dstDb, new object[] { dstPattern });
+
+// Per (parameter, track) you want to populate:
+object dstCol = createNewColumn.Invoke(dstMpePattern, new object[] { dstParam, track });
+//   ^ MPEPattern.CreateNewColumn(IParameter, int) → fresh MPEPatternColumn.
+
+// Write events:
+setEvents.Invoke(dstCol, new object[] { events, /*set:*/ true, /*play:*/ false });
+//   ^ MPEPatternColumn.SetEvents(PatternEvent[], bool, bool) — internal.
+//     play=false avoids triggering audio-thread side effects.
+
+// UI refresh:
+dstPattern.NotifyPatternChanged();
+```
+
+The internal `SetEvents(PatternEvent[], bool, bool)` overload (3 args,
+not 2) is the one MPE itself uses for bulk operations. The `play`
+parameter is the difference: with `play=true` it dispatches notes
+through the audio thread as if recorded; with `play=false` it's a
+silent paste.
+
+### 11.3 Cross-tracker parameter name mapping
+
+Matilde's track parameter names (verified against
+`Buzztrax/buzzmachines/Matilde/Tracker/Tracker.cpp`):
+
+```
+Note · Wave · Volume · Effect1 · Argument1 · Effect2 · Argument2
+```
+
+Pedal Tracker's:
+
+```
+Note · Wave · Volume · Cmd · Arg · Cmd2 · Arg2
+```
+
+For the import to round-trip cleanly the column-byte semantics are
+identical (Buzz pt_note for Note; raw 0x00–0xFE bytes for the rest)
+so the per-event translation is a straight pass-through. Only the
+*column identity* needs mapping. A static dictionary suffices:
+
+```csharp
+static readonly Dictionary<string, string> ParamAlias = new()
+{
+    { "Note", "Note" }, { "Wave", "Wave" }, { "Volume", "Volume" },
+    { "Effect1", "Cmd" },  { "Argument1", "Arg"  },
+    { "Effect2", "Cmd2" }, { "Argument2", "Arg2" },
+    // Identity passthroughs for Pedal-Tracker → Pedal-Tracker imports.
+    { "Cmd", "Cmd" }, { "Arg", "Arg" },
+    { "Cmd2", "Cmd2" }, { "Arg2", "Arg2" },
+};
+```
+
+Source columns whose `Parameter.Name` doesn't appear in the destination
+machine's parameter list (e.g. Matilde's global parameters showing up
+as columns at the global-group level) get skipped with a warning.
+Expect ~4 such skips per pattern from Matilde imports — that's
+`AmpDecay`, `Offset`, `Quantize`, `Tuning` (Matilde's globals declared
+in `Tracker.cpp`).
+
+### 11.4 Other observations from the v1.3 work
+
+- `IMachine.CreatePattern(name, length)` and `IMachine.DeletePattern(p)`
+  fire `PatternAdded` / `PatternRemoved` events. MPE subscribes to these
+  per-machine in `MachineVM.cs`, so it auto-syncs its `MPEPatternsDB`
+  whenever you create or delete patterns through the public API. You
+  don't need to manually register with MPE for new patterns — but you
+  DO need to populate their column data, since MPE's auto-add creates
+  an empty `MPEPattern` shell only.
+- `IMachine.TrackCount = N` works as expected on managed machines.
+  Setting it grows or shrinks the per-track parameter columns
+  automatically.
+- `IMachine.ManagedMachine` is part of the public `IMachine` interface
+  and returns the `IBuzzMachine` instance directly — no reflection
+  needed for managed-machine self-introspection (unlike `EditorMachine`
+  which is internal-typed).
+- `PatternEvent.TimeBase = 240` ticks per Buzz tick, hardcoded as
+  `public const int` on the struct. Pattern lengths are stored in Buzz
+  ticks; positions in events are in TimeBase units. Copying patterns
+  verbatim doesn't need any time-base conversion as long as both
+  machines use the same editor (which they do if both use MPE).
+
+---
+
+## 12. Multi-output per-track generators
+
+Added in v1.4 alongside the multi-out feature for routing each pattern
+track to a separate output. Two non-obvious things here.
+
+### 12.1 Activate multi-out by defining the IList Work overload
+
+ReBuzz's managed-machine host detects which Work overload your class
+defines via reflection at registration time
+(`ManagedMachineHost.cs:194-198`):
+
+```csharp
+// Single stereo out — sets MachineInfoFlags.MULTI_IO = false
+public bool Work(Sample[] output, int n, WorkModes mode);
+
+// Multi-out — sets MachineInfoFlags.MULTI_IO = true automatically
+public bool Work(IList<Sample[]> output, int n, WorkModes mode);
+```
+
+Define exactly one. The flag is set at `ManagedMachineDll.cs:84` based
+on which signature the machine class exposes. No explicit `MULTI_IO`
+declaration needed; no attribute parameter for it either.
+
+`IList<Sample[]>` arrives with one entry per output channel. Each entry
+is a stereo `Sample[]` (with per-element `.L` and `.R` floats). ReBuzz
+only allocates a `Sample[]` buffer for outputs that have an active
+connection; unconnected outputs are `null` in the list. So the host
+side does the connection-tracking for you — your render code just
+checks `if (output[i] == null) continue;` and skips writing to that
+slot.
+
+### 12.2 Static `OutputCount` with headroom — NOT dynamic auto-sync
+
+The first instinct is "make `OutputCount` track `TrackCount` so I don't
+expose more outputs than needed." This crashes on song reload. The
+sequence:
+
+1. ReBuzz instantiates the machine. `MachineDecl.OutputCount` sets
+   the initial `MachineCore.OutputChannelCount` at
+   `MachineManager.cs:165`.
+2. ReBuzz restores saved connections from the .bmx file. A connection
+   from "Track 3" has `SourceChannel = 3`.
+3. The audio thread calls into `MachineWorkInstance.WorkMachineManaged`
+   for the first time. Line 145 sizes `multiSamplesOut` to
+   `Machine.OutputChannelCount`. Line 154 indexes
+   `multiSamplesOut[outConnection.SourceChannel]`.
+4. If `SourceChannel >= OutputChannelCount`,
+   `List<>.set_Item(int, T)` throws `ArgumentOutOfRangeException`
+   **before our Work() ever runs**. Any auto-sync logic at the top
+   of Work() is unreachable.
+
+The fix is to declare `OutputCount` with full headroom up front:
+
+```csharp
+[MachineDecl(
+    Name        = "Pedal Tracker",
+    MaxTracks   = MAX_VOICES,           // 16
+    OutputCount = MAX_VOICES + 1)]      // 17 = 1 master + 16 max tracks
+```
+
+This is free at runtime: `MachineWorkInstance.cs:150-160` only
+allocates `Sample[]` buffers for outputs that have a connection. The
+17 - N unconnected slots stay `null` in the list and skip the render
+loop. Zero memory waste, zero per-Work overhead.
+
+`MachineDecl` attribute arguments must be compile-time constants, so
+expressions like `MAX_VOICES + 1` work as long as `MAX_VOICES` is
+declared `public const int` on the same class.
+
+### 12.3 Master output convention
+
+For any tracker-style multi-out generator, conventional layout is:
+
+- **Output 0** — summed master mix (with master gain applied)
+- **Outputs 1..N** — per-track dry signals (no master gain)
+
+The "no master gain on per-track" part matters: if you apply master to
+both, the master fader gain-stages everything you've routed externally,
+which defeats the whole point of per-track routing for external
+processing. Keep per-track outputs dry; the user's external mixer
+handles per-track levels.
+
+### 12.4 Channel naming for the connection menu
+
+ReBuzz looks up `string GetChannelName(bool input, int index)` by name
+via reflection (`ManagedMachineHost.cs:247`). Define it to make the
+right-click → "Connect…" submenu show readable labels:
+
+```csharp
+public string GetChannelName(bool input, int index)
+{
+    if (input) return null;            // generator has no inputs
+    if (index == 0) return "Master";
+    return "Track " + index;           // 1-based for the user
+}
+```
+
+Returning `null` falls back to a generic "out N" label.
+
+### 12.5 Render strategy: per-track scratch, then publish
+
+Allocate a dedicated stereo scratch pair per voice (16 of them, each
+sized to a max audio block — 256 samples is the ReBuzz cap, but
+allocate generously e.g. 2048 to weather any future change). The
+render loop is identical to single-out except every voice writes to
+its own scratch instead of a shared mix.
+
+```csharp
+// Render
+for (int t = 0; t < MAX_VOICES; t++) {
+    if (!_voices[t].Active) continue;
+    Voice.Render(_voices[t], _trackL[t], _trackR[t], n,
+                 interp, _engineRate, /*master:*/ 1f);
+}
+// Publish out 0 — sum + master gain
+if (output[0] != null) {
+    for (int i = 0; i < n; i++) {
+        float l = 0, r = 0;
+        for (int t = 0; t < MAX_VOICES; t++) { l += _trackL[t][i]; r += _trackR[t][i]; }
+        output[0][i].L = l * masterGain * OUT_SCALE;
+        output[0][i].R = r * masterGain * OUT_SCALE;
+    }
+}
+// Publish outs 1..N — per-track dry
+for (int t = 0; t < Math.Min(output.Count - 1, MAX_VOICES); t++) {
+    if (output[t + 1] == null) continue;
+    for (int i = 0; i < n; i++) {
+        output[t + 1][i].L = _trackL[t][i] * OUT_SCALE;
+        output[t + 1][i].R = _trackR[t][i] * OUT_SCALE;
+    }
+}
+```
+
+This makes render cost independent of routing topology (always render
+all voices, even ones whose track output is unconnected — they still
+need to contribute to the master sum on out 0). Per-voice connection
+bookkeeping isn't needed.
+
+### 12.6 Mono samples on stereo outputs
+
+Each multi-out slot is always a stereo `Sample[]` regardless of source
+material. For a mono wave the natural choice is centre-panned mono:
+`L = R = mono * gain`. If your wave-snapshot code already duplicates
+the mono channel into both `L` and `R` arrays at load time (Pedal
+Tracker's `WavetableAccess.SnapAll` does this with
+`Array.Copy(L, MAX_PAD, R, MAX_PAD, sampleCnt)`), no special-case is
+needed in the render loop — the per-voice render path handles mono
+and stereo identically and the per-track output naturally gets
+centre-panned mono content.
+
+---
+
+## 13. Parameter persistence, mute design, and audio/UI threading
+
+Three closely related issues that all surfaced during v1.5 / v1.6 work.
+Together they govern any feature that exposes a UI surface for the
+machine's own globals (right-click menus, custom WPF windows,
+attribute panels) or that toggles `IMachine` properties from inside
+`Work()`.
+
+### 13.1 The direct-property-write trap
+
+There are **two parallel storage locations** for any managed-machine
+parameter:
+
+- `ParameterCore.values[track]` — ReBuzz core's dictionary, written by
+  `parameter.SetValue(track, value)`, read at save time by
+  `BMXMLFile.cs:858`.
+- The C# property's backing field — read by your code, written by
+  either the property's setter (when called via `SetValue`) or by
+  direct assignment.
+
+Writing directly to the C# property updates only the field. The C#
+state changes, audio behaviour reflects the change, the UI can even
+read the new value — **but `values[]` stays at the old value, and
+that's what gets written to the saved song.**
+
+The trap manifests as: "I set this from a right-click menu / custom
+window / hot-key handler, the change worked at runtime, but it's
+gone after save and reload."
+
+```csharp
+// WRONG — updates the field but not values[].  Won't persist.
+items.Add(new MenuEntry(id, "Cubic", () => InterpParam = 2));
+
+// RIGHT — routes through ParameterCore.SetValue, which writes to
+// values[] AND fires our property setter.
+items.Add(new MenuEntry(id, "Cubic",
+    () => WritebackParameter("Interpolation", 2)));
+
+void WritebackParameter(string name, int value)
+{
+    var groups = host?.Machine?.ParameterGroups;
+    if (groups == null || groups.Count < 2) return;
+    foreach (var p in groups[1].Parameters)
+        if (p?.Name == name) { p.SetValue(0, value); return; }
+}
+```
+
+This applies to **any** custom UI that mutates your own globals.
+Pattern automation, peer control, the right-click parameter properties
+dialog all already use `SetValue` — those work correctly without any
+special code on your end. The bug only appears when *you* write a
+custom path that touches the property directly.
+
+For bool parameters use `value ? 1 : 0` when calling `SetValue`.
+
+### 13.2 One-way authority for parameter ↔ machine-state mirrors
+
+If a parameter on your machine logically corresponds to a property on
+`IMachine` (e.g. `MuteParam` ↔ `IMachine.IsMuted`), the temptation is
+bidirectional sync — propagate changes in either direction so they
+stay consistent. **Don't.** It races.
+
+The race shape: setting `IMachine.IsMuted` from the audio thread must
+be marshalled to the UI thread (see §13.3) which is asynchronous via
+`Dispatcher.BeginInvoke`. Between the dispatch and the UI thread
+running, the next audio-thread Work cycle reads the *stale* `IsMuted`
+state, sees a discrepancy with the parameter, and "corrects" it —
+reversing the parameter change that started the cascade.
+
+This is especially nasty with peer-control / multi-instance setups
+where many dispatches queue up at once and the audio thread keeps
+ticking through stale state for several Work cycles before any of
+the UI callbacks land.
+
+The correct design is **one-way authority with idempotent
+re-assertion**:
+
+- The parameter is the source of truth. Direct mutations to the
+  mirrored `IMachine` property are unilateral; we don't try to
+  propagate them back.
+- Every Work cycle, re-assert the desired `IMachine` state from the
+  parameter. Make the assertion idempotent (short-circuit when
+  already matching) so the steady-state cost is one comparison.
+
+```csharp
+// In every Work():
+bool wantMuted = _muteParam && _muteGain <= 1e-4f;
+SetMachineMutedUiSafe(wantMuted);    // no-op when already matching
+```
+
+User-perceived consequence: clicking the UI mute button while the
+parameter says unmute briefly toggles the visual mute then snaps back
+on the next Work cycle. The parameter wins. This is a feature, not
+a regression — it gives users a clear mental model of "this parameter
+controls mute; the UI button is a hard override that the parameter
+ignores."
+
+### 13.3 Setting `IMachine` properties from the audio thread
+
+Direct: `host.Machine.IsMuted = true` from inside `Work()`.
+
+What ReBuzz does: `MachineCore`'s setter runs on the calling thread,
+fires `PropertyChanged.Raise(this, "IsMuted")` synchronously. The
+machine view's `MachineControl.cs:143` listener catches the
+notification, re-raises its own `PropertyChanged` for
+`MachineBackgroundColor` and `NameText` — **also synchronously, on
+the audio thread**.
+
+WPF's data-binding system silently fails to update visuals when the
+notification arrives on a non-UI thread. The internal state changes
+correctly (the machine actually mutes), the right-click parameters
+view reads the right value (because that view is queried on the UI
+thread), but the machine-view box doesn't darken and its name doesn't
+gain parentheses.
+
+The fix is to marshal the assignment via `Application.Current.Dispatcher.BeginInvoke`,
+which puts the property write on the UI thread so the
+`PropertyChanged` cascade reaches WPF's bindings on the right thread:
+
+```csharp
+void SetMachineMutedUiSafe(bool muted)
+{
+    var m = host?.Machine;
+    if (m == null || m.IsMuted == muted) return;       // idempotent
+
+    var dispatcher = System.Windows.Application.Current?.Dispatcher;
+    if (dispatcher == null || dispatcher.CheckAccess())
+    {
+        m.IsMuted = muted;                              // already on UI thread
+    }
+    else
+    {
+        dispatcher.BeginInvoke(new System.Action(() =>
+        {
+            try { if (host?.Machine != null) host.Machine.IsMuted = muted; }
+            catch { }
+        }));
+    }
+}
+```
+
+`BeginInvoke` is non-blocking — the audio thread doesn't stall waiting
+for the UI thread. The idempotence check at the top means most calls
+are a single comparison and a return.
+
+This pattern generalises to **any** `IMachine` property whose change
+drives a WPF binding. Setting `IsBypassed`, `Name`, or anything else
+from `Work()` will hit the same trap. Audit every assignment to a
+host-property from the audio thread and route it through a
+UI-thread-safe wrapper.
+
+### 13.4 Mute-with-fade design pattern
+
+Pattern parameter (`MuteParam : bool`, `MuteInertiaParam : int`) +
+runtime fade state (`_muteGain : float`, `_muteTarget : float`). The
+parameter setter sets `_muteTarget`; Work() advances `_muteGain`
+toward target every block. Output gain is the per-sample lerp from
+the entry-block gain to the exit-block gain.
+
+Per-block trajectory advance:
+
+```csharp
+static float AdvanceFade(float current, float target, int n, int inertiaSamples)
+{
+    if (current == target) return current;
+    if (inertiaSamples <= 0) return target;
+    float step = n / (float)inertiaSamples;
+    return target > current
+        ? System.Math.Min(target, current + step)
+        : System.Math.Max(target, current - step);
+}
+```
+
+Per-sample apply inside publish loops:
+
+```csharp
+float invN  = (n > 1) ? 1f / (n - 1) : 0f;
+float delta = end - start;
+for (int i = 0; i < n; i++) {
+    float gain = start + delta * (i * invN);
+    out[i] = source[i] * gain;
+}
+```
+
+For per-track variants (16 independent fades), use stack-allocated
+spans for the per-track start/end gains so the audio thread doesn't
+allocate:
+
+```csharp
+System.Span<float> tmStart = stackalloc float[MAX_VOICES];
+System.Span<float> tmEnd   = stackalloc float[MAX_VOICES];
+```
+
+Useful template for any "smooth-toggleable" feature: per-track Pan,
+Solo, ducking, future automation lanes.
+
+### 13.5 The `_workCalls == 0` snap-on-load trick
+
+When a song loads, ReBuzz pushes saved parameter values through your
+setters before the audio engine starts. If your setter triggers a
+fade (e.g. `_muteTarget = value ? 0 : 1`), the fade will start from
+whatever the field initializer was (typically 1.0) and ramp to the
+loaded value — audible fade in/out at song load.
+
+The fix: snap the gain to target when no Work() has run yet:
+
+```csharp
+public bool MuteParam
+{
+    set
+    {
+        if (_muteParam == value) return;
+        _muteParam = value;
+        _muteTarget = value ? 0f : 1f;
+        // On song load (before any Work() has run), snap so we don't
+        // fade in/out from the previous state.
+        if (_workCalls == 0) _muteGain = _muteTarget;
+    }
+}
+```
+
+Diagnostic counters double as a "have we started rendering yet?"
+flag. Cheap, no extra state, robust against the load sequence.
+
+### 13.6 Bug-class summary
+
+If you find yourself writing a custom UI for your own parameters
+or mirroring a parameter to an `IMachine` property, run through this
+checklist:
+
+| Question | Right answer |
+|----------|--------------|
+| Does the change come from a custom UI handler? | Use `parameter.SetValue`, never direct property assignment. |
+| Are you setting an `IMachine` property from `Work()`? | Marshal via `Dispatcher.BeginInvoke`. |
+| Does state need to mirror in two directions? | Don't. Pick one as authoritative; re-assert idempotently every Work. |
+| Does a fading parameter affect audio at song-load time? | Snap to target when `_workCalls == 0`. |
+| Does the fade need to coexist with the host's zero-CPU bypass? | Re-assert `IsMuted` from the parameter+fade state every Work cycle so bypass engages exactly when the fade hits zero. |
+
+---
+
+## 14. Zero-CPU bypass and the resume problem (considered, rejected)
+
+> **Verdict from v1.7**: this approach was tried in v1.5–v1.6.4 and
+> ultimately rolled back.  The machinery described in this section is
+> NOT present in the current production code.  See §15 for the design
+> we settled on (always-render).  This section is preserved as
+> reference material for anyone tempted to add host-side bypass back —
+> the trade-offs and the corner cases are non-obvious and easy to
+> re-derive incorrectly.  If you find yourself wanting zero-CPU mute,
+> read §15.4 first to see why we walked away from it.
+
+ReBuzz's zero-CPU bypass for muted machines (engaged when
+**Settings → Audio → Process muted machines** is unchecked AND
+`IMachine.IsMuted == true`) gates the entire render path: line 229 of
+`MachineWorkInstance.WorkMachineManaged` returns immediately with a
+silentBuffer write, our managed `Work()` is never called for that
+audio block. Saves real CPU when many trackers are muted in dense
+projects.
+
+The trap: **Tick still fires** during the bypass period.
+`MachineWorkInstance.Tick` at line 568 runs whenever
+`PosInTick == 0` (or sub-tick boundary), independent of mute state.
+That's how managed machines get parameter setters delivered. So while
+Work is bypassed, our property setters keep running on every tick
+boundary, dispatched by the pattern engine as song position advances
+through whatever rows happen during the muted period.
+
+Per-track per-row setters (`SetNote`, `SetWave`, `SetVolume`,
+`SetCmd`, `SetArg`) write to `voice.PendingX` fields and set
+`HasNewX = true`. **`HasNewX` flags are one-shot**, normally cleared
+by `ApplyPendingParameters` inside `Work()`. With Work bypassed,
+the flags never clear; subsequent tick boundaries overwrite the
+`PendingX` values with whatever's on the latest row.
+
+After many bypassed ticks, voice state is:
+
+- `PendingNote` / `PendingWave` / `PendingVolume` / `PendingCmd[]` /
+  `PendingArg[]` all hold the values from the **most recent row**
+  delivered during the bypass — usually a row from many beats ago,
+  not the row the song will be on when bypass releases.
+- `HasNewX` flags are all true.
+- Active voices that were sounding when bypass engaged are frozen:
+  their `Pos` doesn't advance because Render didn't run, but they're
+  still flagged `Active = true` with whatever `CurrentGain` they had.
+  The note that "should" have ended naturally at sample end is
+  still hanging in pause.
+- Per-voice envelope/effect state (vibrato phase, porta progress,
+  sub-tick countdowns) is similarly frozen.
+
+When `IsMuted` clears and Work resumes, two things go wrong without
+intervention:
+
+1. The first call to `ApplyPendingParameters` consumes the stale
+   `HasNewX` flags and triggers a note from a row in the past
+   (whatever the last row before resume was). Audibly this is a
+   missed beat or a snare hitting where there should be silence.
+2. Active-but-frozen voices continue rendering from their stale
+   `Pos`, playing the wrong moment of the sample.
+
+### 14.1 Detection: was Work just resumed from bypass?
+
+The audio thread can't directly observe "Work was bypassed for the
+last N audio blocks." It can only see whether Work is running NOW
+and what `IMachine.IsMuted` says. A reliable heuristic:
+
+- Track `_prevIsMuted` — what `IsMuted` was last time Work ran.
+- Track `_muteCyclesObservedInWork` — how many Work cycles have
+  observed `IsMuted == true`. Increment when Work runs while muted,
+  reset to zero whenever Work runs while unmuted.
+
+The resume-from-bypass condition is then:
+
+```csharp
+bool isMutedNow = host?.Machine?.IsMuted ?? false;
+if (_prevIsMuted && !isMutedNow && _muteCyclesObservedInWork == 0)
+{
+    // We're back from the zero-CPU bypass — discard stale state.
+    DiscardStaleState();
+    _prevSongPos = int.MinValue;   // next genuine row registers as a new row
+}
+_prevIsMuted = isMutedNow;
+_muteCyclesObservedInWork = isMutedNow ? _muteCyclesObservedInWork + 1 : 0;
+```
+
+The counter distinguishes the bypass case from the
+`ProcessMutedMachines = true` case (where Work runs throughout the
+muted period and the inner gate at line 263 substitutes silentBuffer
+for the output AFTER Work has run). In that mode pending state never
+accumulates — `ApplyPendingParameters` consumed it as it arrived
+during muted-but-running Work cycles — so the discard isn't needed
+and would in fact drop legitimate just-delivered setter values.
+
+### 14.2 Discard, but preserve persistent column state
+
+The voice-level state to discard:
+
+- `HasNewNote`, `HasNewWave`, `HasNewVolume`, `HasNewCmd[]` — the
+  one-shot flags that would consume stale pending values.
+- `Active`, `InLoop`, `PingPongDir`, `EffectSamplesAccum` — frozen
+  voice state.
+- `VibratoActive` + phase/speed/depth, `PortaActive` + target/speed
+  — effects attached to the no-longer-playing note.
+- `NoteDelaySamples`, `NoteCutSamples`, `RetrigPeriodSamples`,
+  `RetrigCountdown`, `RetrigActive` — sub-tick countdowns scheduled
+  relative to a timeline that's now in the past.
+- `CurrentGain`, `TargetGain` — voice envelope (since voice is
+  deactivating).
+- `HasPendingTrigger`, `PendingSnap`, `PendingMidi`, `PendingPos` —
+  deferred-trigger handoff state.
+
+The voice-level state to **preserve**:
+
+- `ActiveWaveSlot` — tracker convention is that note-only rows
+  (rows where the Wave column is empty) play the last-explicitly-set
+  wave. If you reset this on resume, a `kick . . .` pattern where
+  only row 0 specifies the wave would play silence on rows 4, 8,
+  12 of the next pattern after resume.
+- `Volume` — same logic. The user might have a track muted on a
+  row that set a non-default Volume column value; reset would snap
+  to 1.0, audible level jump.
+- `Pos` doesn't matter (the voice is being deactivated; Pos is
+  re-seated by the next genuine note trigger anyway), but no harm
+  leaving it.
+
+Pedal Tracker's `Voice.DiscardForResume()` implements exactly this
+partial-reset, alongside the full `Voice.Reset()` that's used at
+machine construction.
+
+### 14.3 The unmute-from-inside-bypass flow
+
+When the user toggles the parameter back to unmute via peer control
+or pattern automation during the bypass period, the setter fires
+(Tick is still running). In Pedal Tracker, the `MuteParam` setter's
+unmute path immediately calls `SetMachineMutedUiSafe(false)` to
+dispatch `IsMuted = false` on the UI thread:
+
+```csharp
+public bool MuteParam {
+    set {
+        if (_muteParam == value) return;
+        _muteParam = value;
+        _muteTarget = value ? 0f : 1f;
+        ...
+        // Unmute path: clear ReBuzz's bypass immediately so Work
+        // gets called again on the next audio cycle.  Mute path:
+        // leave IsMuted alone — top-of-Work assertion will set it
+        // to true once the fade-down completes (gain hits zero).
+        if (!value) SetMachineMutedUiSafe(false);
+    }
+}
+```
+
+Without the immediate dispatch, the unmute would be stuck: Work
+needs to run to clear `IsMuted`, but `IsMuted = true` keeps Work
+bypassed. Setter on the audio thread is the only thread where we
+can break the cycle from inside the bypass.
+
+Once `IsMuted` clears, the next Work cycle runs, the resume-from-
+bypass detection fires, `DiscardForResume` clears stale state, and
+the next genuine pattern row delivers a clean trigger.
+
+### 14.4 The cost-trade-off
+
+Zero-CPU bypass is genuinely zero CPU: not just our Work() but the
+entire output-buffer write path is skipped, and `silentBuffer` is
+substituted directly. For a project with 16 trackers where 12 are
+muted at any moment, the saving is the render cost of those 12
+machines.
+
+The cost is one row of pattern data lost across each mute boundary.
+Whatever pending setter state had accumulated when bypass releases
+is discarded, so the next genuine pattern row is the first audio
+the user hears. At typical TPB×BPM (16 ticks per beat at 156 BPM ≈
+24 ms per row) the loss is sub-perceptual for most musical
+contexts. For slow tempos or live-performance triggering it can be
+audible as a missed first beat after un-muting.
+
+If a future requirement makes that row-loss unacceptable, the
+alternative discussed but not implemented in v1.6.3 is "stop new
+triggers immediately, fade existing voices over MuteInertia,
+engage `IsMuted = true` only when all voices are quiet." This
+preserves natural ring-out at the cost of delayed bypass engagement
+and slightly more complex state machinery; see the v1.6.3 design
+discussion for the trade-off shape.
+
+### 14.5 Generalisation: detecting any host-side bypass resume
+
+The `_prevState + _cyclesObserved` pattern works for any host-side
+bypass condition the audio thread can observe via an `IMachine`
+property. Examples beyond `IsMuted`:
+
+- `IMachine.IsBypassed` — passes input through unchanged for
+  effects (but generators don't use this)
+- `IMachine.IsSoloed` interaction with `Song.SoloMode` — a
+  generator that's not soloed during solo mode is bypassed at line
+  166 of `WorkMachineManaged`
+- `IMachine.IsSeqMute` — sequence-mute, separate from per-machine
+  mute
+
+Any of these cause Work to skip while Tick may still fire (depending
+on the bypass site). If you build a feature that depends on Work
+running continuously to manage state, plan for the skipped-Work
+case the same way: detect resume, discard whatever stale state has
+accumulated, let the next genuine setter call deliver fresh data.
+
+
+---
+
+## 15. Always-render mute (production design from v1.7)
+
+The production master-mute and per-track-mute design after v1.7 is
+deliberately simpler than what v1.5–v1.6.4 tried. The full machinery
+described in §14 was removed because the trade-off didn't work for
+this machine's workloads. This section documents what's actually in
+the code and why we chose it.
+
+### 15.1 The design
+
+Two layers of fade gain applied in the publish loops, no interaction
+with `IMachine.IsMuted`:
+
+```csharp
+// Master mute (one parameter, one fade gain pair)
+public bool MuteParam { ... }                  // pattern-automatable switch
+float _muteGain   = 1f;                        // current
+float _muteTarget = 1f;                        // ramp toward
+
+// Per-track mutes (16 parameters, 16 fade gain pairs)
+public bool MuteT1..MuteT16 { ... }            // 16 individual switches
+float[] _trackMuteGain   = new float[16];      // all initialized to 1.0
+float[] _trackMuteTarget = new float[16];      // ditto
+```
+
+Setters update the corresponding `_muteTarget` (or `_trackMuteTarget[t]`)
+and snap `_muteGain` to target on first call (`_workCalls == 0`)
+to avoid audible flips on song load. Work() runs continuously every
+audio block. The publish loops compute per-block fade trajectories
+once (via `AdvanceFade(current, target, n, inertiaSamples)`) and
+linearly interpolate per sample inside both the master sum and the
+per-track multi-out copies. `IMachine.IsMuted` is never written from
+our side.
+
+The cost: the machine renders all 16 voice slots every audio block,
+regardless of whether anything is audible. Voices that aren't
+triggered cost nothing (the render loop skips `!v.Active` voices).
+Active voices triggered at root pitch use v1.6.2's interpolation
+bypass and are nearly free. The actual CPU footprint of a fully
+muted Pedal Tracker is small enough that "always render" is
+practically the same as "zero-CPU bypass" for most projects.
+
+### 15.2 Why this works for trackers
+
+Trackers play short, transient samples (drums, plucks, hits) at
+their native pitch most of the time. Each voice's render loop is
+a tight `src[i0]` read plus a couple of multiplies (gain, fade
+trajectory). A full 16-voice block at 256 samples is in the order
+of 4096 multiply-adds and 4096 adds for the master sum — single-
+digit microseconds on modern CPUs. The render cost of an entire
+muted Pedal Tracker is negligible.
+
+The host-side bypass was an attempt to optimise something that
+wasn't a bottleneck in practice, at the cost of breaking smooth
+peer-controlled mute swaps. Bad trade for this machine type.
+
+For a managed machine that actually does expensive per-block work
+(e.g. an FFT-heavy effect, granular synthesis, convolution), the
+trade-off would tilt the other way and §14's machinery would be
+worth revisiting.
+
+### 15.3 Peer-controlled swap as the deciding workflow
+
+The use case that made always-render essential: 8 (or more)
+Pedal Tracker instances arranged into two groups (e.g.
+{a,c,e,g} vs {b,d,f,h}), each tracker playing a near-identical
+pattern variation, with a peer-control machine toggling
+`MuteParam` on one group at a time. The user wants to A/B
+between groups smoothly to compose live.
+
+With host-side bypass: the muted group's voices freeze
+mid-render, pattern engine ticks accumulate one row of stale
+setter state, and on resume the audible result is one of:
+- A missed beat at the swap row (DiscardForResume drops state)
+- A late trigger from a row already past (no DiscardForResume)
+- A stale-Pos artefact from the frozen voice continuing to render
+
+All three are perceptible. None match what the user hears with
+a downstream gain machine doing the same A/B switch.
+
+With always-render: both groups render continuously. The
+parameter just crossfades between two identical signals via the
+output gain. Bit-identical to the downstream-gain solution,
+no perceptible artefacts.
+
+The peer workflow is the most demanding case but it's also the
+most musical case — composers reach for it because it sounds
+right. Optimising the implementation for "musically right at
+all costs" was the right call.
+
+### 15.4 If you're tempted to add zero-CPU bypass back
+
+Read §14 in full first, then think about whether the workloads
+you care about actually save enough CPU to be worth the
+behavioural complexity. The signposts:
+
+- **What does an idle voice cost?** If your render loop has
+  expensive per-block work that doesn't depend on having active
+  voices (FFT setup, convolution kernel application, oversampled
+  filter state), you might genuinely save CPU by skipping Work.
+  Pedal Tracker doesn't — idle voices are skipped via `!v.Active`
+  early in the loop, no fixed per-block overhead.
+- **Will users ever swap muted instances?** If yes, host-side
+  bypass introduces audible artefacts on swap and you'll be
+  fighting them with DiscardForResume-style mitigations that
+  trade one kind of artefact for another. If no (e.g. mute is
+  only used to silence permanently-unused tracks), bypass is
+  free.
+- **Can you keep both?** A per-instance setting ("Smooth Mute"
+  vs "Zero-CPU Mute") is technically possible — the bypass-
+  resume detection plays nicely alongside always-render code as
+  long as the bypass is opt-in. We considered this in v1.6.4
+  development but rejected it for surface-area reasons. Worth
+  revisiting only if a real workload appears that benefits.
+- **The UI mute button stays a hard kill regardless.** Clicking
+  the standard Buzz mute button on the machine sets
+  `IMachine.IsMuted = true` directly via `MachineControl.cs:207`
+  — no path goes through your code. With ProcessMutedMachines=
+  false, ReBuzz bypasses you. Whatever your parameter design,
+  the UI button is always a hard kill. Don't try to mirror it
+  to your parameter (see §13.2 for why bidirectional sync
+  doesn't work).
+
+### 15.5 The lesson generalised
+
+When a host offers a CPU-saving optimisation that requires you
+to give up state continuity, evaluate the trade-off against the
+*actual* workloads users will exercise, not the worst case the
+optimisation was designed to address.
+
+For a tracker: workloads are mostly cheap (sample reads, fade
+multiplies). State continuity matters because the user can
+swap-mute machines musically. Conclusion: always render.
+
+For a different machine type the answer might flip. The point
+isn't that host-side bypass is bad — it's that the framework
+exposes it as an option, and you have to decide whether your
+workload benefits more from the CPU saving or suffers more from
+the state discontinuity. Pedal Tracker's answer happens to be
+"render always". Document yours either way.
