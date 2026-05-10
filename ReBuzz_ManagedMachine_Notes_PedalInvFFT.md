@@ -1476,3 +1476,115 @@ edits.
 The implication for v2.2: when v2.3 lands with (say) spectral morph,
 this entire 64-preset bank stays valid. Some presets might benefit
 from being updated to use the new feature, but none will break.
+
+---
+
+## 24. Defensive track-index bounds checking — external writes can exceed MaxTracks
+
+v2.2.1 hot-fix. PedalInvFFT crashed with `IndexOutOfRangeException` in
+`SetNote` when Pedal Muter was used to mute the machine. The crash
+revealed an assumption that doesn't hold in practice: that the `track`
+parameter delivered to a setter is always in `[0, MaxTracks-1]`.
+
+### 24.1 What actually arrives at the setter
+
+`MaxTracks` in `MachineDecl` is an upper bound advertised to the host,
+not a hard contract. ReBuzz routes parameter writes through
+`ManagedMachineHost.SetParameterValue(index, track, value)`, and the
+`track` argument is whatever the *writer* supplied — there's no
+clamp at the host layer. Any control machine driving your
+parameters can write to track values outside your declared range:
+
+- **Pedal Muter** (PedalMuter notes — `Track-scan fallback in
+  FlushStaleVoicesOnMachine = 16`) scans tracks 0..15 when injecting
+  Note.Off=255 to flush stale voices on a target machine, regardless
+  of the target's actual MaxTracks. The 16-track ceiling covers
+  polyphonic synths that haven't bumped their `TrackCount` to match
+  their MaxTracks (Core §19). For PedalInvFFT (MaxTracks=8), tracks
+  8..15 are out-of-range writes.
+- **Pattern editor**, **MIDI converters**, and other tools generally
+  write within your declared range, but there's no protocol-level
+  guarantee.
+
+The setter must therefore treat `track` as untrusted input and
+range-check before using it as an array index.
+
+### 24.2 The minimal fix
+
+Guard the firing-track write only:
+
+```csharp
+public void SetNote(Note value, int track)
+{
+    if (track >= 0 && track < _voices.Length)
+    {
+        byte v = value.Value;
+        if (v == Note.Off)        _voices[track].QueueNoteOff();
+        else if (v != 0)          _voices[track].QueueNoteOn(v);
+    }
+
+    // Sibling-polling loop is already bounded to _voices.Length —
+    // safe regardless of the firing track value.
+    ...
+}
+```
+
+Skip silently on out-of-range rather than throwing or logging. The
+write was meant for "track 8" which doesn't exist on this voice —
+the only meaningful response is to ignore it. Logging would spam
+under Pedal Muter's per-mute 16-track sweep.
+
+### 24.3 The polling loop already does the right thing
+
+For the Pedal Muter scenario specifically, the existing
+sibling-polling block in `SetNote` (§18) handles the *correct*
+behaviour automatically:
+
+1. Pedal Muter writes Note.Off=255 to pvalues[0..15] for the target's
+   note parameter.
+2. ReBuzz's `parametersChanged` collision (§18) means our `SetNote`
+   is called once with `track=15` (or whichever was last written).
+3. Our bounds check skips the firing-track write (track 15 is
+   out-of-range for our 8 voices).
+4. The polling loop iterates `_voices.Length` slots (0..7) and reads
+   pvalues[0..7], all of which contain 255 (Note.Off).
+5. Each voice gets `QueueNoteOff()` — exactly the mute behaviour
+   Pedal Muter intended.
+
+So PedalInvFFT now handles Pedal Muter's stale-voice flush
+*correctly* (all voices released on mute), not just *without
+crashing*. The bounds-check fix unlocked a feature interaction the
+original code couldn't reach.
+
+### 24.4 Generalization to other track-parameter setters
+
+Any `[ParameterDecl]` method that takes an `int track` parameter and
+uses it to index per-voice state must apply the same defensive
+check. PedalInvFFT currently only has `SetNote`, but future
+parameters identified in the README's future-work list — per-track
+Detune, per-track Volume offsets, per-track Brightness offsets —
+would each need the guard.
+
+The pattern generalizes beyond polyphonic synths. Any managed
+machine with track parameters should bounds-check the `track`
+argument before indexing per-track state, on the assumption that
+`MaxTracks` is a hint to the host but not a contract from external
+writers.
+
+### 24.5 Why this didn't surface earlier
+
+The crash needed three conditions simultaneously:
+
+- A polyphonic managed machine with `MaxTracks > 1` (so the setter
+  uses `track` as an array index in the first place).
+- An external control machine that writes track values beyond
+  `MaxTracks`. Pedal Muter is the most prominent in this project's
+  ecosystem; the pattern editor and MIDI converters stay within
+  range, so manual play-and-test wouldn't trigger it.
+- The user actually trying to mute the polyphonic synth via the
+  external controller — the specific interaction that brings the
+  out-of-range write to `SetNote`.
+
+PedalM1 (Core §14 reference for the polyphonic-managed-synth
+pattern) is presumably also vulnerable; worth checking and
+hot-fixing there too if it isn't already.
