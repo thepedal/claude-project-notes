@@ -3,6 +3,8 @@
 Source: ReBuzz 1817-preview behaviour + Pedal Comp / Pedal Tracker / Pedal
 Muter v1.0 deployment experience.
 Updated with findings from Pedal Dly PCM41 v1.0 build.
+Updated with findings from Pedal Plaits v0.1 scaffolding session
+(TargetFramework / UseWPF / post-build deploy / two-namespace usings).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -40,10 +42,12 @@ ReBuzz install lives).
 ### 1.2 Mandatory `.csproj` properties for every machine
 
 Every managed machine `.csproj` in this project must include the
-following four properties in a `<PropertyGroup>`:
+following six properties in a `<PropertyGroup>`:
 
 ```xml
 <PropertyGroup>
+  <TargetFramework>net10.0-windows</TargetFramework>
+  <UseWPF>true</UseWPF>
   <DebugType>none</DebugType>
   <DebugSymbols>false</DebugSymbols>
   <GenerateDependencyFile>false</GenerateDependencyFile>
@@ -51,12 +55,34 @@ following four properties in a `<PropertyGroup>`:
 </PropertyGroup>
 ```
 
+- `TargetFramework=net10.0-windows` matches the framework ReBuzz's own
+  DLLs are built against. Targeting `net8.0-windows` (or anything older)
+  produces a hard error at link time:
+
+  ```
+  error CS1705: Assembly 'BuzzGUI.Interfaces' with identity '…' uses
+  'System.Runtime, Version=10.0.0.0, …' which has a higher version than
+  referenced assembly 'System.Runtime, Version=8.0.0.0, …'
+  ```
+
+  Symptoms surface only at compile, never at runtime — so a build that
+  worked on a developer's machine targeting an older framework would
+  silently fail the moment ReBuzz upgrades. Pin to `net10.0-windows`
+  unconditionally.
+
+- `UseWPF=true` is required because `BuzzGUI.Interfaces.dll` transitively
+  references WPF types (`WindowsBase`, `PresentationCore`,
+  `PresentationFramework`). Without it the SDK does not pull in those
+  reference assemblies and types from them — directly or transitively
+  used by ReBuzz's interfaces — fail to resolve. Set it on every
+  managed machine, even ones with no GUI of their own.
+
 - `DebugType=none` stops `.pdb` generation entirely.
 - `DebugSymbols=false` is the matching companion to `DebugType=none`.
 - `GenerateDependencyFile=false` suppresses the `.deps.json`.
-- `NoWarn=MSB3277` suppresses assembly version-conflict warnings caused by
-  ReBuzz shipping DLLs built against older framework versions. See §4 for
-  the full explanation.
+- `NoWarn=MSB3277` suppresses assembly version-conflict warnings caused
+  by ReBuzz shipping DLLs built against older framework versions. See
+  §4 for the full explanation.
 
 This applies to:
 - any new machine scaffolded in this project,
@@ -64,28 +90,71 @@ This applies to:
 - any time a `.csproj` is reviewed and these are found to be missing —
   flag and add them.
 
-### 1.3 If you want to keep `.pdb`s for local diagnostics
+For `AssemblyName` see §2 (it's mandatory but has its own conventions
+to discuss).
 
-If you'd rather still produce `.pdb`s in your build output for your own
-debugging use (without deploying them), use `<DebugType>portable</DebugType>`
-or `<DebugType>pdbonly</DebugType>` instead of `none`, and instead
-narrow your deploy step to `*.dll` only. For example, with a post-build
-copy task:
+### 1.3 Mandatory post-build deploy target
+
+Every managed machine `.csproj` must include a post-build target that
+copies the freshly-built `.dll` into ReBuzz's gear folder. Generators
+go to `Gear\Generators`, effects to `Gear\Effects`:
 
 ```xml
+<!-- For generators -->
 <Target Name="DeployToReBuzz" AfterTargets="Build">
   <Copy SourceFiles="$(TargetPath)"
-        DestinationFolder="C:\Program Files\ReBuzz\Gear\Generators" />
+        DestinationFolder="C:\Program Files\ReBuzz\Gear\Generators\"
+        ContinueOnError="true" />
+</Target>
+
+<!-- For effects -->
+<Target Name="DeployToReBuzz" AfterTargets="Build">
+  <Copy SourceFiles="$(TargetPath)"
+        DestinationFolder="C:\Program Files\ReBuzz\Gear\Effects\"
+        ContinueOnError="true" />
 </Target>
 ```
 
-Note `$(TargetPath)` — this is the `.dll` only, not `$(TargetDir)\*.*`
-which would sweep up the `.pdb` and `.deps.json` too. The default
-configuration in §1.2 still removes the files at source, which is
-simpler; the `pdbonly`-plus-narrow-copy variant is for when local
-debugging needs the symbols.
+Notes on the shape:
 
-### 1.4 Caveat — when `.pdb` deployment is justified
+- **`AfterTargets="Build"`** runs the copy on every build (Debug and
+  Release), not just publish. Most managed-machine iteration is
+  Debug-only — if the copy only fired on publish, the deploy would
+  never happen during normal development.
+- **`$(TargetPath)`** resolves to the just-built `.dll` only — not
+  `$(TargetDir)\*.*` which would sweep up any leftover `.pdb` or
+  `.deps.json`. With the §1.2 properties those files aren't generated,
+  but using `$(TargetPath)` makes the rule "deploy *just* the dll"
+  explicit and survives a §1.2 misconfiguration.
+- **`ContinueOnError="true"`** is essential. ReBuzz holds an open
+  handle on every loaded machine DLL; if it's running when you
+  rebuild, the Copy fails with a sharing-violation error and would
+  otherwise turn the whole build red. With ContinueOnError, the build
+  still succeeds — close ReBuzz and rebuild to refresh the deployed
+  DLL.
+
+If ReBuzz is installed somewhere other than `C:\Program Files\ReBuzz`,
+change the one path in the csproj and that's it; this isn't worth
+parameterising via a `<Property>` because most machines in the project
+share the same install path.
+
+### 1.4 Keeping `.pdb`s for local diagnostics
+
+The default in §1.2 disables `.pdb` generation entirely. If you want
+symbol files in your local build output for stepping in a debugger —
+without changing what gets deployed — swap two properties:
+
+```xml
+<DebugType>portable</DebugType>      <!-- was: none -->
+<DebugSymbols>true</DebugSymbols>    <!-- was: false -->
+```
+
+The §1.3 Copy task uses `$(TargetPath)` (the `.dll` only) so the
+`.pdb` stays in `bin\<Config>\` and never reaches ReBuzz's gear
+folder. Deployment hygiene is preserved while you get full file/line
+info in the IDE.
+
+### 1.5 Caveat — when `.pdb` deployment is justified
 
 If you're chasing a hard-to-reproduce crash in the wild (e.g. a deadlock
 of the kind in Core §21 that only manifests at the Nth instance), having
@@ -336,3 +405,93 @@ The zip's filename matches the subdir name: `pedalinvfft.zip` contains
 `pedalinvfft/`, `pedalcomp.zip` contains `pedalcomp/`, etc. No version
 suffix in the filename — git history or a separate release-notes file
 tracks versions.
+
+---
+
+## 6. Source-side namespaces — `Buzz.MachineInterface` vs `BuzzGUI.Interfaces`
+
+The SDK types managed machines need are split across **two namespaces in
+the same DLL** (`BuzzGUI.Interfaces.dll`). The `<Reference>` in the
+csproj covers both; only the `using` directives need to import each.
+
+### 6.1 Which types live where
+
+**`Buzz.MachineInterface`** — the machine SDK surface that native Buzz
+machines also use, faithfully reproduced for managed compatibility:
+
+- `IBuzzMachine` — the interface every machine class implements
+- `IBuzzMachineHost` — the host-provided context object
+- `MachineDecl` / `MachineDeclAttribute`
+- `ParameterDecl` / `ParameterDeclAttribute`
+- `Note` — the note struct (with `Value`, `ToMIDINote()`, `Off`, etc.)
+- `Sample` — the stereo sample struct (`L`, `R`)
+- `WorkModes` — the enum passed to `Work()`
+- `MasterInfo` / `SubTickInfo` — the timing structs reachable from
+  `IBuzzMachineHost.MasterInfo`
+- `Transformations` — value transformation enum used in `ParameterDecl`
+
+**`BuzzGUI.Interfaces`** — higher-level interfaces for talking to the
+host's object graph:
+
+- `IMachine` — what `IBuzzMachineHost.Machine` returns
+- `IParameter`, `IParameterGroup`, `IPattern`, `IPatternColumn`, …
+- `IBuzz` — the top-level host object, reached via
+  `host.Machine.Graph.Buzz` and used for things like the transport-stop
+  poll in Core §27 (`.Playing`)
+- `ParameterType`, `ParameterFlags`, `ParameterGroupType` — the enums
+  ReBuzz uses to describe parameters
+- `BuzzNote` — the static constants helper for raw byte note values
+
+### 6.2 The mandatory using directives
+
+Every managed machine's main file (the one with `[MachineDecl]` on a
+class implementing `IBuzzMachine`) must have **both** usings:
+
+```csharp
+using Buzz.MachineInterface;   // IBuzzMachine, IBuzzMachineHost, MachineDecl,
+                               // ParameterDecl, Note, Sample, WorkModes
+using BuzzGUI.Interfaces;      // IMachine, IBuzz, ParameterType,
+                               // anything reached through .Graph.Buzz
+```
+
+Leaving out the first produces a cascade of CS0246 errors at every
+SDK-type reference:
+
+```
+error CS0246: The type or namespace name 'IBuzzMachine' could not be found
+error CS0246: The type or namespace name 'MachineDecl' could not be found
+error CS0246: The type or namespace name 'ParameterDecl' could not be found
+error CS0246: The type or namespace name 'Note' could not be found
+error CS0246: The type or namespace name 'Sample' could not be found
+error CS0246: The type or namespace name 'WorkModes' could not be found
+…
+```
+
+Leaving out the second usually compiles (because the type chain is
+walked through interface return types) but fails the moment the code
+does anything explicit with an `IMachine` or `IBuzz` reference.
+
+### 6.3 Helper files usually need neither
+
+DSP helper files (voice classes, filters, oscillators, engines, utility
+classes) typically use only primitives and the project's own types —
+no SDK contact. Don't add the SDK usings prophylactically; only add
+them where actually needed. This keeps it obvious from the using block
+whether a given file touches host state or is pure DSP.
+
+The dividing line is usually the file with `IBuzzMachine` on a class:
+that one needs both usings; everything beneath it (Voice.cs, Filter.cs,
+Engine.cs, etc.) needs neither unless it explicitly takes a `Sample[]`
+parameter or similar.
+
+### 6.4 Why this isn't caught by IDE auto-import
+
+A fresh `class : IBuzzMachine { }` declaration in a new file with no
+usings will trigger the IDE's "missing using" lightbulb — but a wrong
+import (`using BuzzGUI.Interfaces;` alone, as a guess from "well that's
+the DLL we reference") looks plausible and the IDE doesn't suggest
+*adding* `Buzz.MachineInterface` because the BuzzGUI one already
+"covers" the assembly. You only find out at build time.
+
+The rule for scaffolding: **both usings, every time**, on the main
+machine file. Cheap to write, blocks a known footgun.
