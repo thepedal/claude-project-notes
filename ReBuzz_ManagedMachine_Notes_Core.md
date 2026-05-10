@@ -3,9 +3,10 @@
 Source: ReBuzz 1817-preview source code + debugging session for Pedal Chord.
 Updated with findings from Pedal EQ v1.2 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Dly PCM41 v1.0 build (ReBuzz 1819-preview).
+Updated with findings from Pedal Plaits v0.4 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
-Sections 1–28 are general findings that apply across managed machines.
+Sections 1–29 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -1313,3 +1314,129 @@ are human-readable strings whose presentation isn't materially worse
 for saying "or" instead of `/` or "less than" instead of `<`. The cost
 of ignoring the rule is a hang that's hard to attribute because the
 build succeeds and the machine loads.
+
+---
+
+## 29. Sample-rate change detection — don't cache `_sr` from a one-shot init
+
+`host.MasterInfo.SamplesPerSec` is reported per-`Work()` call and can change
+at runtime — most commonly when the user switches audio devices or changes
+ReBuzz's output sample rate during a session. Machines that grab `_sr` once
+on first-Work init and then cache it forever will produce **wrong pitch on
+every oscillator** and **wrong cutoff on every filter** after the rate
+changes, because all `dt` and coefficient computations downstream are still
+using the old rate.
+
+The symptom is subtle: nothing breaks visibly, audio still plays, but
+everything is pitched off by the ratio `oldSr / newSr`. From 48k to 44.1k
+that's a flat 1.5 semitones; from 96k to 48k it's an octave high. Easy to
+miss in casual testing because the off-pitch is consistent across all
+notes — it sounds "in tune with itself".
+
+### 29.1 The wrong pattern
+
+```csharp
+bool _initialized;
+
+public bool Work(/* ... */)
+{
+    if (!_initialized)
+    {
+        float sr = _host?.MasterInfo?.SamplesPerSec ?? 44100f;
+        _voice.Init(sr);   // propagates _sr down to all engines/filters
+        _initialized = true;
+    }
+    // ... uses _sr cached during Init ...
+}
+```
+
+This handles first-call setup but never re-initialises when the host
+changes rate. The cached `_sr` becomes stale silently.
+
+### 29.2 The right pattern
+
+```csharp
+float _lastSr;   // 0 = never initialised
+
+public bool Work(/* ... */)
+{
+    float currentSr = _host?.MasterInfo?.SamplesPerSec ?? 44100f;
+    if (MathF.Abs(currentSr - _lastSr) > 0.5f)
+    {
+        _voice.Init(currentSr);   // re-init with new rate
+        _lastSr = currentSr;
+    }
+    // ... rest of Work ...
+}
+```
+
+The `> 0.5f` tolerance is a guard against floating-point noise — a host
+reporting `44100.001` one tick and `44100.0` the next shouldn't trigger
+spurious re-inits. Real device changes always cross integer rate
+boundaries (44100 → 48000, etc.), so 0.5 Hz is plenty of margin.
+
+### 29.3 Trade-off — re-init resets state
+
+Calling `Voice.Init(newSr)` typically resets oscillator phases, filter
+integrator state, RNG seeds, envelope state. For a rate change mid-note
+this means an audible click as everything snaps to its default state.
+
+In practice this is acceptable: rate changes happen at device-switch
+time, which is almost always with playback stopped. The state-resetting
+branch never fires during a song.
+
+If a particular machine has expensive state that's painful to reset
+(e.g., a long convolution tail, an accumulated FFT history), refactor
+`Init(sr)` into two methods:
+
+- `SetSampleRate(float sr)` — recomputes `_sr` and any rate-dependent
+  coefficients; does NOT touch oscillator phases, envelopes, or
+  accumulator state.
+- `Reset()` — zeros all per-voice state, called from `NoteOn` or
+  explicit voice-reset paths.
+
+Then `Init(sr)` becomes `SetSampleRate(sr) + Reset()` for the
+first-time call, and a runtime rate-change calls only
+`SetSampleRate(currentSr)`. The detection pattern at the top of `Work`
+stays the same; only the engine-side method it calls changes.
+
+### 29.4 What this affects across an engine bank
+
+Every component with a sample-rate-derived value needs to pick up rate
+changes. In the Pedal Plaits architecture (the build that surfaced
+this), that's:
+
+| Component         | Sample-rate dependencies                              |
+|-------------------|-------------------------------------------------------|
+| Oscillator engine | `dt = freq / sr` per partial / per oscillator         |
+| Filter (SVF/TPT)  | `f = tan(π·fc/sr)` or `2·sin(π·fc/sr)` coefficient    |
+| LPG               | One-pole `a = dt / (rc + dt)`, `dt = 1/sr`            |
+| Decay envelope    | `coef = exp(-1 / (tau · sr))`                         |
+| Noise clock       | `clockDt = clockHz / sr`                              |
+
+Every engine that touches any of these computes them from the
+host-provided `_sr` at control rate (once per Render call). With the
+`_lastSr` re-init pattern in place, those computations always see the
+current rate without any per-engine plumbing.
+
+### 29.5 The general principle — `MasterInfo` is runtime-variable
+
+The same principle applies to tempo. If a machine derives anything from
+`MasterInfo.SamplesPerTick` (an LFO whose rate is tempo-locked, a delay
+time in ticks, etc.), don't cache that value at init either — read it
+from `MasterInfo` per Render. The cost is one struct field access per
+block, negligible compared to the cost of getting it wrong.
+
+The signature pattern: **anything from `MasterInfo` is a runtime
+variable, not a setup constant.** Treat it like a parameter — read on
+demand, never cache across calls without an explicit invalidation
+check.
+
+### 29.6 Discovered
+
+Pedal Plaits v0.3 → v0.4 — the WaveshapingEngine produced wrong pitch
+after the user switched audio device from 48 kHz to 44.1 kHz mid-session.
+Investigation showed every engine in the build cached `_sr` from a single
+`Voice.Init(sr)` call on first Work, so none of them noticed the host's
+rate change. The §29.2 pattern (with the 0.5 Hz tolerance) fixed it
+across all engines without per-engine code changes.
