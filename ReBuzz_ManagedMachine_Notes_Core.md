@@ -5,9 +5,10 @@ Updated with findings from Pedal EQ v1.2 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Dly PCM41 v1.0 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.4 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.6 build (ReBuzz 1819-preview).
+Updated with findings from Pedal Plaits v0.7 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
-Sections 1–30 are general findings that apply across managed machines.
+Sections 1–31 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -1611,3 +1612,165 @@ The same protection should be added preemptively to SnareDrum, HiHat,
 and any future modal-style engine (Rings clone, plate reverb, etc.)
 before their DSP is ported, since they share the same architectural
 pattern of impulse-excited resonator decay.
+
+---
+
+## 31. Chamberlin SVF impulse response peaks at f, not f·Q
+
+The Chamberlin state-variable filter — cheap LP/BP/HP-from-one-pair-of-
+integrators SVF used throughout this project's percussive engines — has
+a well-known gain characteristic for **sinusoidal** input at resonance:
+the BP output amplitude is approximately Q (= 1/damp). The mental model
+that follows from this — *"high Q means loud ringing"* — is **wrong for
+impulse excitation**.
+
+After a unit impulse into the standard Chamberlin SVF:
+
+```csharp
+_lp += f * _bp;
+hp = input - _lp - damp * _bp;
+_bp += f * hp;
+```
+
+with `f = 2·sin(π·fc/sr)` and `damp = 1/Q`:
+
+- **Peak BP amplitude** is approximately `f` (which is tiny at audio
+  rates — ~0.02 at C-3, ~0.005 at C-2)
+- **Decay time constant** is approximately `Q / (π·fc)` seconds
+
+Q controls how *long* the resonator rings, not how *loud* its peak gets.
+Both quantities together determine the total integrated energy in the
+ring (Q·f² ∝ Q·fc²), but the **instantaneous** output during the ring
+stays small at all times.
+
+### 31.1 The numbers
+
+Concrete values at 44.1 kHz with Q=30 (typical snare-shell setting):
+
+| Note  | fc (Hz) | f       | Peak _bp | Ring τ   |
+|-------|---------|---------|----------|----------|
+| C-2   | 65      | 0.00926 | ~0.01    | 147 ms   |
+| C-3   | 131     | 0.01853 | ~0.02    | 73 ms    |
+| C-4   | 262     | 0.0370  | ~0.04    | 37 ms    |
+| C-5   | 523     | 0.0741  | ~0.07    | 18 ms    |
+
+At a typical snare body pitch around 180 Hz, peak BP amplitude is
+~0.025 — roughly **30× quieter** than a comparable BP filter
+continuously excited by white noise (which sits at RMS ~0.4 for a
+~5 kHz BPF on ±1 white noise).
+
+### 31.2 When this bites you
+
+The trap is impulse-excited SVFs **mixed with another continuously-
+excited DSP path** in the same output. The continuously-excited path
+has normal-size amplitude (~0.2–0.5). The impulse-excited path is
+invisibly tiny (~0.02). The mix is dominated by the loud component, and
+any control that affects only the quiet path appears to have no
+audible effect.
+
+The signature symptom: *"control X doesn't do anything"* when control
+X drives the impulse-excited path and another path dominates the mix.
+Most painfully, this includes the **note column itself** when the
+SVFs are tuned to track pitch but the dominating noise path is at a
+fixed cutoff.
+
+### 31.3 When this does NOT bite you
+
+Filters with continuous input — BP filters on noise sources, sustained
+oscillators feeding LP/BP/HP, voice LPGs processing engine output —
+are immune. The input is always at normal amplitude, the filter's
+steady-state gain is Q at resonance, and the output sits at sensible
+audio levels.
+
+Single-output percussive engines that don't mix the resonator with
+anything else also don't see it. The Pedal Plaits bass drum is a
+case: its SVF output is the *only* component in the OUT path, so the
+quiet absolute amplitude is just compensated by the overdrive gain
+stage downstream (`MathF.Tanh(_resBp * overdrive)`) and nobody
+notices.
+
+### 31.4 The fix — normalize by 1/f
+
+When mixing an impulse-excited SVF with a continuously-excited path,
+divide the SVF output by `f` (the coefficient that determines its
+peak amplitude):
+
+```csharp
+// In per-block setup, alongside the filter coefficient:
+float f = 2f * MathF.Sin(MathF.PI * fc / sr);
+float tonalGain = 1f / MathF.Max(f, 1e-6f);   // peak normalised to ~1.0
+
+// In the per-sample loop:
+float tonal = _bp * tonalGain * ampEnv;
+float outSample = tonalMix * tonal + noiseMix * noiseBp;
+```
+
+The `MathF.Max(f, 1e-6f)` guards against divide-by-zero if fc happens
+to be very low (which won't happen with a real note frequency, but is
+cheap insurance).
+
+Output now sits at peak ~1.0 at any pitch — a "normal" audio-level
+signal that mixes naturally with other normal-level signals. The gain
+is recomputed once per block at control rate, alongside the filter
+coefficient — no per-sample cost.
+
+### 31.5 Alternative — boost the impulse instead
+
+A symmetric way to read the same problem: the impulse is too small.
+Instead of normalizing the output, scale the input:
+
+```csharp
+float impulse = _impulseCounter > 0 ? (1f / f) : 0f;
+```
+
+Equivalent end result, marginally cheaper (one division per trigger
+instead of one per block). The choice is stylistic. Output-side
+normalisation is easier to reason about — *"output sits at ~1.0, like
+everything else"* — and makes the dependence on the filter
+coefficient explicit at the mix point. Input-side normalisation is
+closer to physical intuition — *"hit the resonator hard enough that
+it rings audibly"*.
+
+### 31.6 Where this applies in this project
+
+Audit the codebase for this pattern: any impulse-excited Chamberlin
+SVF whose output is mixed with another path before reaching the user.
+
+- **Pedal Plaits BassDrumEngine**: single output path, no mix → not
+  affected.
+- **Pedal Plaits SnareDrumEngine**: SVF tonal mixed with BP noise →
+  affected. Fixed in v0.7.
+- **Pedal Plaits HiHatEngine**: 6-square sum + noise → HP filter →
+  output. HP filter is *continuously* excited by the input mix (not
+  impulse-excited), so not affected.
+- **Pedal Plaits FilteredNoiseEngine**: SVF continuously excited by
+  variable-clock noise, not impulse-excited → not affected.
+
+The pattern to watch for in any future engine: an SVF whose `input`
+sample is mostly zero with occasional impulses, while its output is
+summed into a final mix alongside other audio paths. That combination
+is the trigger condition.
+
+### 31.7 Discovered
+
+Pedal Plaits v0.7 — the SnareDrumEngine's note column was inaudible,
+even though `_baseHz` was tracking correctly through `NoteOn` and into
+the resonator coefficients. Investigation showed the two SVF
+resonators were producing tonal output at peaks of 0.02–0.07 across
+the playable note range, while the continuously-excited 5 kHz noise
+BP output was sitting at RMS ~0.4. The noise component dominated the
+perceived sound entirely, and since the noise BPF was at a fixed
+frequency, no note-dependent character could emerge.
+
+Adding `tonalGain = 1/f` per-block, applied to the resonator sum,
+brought the tonal level to ~1.0 peak and made the snare's body pitch
+clearly audible across the keyboard. The output mix scale was lowered
+from 0.6 to 0.3 to keep the combined level within headroom (the
+boosted tonal can reach ~2.2 peak at TIMBRE=1 with both resonators
+contributing).
+
+The same `1/f` normalisation should be added preemptively to any
+future modal-style engine (Rings clone, plate reverb tank readouts
+mixed with dry signal, drum machines with multi-component shells)
+where impulse-excited high-Q resonators sit in a mix with
+continuously-excited paths.
