@@ -120,11 +120,14 @@ is per-wave invalidation (only invalidate the specific wave whose data
 actually changed) and filtering on `PropertyName` to skip UI-only
 properties — not the brute-force version.
 
-### 2.1 Buzz-byte note encoding
+### 2.1 Buzz-byte note encoding (and the v1.1 octave fix)
 
 `IWaveLayer.RootNote` is declared `int` in BuzzGUI.Interfaces but
-holds a Buzz-byte note value (high nibble = octave, low nibble =
-semitone+1, with C-4 = `0x40`). The conversion to linear MIDI:
+holds a Buzz-byte note value: high nibble = octave (0-9), low nibble
+= semitone + 1 (so 1 = C, 12 = B). Pattern-editor "c-4" is byte
+`0x41`, "c-5" is `0x51`, etc. The conversion to standard MIDI must
+add 12 — the byte's "octave 4" corresponds to MIDI octave 5 in the
+standard MIDI naming scheme, where middle C = MIDI 60 = "C4":
 
 ```csharp
 static int BuzzByteToMidi(int b)
@@ -132,18 +135,49 @@ static int BuzzByteToMidi(int b)
     int oct  = (b >> 4);
     int semi = (b & 0xF) - 1;
     if (semi < 0) semi = 0;
-    int m = oct * 12 + semi;
+    int m = (oct + 1) * 12 + semi;     // +12 — Buzz "c-4" → MIDI 60
     if (m < 0)   m = 0;
     if (m > 127) m = 127;
     return m;
 }
 ```
 
-The `int` declaration is misleading — early builds used `byte` to
-match the conceptual content and got a CS1503 conversion error from
-the compiler. Always check Buzz API declarations against actual
-returned types; the documentation may use the conceptual term ("Buzz
-byte") while the C# type is wider.
+The same `(oct + 1) * 12 + semi` form must be used wherever a Buzz
+note byte is converted to MIDI — including the inline conversion in
+`FireTriggerNow` that pulls the played note out of the pattern row.
+Both sites must agree, otherwise the offset asymmetry corrupts pitch
+math.
+
+**Why the +12 matters.** This bug shipped in v1.1's first multisample
+build with `(oct + 1)` reduced to `oct` — equivalent to a -12 offset
+across the board. *Pitch playback was unaffected*, because the offset
+cancelled in `semiDelta = playedMidi - rootMidi` (both halves shifted
+by the same amount). What broke was *split-point comparisons*: the
+user sets `Split 2 = 60` thinking "Wave 2 takes over at c-4" (because
+60 is conventional middle C and the parameter description says so),
+but my code was comparing `60` against the off-by-12 `playedMidi`,
+so Wave 2 didn't actually fire until the pattern reached "c-5" (the
+byte that converted to 60 with the bug). The cello sample (loaded
+into Wave 2 specifically to make the cross-over audible) appeared
+one octave higher than the documentation said it should.
+
+**The lesson, more general than this specific bug:** when a coordinate
+system has multiple consumers (here: pitch math + threshold
+comparisons), an offset error that cancels for one consumer can
+silently corrupt the other. Round-tripping a value through
+`BuzzByteToMidi` and back doesn't validate that it produces *correct*
+MIDI — only that it produces *self-consistent* MIDI. The first time a
+fixed external reference appears (a parameter labelled "C4 = 60"
+that the user expects to align with the pattern editor's "c-4"), the
+discrepancy surfaces. Worth keeping in mind for any future feature
+that compares converted note values against absolute thresholds —
+think kbd-tracking inflection points, key-zoned effects, etc.
+
+The `int` declaration of `RootNote` is misleading — early builds
+used `byte` to match the conceptual content and got a CS1503
+conversion error from the compiler. Always check Buzz API
+declarations against actual returned types; the documentation may
+use the conceptual term ("Buzz byte") while the C# type is wider.
 
 ---
 
@@ -805,9 +839,10 @@ Documented here for a future v1.x — not in v1.
 ## 14. Parameter design — appendable layout, M1 conventions where compatible
 
 Per Build §3.3, parameter declaration order is part of the preset
-contract. The Pedal M1 v1 layout, in order:
+contract. The Pedal M1 layout, in order:
 
 ```
+v1.0:
 OSC1 Wave / Octave / Transpose / Detune / Level     (5)
 OSC2 Wave / Octave / Transpose / Detune / Level     (5)
 OSC Mode                                             (1)
@@ -822,16 +857,29 @@ LFO2 Wave / Speed / Delay / Fade / →Pitch /
   →VDF / →VDA                                        (7)
 Volume                                               (1)
                                                    ----
-                                                    41 globals
+                                                    41 v1.0 globals
+
+v1.1 appended (multisample zones — see §19):
+OSC1 Wave 2 / Split 2 / Wave 3 / Split 3 /
+  Wave 4 / Split 4                                   (6)
+OSC2 Wave 2 / Split 2 / Wave 3 / Split 3 /
+  Wave 4 / Split 4                                   (6)
+                                                   ----
+                                                    53 globals total
 ```
 
 Track parameters: `Note` (stateless, IsStateless=true) and `Volume`
 (stateful, 0..127 velocity).
 
-**Future parameters append-only.** When v1.1 adds the M1 6-stage amp
-envelope (BreakLevel, Slope) and the pitch envelope (4 ADSR + intensity),
-they go *after* `Volume` (master) — preserving existing presets'
-parameter indexes. Same rule for any v1.x additions.
+**Future parameters append-only.** v1.1's multisample zones land at
+the end of the global list — *after* the master `Volume`. They appear
+visually disconnected from the OSC sections in the rack (the user sees
+"OSC1 Wave 2" several screens below "OSC1 Wave"), which is a small UX
+cost paid in exchange for v1.0 preset compatibility. Same rule applies
+to anything else added later: the M1 6-stage amp envelope, pitch
+envelope, etc. all append to the bottom and live with their visual
+discontinuity. Renaming or reordering existing parameters would break
+preset bundles — `Parameter Name` is the matching key per Build §3.
 
 **Bipolar parameters use the offset trick.** Octave (-2..+2) is encoded
 0..4 with default 2. Transpose (±12 semitones) is encoded 0..24 with
@@ -907,31 +955,59 @@ Total ~1500 lines of C#, comparable to Pedal Tracker.
 
 ---
 
-## 17. Build status as of last test session
+## 17. Build status
 
-- **Compiles clean** — no warnings, no errors. Single CS1503 fixed
-  in early build (RootNote `int` vs `byte`).
-- **Loads in ReBuzz** — confirmed by user.
-- **Polyphonic playback works** — confirmed by user with 24-bit/96 kHz
-  M1 piano samples loaded, two octaves apart, played via Pedal Chord
-  arpeggios.
-- **Parameters all behave as expected** — confirmed by user.
+### v1.0 — released
+
+- **Compiles clean.** No warnings, no errors. Single CS1503 fixed in
+  early build (`RootNote` declared `int` but conceptually a Buzz byte;
+  see §2.1).
+- **Loads in ReBuzz** — confirmed.
+- **Polyphonic playback works** with 24-bit/96 kHz M1 piano samples
+  loaded two octaves apart, played via Pedal Chord arpeggios.
+- **Parameters all behave as expected.**
 - **Click on retrigger** — fixed via deferred-trigger pattern (§4).
-- **Click on fresh trigger** — most likely caused by `PropertyChanged`
-  forcing snapshot rebuilds; fixed by removing the subscription (§2).
-  **Status: pending user confirmation.**
+- **Click on fresh trigger** — fixed by removing the
+  `PropertyChanged` subscription that was forcing snapshot rebuilds
+  (§2).
+- README and notes file shipped alongside.
 
-If the fresh-trigger click persists after the §2 fix, the next likely
-candidate is the anti-click ramp being too fast for the early piano
-attack region — bumping `FADE_STEP` from `1f / 64f` to `1f / 256f`
-would give 5.3 ms fade-in instead of 1.3 ms. Documented in README as
-a tuning knob.
+If a future fresh-trigger click ever shows up, the next tuning knob to
+try is `FADE_STEP` in `Voice.cs` — bumping from `1f / 64f` to
+`1f / 256f` gives 5.3 ms fade-in instead of 1.3 ms, masking any
+residual transient at the cost of a marginally softer attack.
+
+### v1.1 — in development
+
+- **Compiles clean** — additions are pure parameter-and-helper-logic;
+  no Voice or per-sample DSP changes. All v1.0 click fixes carry over
+  unchanged.
+- **Multisample zone selection** — see §19. Per-OSC up to 4 zones with
+  split-point semantic. Defaults preserve v1.0 single-wave behaviour
+  exactly, so existing v1.0 presets and patches load and sound
+  identical.
+- **`BuzzByteToMidi` octave fix** — the multisample feature surfaced a
+  latent off-by-12 in the Buzz-byte → MIDI conversion. The bug
+  cancelled in pitch math but corrupted split-point comparisons, so
+  Wave 2 was firing one octave higher than its parameter description
+  promised. Fixed by adding +12 to the conversion at both call sites
+  (Wavetable.BuzzByteToMidi and the inline conversion in
+  FireTriggerNow). See §2.1 for the full story; valuable as a more
+  general lesson about what offset errors cancel and what they don't.
+- **Status: awaiting user testing.** No regressions expected since the
+  per-sample DSP path is untouched, but worth confirming by playing a
+  v1.0 patch (one wave per OSC, no zones enabled) and verifying it
+  still sounds right before exercising the new zone parameters.
 
 ---
 
 ## 18. v1.x roadmap
 
-In rough priority order:
+Done so far:
+
+- ✅ **Multisample zones per OSC** — landed in v1.1. See §19.
+
+Still on the list, in rough priority order:
 
 1. **6-stage amp envelope.** The M1's actual envelope is
    Attack → AttackLevel → Decay → BreakLevel → Slope → Sustain →
@@ -939,20 +1015,145 @@ In rough priority order:
    it's a defining feature of the M1 sound on the patches that do.
    Append-only addition (per §14).
 2. **Pitch envelope.** 4 ADSR params + intensity. Append-only.
-3. **Loop padding.** Copy samples beyond `LoopEnd` into the
+3. **Multisample zone crossfade.** Currently zones are hard-switched
+   at split points (§19). A per-zone crossfade-width parameter (in
+   semitones) would smooth transitions, blending two zones over a
+   user-defined region around the split. Common in serious samplers;
+   not always wanted (some patches benefit from clean splits).
+4. **Velocity layers per zone.** Orthogonal axis to keyboard zoning —
+   different sample for soft vs. hard hits within the same key range.
+   Doubles the parameter count if added straight; a more compact form
+   would be a per-zone "Velocity High" sample slot plus a velocity
+   crossfade point. Significant scope; v1.x rather than v1.next.
+5. **Loop padding.** Copy samples beyond `LoopEnd` into the
    pre-`LoopStart` pad zone so cubic interpolation across the loop wrap
    doesn't click. Improves quality on user-supplied samples with rough
    loop points.
-4. **Voice-active pruning.** Snap `CurrentGain` to 0 when env reaches
+6. **Voice-active pruning.** Snap `CurrentGain` to 0 when env reaches
    Idle (§13). Frees up CPU on patches with lots of long releases.
-5. **LFO free-run option.** Currently key-sync only (§11). A per-LFO
+7. **LFO free-run option.** Currently key-sync only (§11). A per-LFO
    "free run" parameter would let LFO phase drift across notes for
    patches that want that character. Requires per-voice phase memory
    that survives note-on rather than reset.
-6. **Multi-timbral / Combi mode.** The M1 has 8-part Combis. Far out
+8. **Multi-timbral / Combi mode.** The M1 has 8-part Combis. Far out
    of scope for v1.x — would require either multiple machine instances
    or per-track patch slots.
 
 A custom GUI was discussed and intentionally deferred — the rack works
-fine for 41 parameters and a custom panel is comparable in scope to
+fine for 53 parameters and a custom panel is comparable in scope to
 the entire DSP build.
+
+---
+
+## 19. Multisample zones (v1.1)
+
+The M1 model isn't really "one wave per OSC" — it's "one *multisample*
+per OSC," where a multisample is several recordings split across the
+keyboard so that no single sample has to pitch-shift more than ±1
+octave from its native key. Pedal M1 v1.1 adds this by allowing each
+OSC to hold up to 4 zone slots in addition to the primary v1.0 wave.
+
+### 19.1 Why this is mostly a parameter change, not a DSP change
+
+Voice state is unchanged. Each `Voice.Osc` still holds a single
+`Snap` reference and reads from a single position. The selection of
+*which* snapshot the voice plays just becomes smarter at trigger time.
+Per-sample DSP is unaffected — no new branches in the hot loop, no
+per-voice cost increase, no impact on the click-free retrigger machinery
+or anything else covered in §3-§5.
+
+This is a useful pattern in general: features that look like "the
+voice now does N things instead of 1" often resolve into "the voice
+still does 1 thing, but trigger-time selection is N-way." If you can
+push the multiplicity to note-on, the audio thread stays simple.
+
+### 19.2 Selection algorithm — split-point semantic
+
+Each higher zone "claims" notes from its split point upward, overriding
+lower zones. A zone is disabled when its wave parameter is 0. Zone 1
+(the primary v1.0 wave) is the fallback for any note not claimed by a
+higher zone — including being the only zone if all of zones 2-4 are
+off, which preserves v1.0 behaviour exactly.
+
+```csharp
+static int PickZoneWave(int midi,
+    int w1, int w2, int w3, int w4,
+    int s2, int s3, int s4)
+{
+    if (w4 != 0 && midi >= s4) return w4;
+    if (w3 != 0 && midi >= s3) return w3;
+    if (w2 != 0 && midi >= s2) return w2;
+    return w1;
+}
+```
+
+Iteration is highest-to-lowest so that overlap is resolved in favour
+of the higher-numbered zone. If the user sets Split 2 = 80 and
+Split 3 = 72 (zones in "wrong" order), Z3 still wins for notes ≥ 72
+because we check it first. This is forgiving — there's no parameter
+combination that produces undefined behaviour, just zones that may
+"absorb" each other.
+
+The trade is that this scheme can't represent gaps (where some range
+of notes plays nothing) or overlaps (where two zones sound
+simultaneously, which a sampler would crossfade). For v1.1 that's
+fine — gaps are rarely musically useful, and overlap-with-crossfade is
+a §18 roadmap item.
+
+### 19.3 Zone selection happens once at note-on, not per sample
+
+`PickZoneWave` is called from `FireTriggerNow` using the played MIDI
+note (`TargetMidi`), and the resulting `Snap` reference is stored in
+the voice for the duration of the note. A portamento glide does not
+change which zone is sounding mid-note.
+
+This is a deliberate choice. The alternative — re-selecting the zone
+each sample based on `CurrentMidi` — would mean a long portamento
+could swap the playing sample at the moment the glide crossed a split
+point. That's confusing to compose with: the user's "I played C5"
+plays one sample at the start and a different sample by the end of
+the glide. Standard sampler convention is select-at-trigger, and
+that's what Pedal M1 does.
+
+### 19.4 Per-OSC parameters apply globally to the whole multisample
+
+Octave, Transpose, Detune, and Level on each OSC apply uniformly
+across all zones. This matches the M1 convention where these are
+"multisample-level" parameters. If the user wants different detune per
+zone (e.g., to thicken the high zone with extra cents), the per-OSC
+detune doesn't help — but they can use both OSCs with different zone
+configurations to get there.
+
+A per-zone level slider would be useful for balancing mismatched
+sample recordings (some samples are louder than others when pitch-
+matched). Not in v1.1 — would add 4 params per OSC. Reasonable v1.x
+addition if the demand is real.
+
+### 19.5 Snapshot cache interaction
+
+The snapshot cache (§2) is keyed by `WaveIndex`, not by which
+oscillator slot or zone references the wave. So if OSC1 zone 2 and
+OSC2 zone 1 both reference the same wave index, they share one
+snapshot. Memory cost is per unique wave referenced across all zones
+across both OSCs, not per zone slot. With 8 zone slots total per voice,
+the worst case is 8 distinct waves cached — 8 × 3 MB ≈ 24 MB at the
+v1 test sample size. Comfortable.
+
+The cache is built lazily on first reference, same as v1.0. First
+trigger of a freshly-selected zone wave allocates that snapshot on
+the audio thread; subsequent triggers hit the cache. The README's
+"warm new patches with a silent trigger first" note now applies per
+zone wave, not just per OSC wave.
+
+### 19.6 Preset compatibility
+
+v1.0 presets load unchanged. The 12 new parameters all default to
+either 0 (waves — i.e., zone disabled) or sensible split points
+(60/72/84). With Wave 2/3/4 = 0, `PickZoneWave` returns the primary
+wave for every note, which is exactly v1.0 behaviour.
+
+The reverse is not guaranteed: v1.1 patches that use any zone other
+than the primary will not be representable in v1.0 (the parameters
+don't exist there). Users mixing v1.0 and v1.1 instances should keep
+that in mind, though for a personal-use machine this is an unlikely
+scenario.
