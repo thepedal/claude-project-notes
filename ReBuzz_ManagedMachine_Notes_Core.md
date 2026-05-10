@@ -4,9 +4,10 @@ Source: ReBuzz 1817-preview source code + debugging session for Pedal Chord.
 Updated with findings from Pedal EQ v1.2 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Dly PCM41 v1.0 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.4 build (ReBuzz 1819-preview).
+Updated with findings from Pedal Plaits v0.6 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
-Sections 1–29 are general findings that apply across managed machines.
+Sections 1–30 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -1440,3 +1441,173 @@ Investigation showed every engine in the build cached `_sr` from a single
 `Voice.Init(sr)` call on first Work, so none of them noticed the host's
 rate change. The §29.2 pattern (with the 0.5 Hz tolerance) fixed it
 across all engines without per-engine code changes.
+
+---
+
+## 30. Denormal floats stall the CPU on decaying-state DSP
+
+Floating-point values below ~1.18e-38 (the IEEE-754 denormal/subnormal
+range) are not handled by the FPU hardware on x86 — they trap to CPU
+microcode. Each FP op on a denormal value runs **50–100× slower** than
+on a normal float. In an audio inner loop processing 44 100 samples per
+second, this can spike the engine's CPU from <1% to >50% — and the
+slowdown is sticky: it persists for as long as the state values remain
+in the denormal range, which can be hundreds of milliseconds or longer.
+
+This bites any DSP component whose state decays exponentially toward
+zero without being continuously re-excited. The pattern is:
+
+1. A state variable is set to a non-zero value (an impulse, a NoteOn,
+   a parameter change).
+2. The state decays in subsequent samples via repeated multiplication
+   by a coefficient < 1.
+3. After enough samples, the state crosses ~1e-38 into denormal range.
+4. From that point until the state is flushed to exact zero, every
+   operation on it traps to microcode.
+
+Common offenders in this project's DSP territory:
+- **Bass-drum-style resonators** — SVF / biquad integrators excited by
+  an impulse then ringing/decaying with no further input.
+- **Pitch envelopes** in percussive engines — they decay toward zero
+  unbounded unless the engine explicitly stops advancing them.
+- **Modal / Rings-style banks** — a row of high-Q resonators excited
+  briefly then left to decay independently.
+- **Reverb tank state** — internal delay/feedback variables decay
+  toward zero between input bursts, especially during quiet passages.
+
+Pitched/sustained engines (oscillators with bounded phase, filters
+with continuous input) are **not** vulnerable — their state never
+decays to zero, it oscillates or is constantly re-excited.
+
+### 30.1 The signature symptom
+
+CPU stays elevated long after the audible part of the sound is gone.
+Often **pitch-dependent**, because resonators decay at a rate
+proportional to their center frequency: high-frequency resonators
+reach denormal range faster than low-frequency ones.
+
+The classic user report is *"CPU is fine for low notes, jumps and
+stays high for high notes"* — exactly the signature of denormals
+in a resonator whose decay time is short enough to cross 1e-38
+before the engine's amplitude envelope can cut off processing.
+
+For Pedal Plaits' bass drum specifically (which surfaced this finding),
+at C-5 with brightness=1 the SVF state crossed denormal range in
+~170 ms, whereas the amp envelope didn't reach its IsSilent threshold
+for ~7 s — leaving ~6.8 seconds of microcode-trap-bound CPU per kick.
+
+### 30.2 The fix — flush small values to zero
+
+Add explicit zero-flushes after each state update, with a threshold
+well above denormal range and well below audibility:
+
+```csharp
+// After SVF state update
+_resLp += f * _resBp;
+float hp = impulse - _resLp - damp * _resBp;
+_resBp += f * hp;
+
+// Denormal flush — must run every sample, not per-block
+if (_resBp > -1e-25f && _resBp < 1e-25f) _resBp = 0f;
+if (_resLp > -1e-25f && _resLp < 1e-25f) _resLp = 0f;
+```
+
+Threshold choice — `1e-25` is roughly:
+- 13 orders of magnitude above the denormal threshold (1e-38)
+- 25 orders of magnitude below peak audio (1.0, equivalent to ~-500 dB)
+
+So the flush catches values long before they enter the slow-path range
+and is inaudible even at extreme analytical/observability levels.
+Don't make the threshold too tight: `1e-30` is safely above denormal
+arithmetically but uncomfortably close to FP precision limits, and a
+margin matters for resonators whose state oscillates around zero (a
+near-zero value might be denormal on one sample, non-denormal the
+next, oscillating slowly across the boundary).
+
+For positive-only state (envelopes), only one comparison is needed:
+
+```csharp
+_pitchEnv *= _pitchCoef;
+if (_pitchEnv < 1e-25f) _pitchEnv = 0f;
+```
+
+### 30.3 The cost
+
+Two comparisons + one rarely-taken store per sample, per protected
+state variable. Modern CPUs predict the not-taken branch well because
+state is in normal range for the entire audible portion of the
+sound. Real-world cost: ~1 ns per sample per protected variable. For
+an SVF with 2 state vars, that's ~0.01% CPU at 44.1 kHz. Cheap
+insurance against catastrophic slowdowns.
+
+### 30.4 Where to apply it (and where you don't need to)
+
+The rule: any state variable that **decays toward zero unboundedly
+and isn't continuously re-excited** needs denormal protection on
+every sample of its update.
+
+Apply:
+- ✓ SVF / biquad integrators after impulse excitation (bass drum,
+  snare modes, modal banks, plate reverbs)
+- ✓ Pitch envelopes on percussive engines
+- ✓ Reverb tank delay-line writes and feedback paths
+- ✓ Amp envelopes — *if* their decay isn't gated by a IsSilent /
+  IsActive check that stops the engine well above denormal range.
+  (Pedal Plaits' amp env doesn't need protection because IsSilent
+  fires at 1e-5, halting engine execution before denormal range can
+  be reached. If an engine doesn't stop processing on env-silent,
+  protect it.)
+
+Skip:
+- ✗ Oscillator phase accumulators — bounded in [0, 1], never approach
+  denormal range.
+- ✗ Filter state in continuously-excited filters (Pedal Plaits'
+  filtered-noise engine, sustaining synth filters, compressor
+  envelope detectors with constant program material). The constant
+  input keeps the state out of denormal range.
+- ✗ State variables you explicitly clamp to zero on every sample
+  (e.g., granular engines that do `if (env <= 0f) env = 0f;` already).
+
+### 30.5 Alternatives considered
+
+**SSE flush-to-zero (FTZ) and denormals-are-zero (DAZ) flags.** These
+MXCSR bits make the CPU treat denormals as zero globally, eliminating
+the slowdown. Available via `System.Runtime.Intrinsics.X86.Sse.SetFlushToZeroMode`
+in .NET. *Not used* because:
+
+1. Settings are per-thread, and the audio thread isn't ours to
+   configure reliably — ReBuzz creates and destroys audio threads
+   on its own schedule.
+2. The setting is global to all DSP code on the thread, which can
+   affect plugins or hosted code that expects denormals to be handled
+   correctly (some compressors deliberately let denormals occur to
+   measure RMS over very small windows; some Class A audio designs
+   rely on near-zero behaviour).
+3. Explicit flushes are localized, predictable, and obviously visible
+   in the code where the problem could occur.
+
+**Tiny DC offset trick.** The classic
+`state += 1e-25f; state -= 1e-25f;` pattern, which keeps state
+slightly above zero. Doesn't work reliably under aggressive
+optimization — the JIT may fold the two operations into a no-op
+(JIT optimizations can be more aggressive than typical C/C++
+compilers because the runtime knows everything). Explicit
+comparison-flush is more robust.
+
+### 30.6 Discovered
+
+Pedal Plaits v0.5 → v0.6 — the BassDrumEngine's CPU usage stayed
+elevated for several seconds after triggering a kick, but only at
+higher notes (C-4 and above). Investigation showed that at higher
+resonance frequencies the Chamberlin SVF state decayed into denormal
+range (~170 ms at C-5 with brightness=1) before the amplitude envelope
+crossed the IsSilent threshold (~7 s at MORPH=80). During the gap,
+every SVF update operation trapped to microcode at ~50× normal cost.
+Adding explicit `1e-25f` flushes to the SVF integrators (`_resLp`,
+`_resBp`) and to the pitch envelope (`_pitchEnv`) brought CPU back
+to baseline immediately when the audible tail finished.
+
+The same protection should be added preemptively to SnareDrum, HiHat,
+and any future modal-style engine (Rings clone, plate reverb, etc.)
+before their DSP is ported, since they share the same architectural
+pattern of impulse-excited resonator decay.
