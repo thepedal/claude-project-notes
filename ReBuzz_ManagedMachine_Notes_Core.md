@@ -6,6 +6,7 @@ Updated with findings from Pedal Dly PCM41 v1.0 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.4 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.6 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.7 build (ReBuzz 1819-preview).
+Updated with findings from Pedal Plaits v1.2 build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
 Sections 1–31 are general findings that apply across managed machines.
@@ -1774,3 +1775,277 @@ future modal-style engine (Rings clone, plate reverb tank readouts
 mixed with dry signal, drum machines with multi-component shells)
 where impulse-excited high-Q resonators sit in a mix with
 continuously-excited paths.
+
+---
+
+## 32. Per-Work parameter smoothing — eliminating zipper noise on modulated parameters
+
+ReBuzz delivers parameter changes per buffer. The naïve render pattern
+is to snapshot parameter values at the top of `Work()` and use them as
+constants for the buffer's entire render. That pattern works fine when
+parameters change only at human pace — user knob movement or pattern
+automation at row boundaries. Both are slow enough that buffer-rate
+parameter updates aren't audibly stepped.
+
+Once external modulator machines come into play — LFO machines,
+envelope-follower machines, MIDI-CC bridges, modulation-matrix machines
+that write to your parameters at tick rate — the snapshot-then-hold
+pattern breaks audibly. Each buffer holds the previous source value
+flat for n samples, then jumps to the new value at the next buffer
+boundary. The discontinuity creates zipper noise — a sharp
+clicking/rasping artefact whose audibility scales with how aggressively
+the parameter is being modulated, and with how short the host's buffer
+size is.
+
+Pedal Plaits v1.2 introduces a two-stage smoothing pattern that fixes
+this generically for any continuous parameter. The pattern is broadly
+applicable — any managed machine whose parameters are likely targets
+for external modulation should consider it.
+
+### 32.1 The two-stage design
+
+```
+                user-set / pattern automation / external modulator
+                                │
+                                ▼ (instantaneous, per-Work)
+                       target value (= current property value)
+                                │
+                                ▼ (exponential approach toward target)
+                  smoothed value, end-of-Work
+                                │
+                                ▼ (linear interpolation between
+                                    prev-Work-end and this-Work-end)
+                      per-sub-block param value
+                                │
+                                ▼
+                         engine.Render(...)
+```
+
+**Stage 1 — Per-Work exponential smoothing toward target.** Each
+`Work()` reads the current parameter property values as targets. The
+persistent smoothed-state field moves toward those targets by a
+coefficient derived from a time constant:
+
+```csharp
+const float SMOOTH_SECS = 0.010f;   // 10 ms tau
+float smoothCoef = 1f - MathF.Exp(-n / (SMOOTH_SECS * sr));
+float hmStart  = _smHarmonics;
+float hmEnd    = hmStart + (harmonicsTarget - hmStart) * smoothCoef;
+_smHarmonics   = hmEnd;             // persist for next Work
+```
+
+The `1 - exp(-n/(T·sr))` form gives mathematically exact exponential
+smoothing regardless of buffer size — total smoothing time stays at
+10 ms whether the host runs 64-sample or 1024-sample buffers. A common
+shortcut is `smoothCoef = n / (T*sr)` (linear approximation, fine for
+small n/sr ratios), but the exact form costs one `MathF.Exp` per Work
+and removes the buffer-size dependency.
+
+**Stage 2 — Per-sub-block linear interpolation.** With `hmEnd`
+representing the *end-of-buffer* smoothed value, `hmStart` is whatever
+the smoothed state was at the end of the previous Work. Per sub-block
+(the engine's control-rate block of typically 8-32 samples),
+interpolate linearly between buffer-start and buffer-end values:
+
+```csharp
+int i = 0;
+while (i < n) {
+    int blk = Math.Min(BLOCK_SIZE, n - i);
+    float t = (i + blk * 0.5f) / n;          // block-midpoint progress 0..1
+    pBlock.Harmonics = hmStart + (hmEnd - hmStart) * t;
+    // ... fill other smoothed fields the same way ...
+    engine.Render(scratchOut, scratchAux, blk, in pBlock);
+    i += blk;
+}
+```
+
+Stage 2 is what actually eliminates zipper noise. Stage 1 alone would
+still have discontinuities at buffer boundaries — just smaller ones.
+Stage 2 ensures the value transitions linearly through the buffer
+rather than stepping at sub-block boundaries.
+
+### 32.2 Why a single mechanism isn't sufficient
+
+Three obvious one-stage alternatives, and why each falls short:
+
+**Alternative A — Just lerp old-snapshot to new-snapshot per sub-block,
+no exponential.** Transitions complete in exactly one buffer regardless
+of buffer size. At small buffers (64 samples = 1.5 ms at 44.1 kHz) this
+is still audibly fast — modulation source changes still produce
+discontinuities, just spread over a shorter window. At large buffers
+(1024+ samples = 23 ms) this over-smooths and adds modulation lag. No
+way to tune smoothing time independent of buffer size.
+
+**Alternative B — Just per-Work exponential, no per-sub-block lerp.**
+The smoothed value updates once per Work, then holds constant for the
+whole buffer. Reduces the size of buffer-boundary jumps (each is now
+`smoothCoef × (target - previous)` instead of `target - previous`) but
+doesn't eliminate them. Zipper noise persists at reduced amplitude.
+
+**Alternative C — Per-sample exponential filter on the parameter.**
+Mathematically clean. Expensive: an `exp(-1/(T*sr))` coefficient is
+typically pre-computed, but per-sample multiply-add is still ~3 ops per
+parameter per sample. For 6 smoothed parameters × 44.1 kHz × 44 voices,
+this isn't free.
+
+The two-stage pattern combines the best of all three: tunable smoothing
+time independent of buffer size (Stage 1), zipper-free continuous
+output (Stage 2), and amortized cost (Stage 1 runs once per Work,
+Stage 2 is a single lerp per sub-block).
+
+### 32.3 Lazy initialization
+
+Smoothed-state fields start at 0 by default. If the user has already
+set parameters via preset or song load before the first `Work()`, the
+smoothed values would start at 0 and ramp toward the user's values
+over ~30 ms — producing a fade-in on machine load that's almost-but-
+not-quite right.
+
+Lazy init solves this: on the first `Work()` after construction, snap
+the smoothed state to current target values rather than smoothing
+toward them:
+
+```csharp
+bool _smoothInit;
+
+// At top of Work(), after target computation:
+if (!_smoothInit) {
+    _smHarmonics = harmonicsTarget;
+    _smTimbre    = timbreTarget;
+    // ... all smoothed params
+    _smoothInit  = true;
+}
+```
+
+This must be done per-machine-instance (not as a class default)
+because ReBuzz can construct multiple instances and each needs its own
+init from its own loaded parameter values. The constructor doesn't
+have safe access to parameter values yet (they're loaded after the
+constructor by `CreateParameterDelegates`, see §15), so the lazy-init
+flag is the cleanest pattern.
+
+### 32.4 What to smooth, what to leave raw
+
+Not every parameter benefits from smoothing. The categorisation is by
+what the parameter *means* musically:
+
+**Smooth these:** continuous "character" parameters that engines read
+every block (e.g. Harmonics, Timbre, Morph, filter cutoff/resonance,
+volume, envelope shape coefficients, decay times). These are the
+parameters external modulators are most likely to target. Smoothing
+produces clean continuous response.
+
+**Leave raw:** discrete enums (engine selector, waveform selector,
+target selector — any parameter where intermediate values are
+meaningless). NoteOn-only parameters (oscillator phase reset, S&H
+trigger). Pitch parameters where semitone steps should be instantaneous
+on note triggers, not glide (otherwise pattern transposition unintendedly
+becomes portamento).
+
+**The NoteOn-snapshot exception.** Even smoothed parameters need their
+*raw* (unsmoothed) values at NoteOn time when initialising voice state.
+The DecayEnv's initial value and the LPG's strike level should reflect
+what the user *intends* at note trigger, not whatever the smoothing
+state happens to be passing through mid-ramp. Pedal Plaits handles this
+by keeping `ParamsSnapshot()` returning raw values for the NoteOn code
+path, while the ongoing render uses smoothed values:
+
+```csharp
+if (_hasNoteOn) {
+    _voice.NoteOn(midi, _velocity, ParamsSnapshot());   // raw values
+}
+// ... ongoing render below uses smoothed values
+```
+
+This is subtle but important. Without this split, rapid note triggering
+during a smoothing ramp gets envelope shapes that don't match the
+user's settings — and the user can't easily diagnose why, because the
+settings *look* right.
+
+### 32.5 Interaction with other modulation sources
+
+Smoothing applies to the *base parameter value*. Other modulation
+sources (velocity routing, modulation matrix offsets) add on top of the
+smoothed value, with the final result clamped to the parameter's valid
+range:
+
+```csharp
+pBlock.Harmonics = Math.Clamp(
+    hmStart + (hmEnd - hmStart) * t        // smoothed base
+    + velocityOffset,                       // trigger-time modulation
+    0f, 1f);                                // clamp
+```
+
+Ordering matters. Smoothing is for *base parameter changes* (user knob,
+pattern automation, external LFO targeting the param directly).
+Trigger-time modulations (velocity routing, key tracking, etc.) are
+*instant on note trigger* — smoothing them would defeat their purpose.
+Pedal Plaits v1.3 separates these concerns by smoothing the base and
+adding trigger-instant offsets after.
+
+The clamp must happen *after* both additions. A common mistake is to
+clamp the smoothed value before adding the offset, then add — that
+loses information when the offset would push back into range:
+
+```csharp
+// WRONG — clamps smoothed first, then adds offset
+float hm = Math.Clamp(hmStart + (hmEnd - hmStart) * t, 0f, 1f);
+pBlock.Harmonics = hm + velocityOffset;     // can go negative or > 1
+```
+
+### 32.6 Cost analysis
+
+Per `Work()` for N parameters smoothed:
+- 1 `MathF.Exp` to compute smoothCoef (shared across all params)
+- N multiply-adds to compute end-of-buffer values
+- N field stores
+
+Per sub-block:
+- N lerps for the per-block parameter struct
+
+For Pedal Plaits with 6 smoothed parameters and typical n=184 samples
+(15 sub-blocks per Work at BLOCK_SIZE=12), total smoothing cost is
+~1 Exp + ~100 lerps per Work — negligible against engine render cost.
+
+The `MathF.Exp` is the most expensive operation in the smoothing path.
+At ~30 ns/call in software .NET, that's 30 ns added per Work — invisible
+in any practical CPU budget. For aggressive optimisation, the
+coefficient could be cached against sample rate (`_lastSr` already
+exists per §29) so Exp only runs on sample-rate changes — but this is
+premature.
+
+### 32.7 Generalisation
+
+The pattern as documented here uses Plaits' BLOCK_SIZE=12, but the
+two-stage approach applies to any block granularity:
+
+- **Per-sample render (no sub-block).** Lerp per-sample between
+  buffer-start and buffer-end values. The linear math is unchanged;
+  the inner loop runs n times instead of n/BLOCK_SIZE.
+- **Variable sub-block** (e.g. SH-101 §2 filter-coefficient cadence).
+  The smoothing-side math is unchanged; the consumer reads the lerped
+  value at its own cadence.
+- **Multi-rate engines** where some parameters are sub-block-rate and
+  others are sample-rate. Apply the same lerp at each consumer's
+  natural granularity.
+
+In all cases the smoothing time constant is the user-visible parameter
+to tune. 10 ms is a good default for "modulation should be responsive
+but not zippery." Pads with deliberately slow modulation tolerate
+30–50 ms; percussive synths with fast envelope-style modulation want
+3–5 ms. The formula is unchanged — only `SMOOTH_SECS` differs.
+
+### 32.8 When NOT to add this
+
+For machines that aren't intended as modulation targets — fixed-
+processing utilities (Pedal Muter, Pedal Comp), pattern-event
+producers (Pedal Chord), or rare-update machines (Pedal Mixer-style
+gain stages) — the smoothing infrastructure is overhead with no
+audible benefit. Skip it. Adding smoothing to *every* managed machine
+"just in case" bloats the codebase and obscures which machines are
+genuinely modulation-friendly.
+
+A reasonable heuristic: if you'd expect a user to wire an LFO machine
+into one of your parameters at any point, add smoothing for that
+parameter. If the parameter is "set once at song load, forgotten
+about" (e.g. limiter ceiling, output routing), skip it.
