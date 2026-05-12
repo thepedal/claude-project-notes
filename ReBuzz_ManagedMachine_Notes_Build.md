@@ -5,6 +5,9 @@ Muter v1.0 deployment experience.
 Updated with findings from Pedal Dly PCM41 v1.0 build.
 Updated with findings from Pedal Plaits v0.1 scaffolding session
 (TargetFramework / UseWPF / post-build deploy / two-namespace usings).
+Updated with findings from Pedal Plaits v1.10 build (§3.5 — preset-bundle
+deploy from the post-build target, ItemGroup pattern for filenames
+containing spaces, Message-task diagnostic for silent-Copy failures).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -138,6 +141,9 @@ change the one path in the csproj and that's it; this isn't worth
 parameterising via a `<Property>` because most machines in the project
 share the same install path.
 
+For machines that ship a preset bundle, see §3.5 for the additional
+Copy step that lives inside the same `DeployToReBuzz` target.
+
 ### 1.4 Keeping `.pdb`s for local diagnostics
 
 The default in §1.2 disables `.pdb` generation entirely. If you want
@@ -215,7 +221,10 @@ produces files ReBuzz will accept.
   to distinguish preset bundles from arbitrary XML in the gear folder. A
   file named `MyMachine_Presets.xml` is silently ignored.
 - **Filename is otherwise free** — common convention is
-  `<MachineName>_Presets.prs.xml` but any base name works.
+  `<MachineName>_Presets.prs.xml` but any base name works. Note that this
+  convention puts a space in the filename for any machine whose name has
+  one (`Pedal Plaits_Presets.prs.xml`, `Pedal Comp_Presets.prs.xml`);
+  §3.5 covers the MSBuild deploy pattern that handles this robustly.
 - **Place alongside the `.dll`** in the same gear subfolder
   (`Gear/Generators` or `Gear/Effects`).
 - **Encoding is UTF-8 with BOM.** A BOM-less UTF-8 file may load but
@@ -326,6 +335,83 @@ rest of the bank stays untouched and continues producing identical XML.
 Keep the generator script alongside the source (e.g. `gen_presets.py`)
 but **do not deploy it** — it's not part of what ReBuzz needs at runtime.
 The deployed bundle is just `<Machine>_Presets.prs.xml` + `<Machine>.dll`.
+
+### 3.5 Deploying the bundle from the post-build target
+
+The bundle needs to land alongside the DLL in the gear folder, which
+means a second `Copy` task inside the same `DeployToReBuzz` target from
+§1.3. The naive form — pasting a literal source path next to the DLL
+copy — looks fine and works for filenames without spaces:
+
+```xml
+<!-- Works for "PedalInvFFT_Presets.prs.xml"; fragile for any name with a space -->
+<Target Name="DeployToReBuzz" AfterTargets="Build">
+  <Copy SourceFiles="$(TargetPath)"
+        DestinationFolder="..." ContinueOnError="true" />
+  <Copy SourceFiles="$(ProjectDir)MyMachine_Presets.prs.xml"
+        DestinationFolder="..." ContinueOnError="true" />
+</Target>
+```
+
+This fails silently when the bundle's filename contains a space (e.g.
+`Pedal Plaits_Presets.prs.xml`, which is the inevitable form of the
+§3.1 convention for any machine whose name has a space): the literal-
+string `SourceFiles` value with an embedded space gets mis-parsed in
+some MSBuild paths so the Copy can't resolve the source, and
+`ContinueOnError="true"` (which is necessary for the DLL lock case)
+suppresses the failure entirely. The build succeeds, the build log
+shows no warning, and the bundle just isn't there.
+
+**The robust pattern:** declare the bundle as an `ItemGroup` item and
+reference it via `@(...)`. MSBuild items are typed objects rather than
+parsed strings, so embedded spaces (and other awkward characters)
+round-trip cleanly into the Copy task.
+
+```xml
+<ItemGroup>
+  <PresetBundle Include="My Machine_Presets.prs.xml" />
+</ItemGroup>
+
+<Target Name="DeployToReBuzz" AfterTargets="Build">
+  <Message Text="Deploying $(TargetFileName) → C:\Program Files\ReBuzz\Gear\Generators\"
+           Importance="high" />
+  <Copy SourceFiles="$(TargetPath)"
+        DestinationFolder="C:\Program Files\ReBuzz\Gear\Generators\"
+        ContinueOnError="true" />
+  <Message Text="Deploying @(PresetBundle) → C:\Program Files\ReBuzz\Gear\Generators\"
+           Importance="high" />
+  <Copy SourceFiles="@(PresetBundle)"
+        DestinationFolder="C:\Program Files\ReBuzz\Gear\Generators\"
+        ContinueOnError="true" />
+</Target>
+```
+
+Notes on the shape:
+
+- **`Include="My Machine_Presets.prs.xml"`** is a relative path resolved
+  against the `.csproj` directory; MSBuild handles the space natively
+  in the `Include` attribute's path-parsing rules and stores the result
+  as a single ITaskItem. The subsequent `@(PresetBundle)` expansion in
+  `SourceFiles` passes that item through as-is rather than reparsing
+  the name as a string list.
+- **`Message` lines before each `Copy`** surface in normal-verbosity
+  build output so a deploy that's silently skipped (lock contention,
+  missing source, permissions) still produces a visible trace. Without
+  them the `ContinueOnError` swallow leaves the build looking identical
+  whether or not anything was actually copied. The pair "Message says
+  it was going to copy X, X still isn't at the destination" is much
+  easier to diagnose than two entirely invisible Copies.
+- **`ContinueOnError="true"`** is kept on the preset Copy for the same
+  reason as the DLL Copy: ReBuzz may hold the bundle file open if the
+  machine is loaded in a running session. Closing ReBuzz and rebuilding
+  refreshes both. Without ContinueOnError, a running ReBuzz turns every
+  rebuild red.
+
+Use this pattern for every managed machine that ships a preset bundle,
+even when the bundle's filename has no space — applying it consistently
+means future machines that gain spaces in their preset filenames (most
+of them, given the §3.1 convention) won't trip the same wire, and the
+build log lines double as a sanity check that deployment actually ran.
 
 ---
 
