@@ -234,10 +234,10 @@ in the common case. Either:
 
 - **Read the pvalues dictionary directly** via reflection on
   `ParameterCore.pvalues` (`ConcurrentDictionary<int,int>`) as
-  documented in Core §14 for inspecting *your own*
-  pvalues. This works on *foreign* parameters too, with the same
-  caveats: lazy init, allocation-free `TryGetValue`, no `Invoke` on
-  the audio thread.
+  documented in Core §14 for inspecting *your own* pvalues. This works
+  on *foreign* parameters too, with the same caveats: lazy init,
+  allocation-free `TryGetValue`, no `Invoke` on the audio thread.
+  §4 below is the canonical worked example of this path.
 
 For the Pedal Muter v1.0 stale-voice flush, the chosen approach was
 "drop the gate" — the flush only runs at mute/unmute transitions, and
@@ -252,6 +252,181 @@ dictionary via reflection — not via `GetValue`. If GetValue says the
 write took effect but the plugin doesn't respond, the issue isn't the
 write; it's the read side (AudioTick skipped due to mute, or plugin
 ignoring the value).
+
+---
+
+## 4. The Core §14 trap hits Mute-driving control machines hard
+
+The `parametersChanged` overwrite documented in Core §14 / Tracker §1.1
+isn't just about Note delivery on chord rows — it bites *any* managed
+machine whose single parameter is being written across multiple tracks
+in one tick. Pedal Muter discovered this the hard way during v1.0
+field testing.
+
+### 4.1 Symptom
+
+User has Pedal Muter with 6 tracks active, each assigned to a different
+target machine, each driven by its own PeerCtrl track. They flip all
+six PeerCtrl sliders simultaneously (or hit the "Unmute All Targets"
+menu, or have pattern rows that write Mute on multiple tracks at the
+same row).
+
+Result: **only one target changes state.** Specifically, the *last*
+track in iteration order. The other five stay where they were.
+
+The user reproduces it with the panic-button menu: each click unmutes
+one more target, working backwards through the track list. That's the
+smoking-gun signature — multiple `SetValue` calls collapsing to one
+setter call, every time, with the iteration-last writer winning.
+
+### 4.2 Root cause
+
+`SetValue(track=N, value=v)` writes `pvalues[N]=v` AND
+`parametersChanged[muteParam]=N`. Six writes in succession leave
+`pvalues[0..5]` all updated but `parametersChanged[muteParam] = 5`
+only. The managed-host `Tick()` then calls `SetMute(value, track=5)`
+once, and the other five writes vanish silently. The C#-side state for
+tracks 0–4 doesn't update, `ApplyTrack` never runs for them, target
+machines keep their old `IsMuted`.
+
+This is the same mechanic as Core §14's chord-row trap, except the
+"chord" here is "six tracks of the same control parameter changing in
+one tick" rather than "six tracks of Note changing in one tick".
+
+### 4.3 Fix — §14 recovery, but for switch parameters
+
+Same shape as the Tracker §14 workaround for `Note` polling, with one
+notable simplification: Mute is a `Byte`-typed switch parameter with
+discrete values 0/1, not a 0..156 note. Range-check pvalues before
+applying:
+
+```csharp
+void PollSiblingMutePValues(int firedTrack)
+{
+    if (!EnsurePollSetup()) return;     // lazy reflection bootstrap
+    int noValue = _ownMuteParam.NoValue;
+
+    foreach (var kv in _ownMutePValues)
+    {
+        int track  = kv.Key;
+        int pvalue = kv.Value;
+        if (track == firedTrack) continue;
+        if ((uint)track >= MAX_TRACKS) continue;
+        if (pvalue == noValue) continue;
+        if (pvalue != 0 && pvalue != 1) continue;     // sanity guard for switch
+
+        bool desired = (pvalue == 1);
+        var ts = _tracks[track];
+        if (ts.MuteState == desired) continue;        // already in sync
+
+        ApplyMuteTransition(track, desired);          // factored helper
+    }
+}
+```
+
+Call from `SetMute` after the main transition, **including** on the
+"already in sync" early-return path — because the *fired* track being
+a no-op doesn't mean sibling tracks were no-ops:
+
+```csharp
+public void SetMute(int value, int track)
+{
+    // ... bounds & lazy resolve ...
+    bool newState = (value == 1);
+    var ts = _tracks[track];
+    if (ts.MuteState == newState) {
+        PollSiblingMutePValues(track);   // still poll!
+        return;
+    }
+    ApplyMuteTransition(track, newState);
+    PollSiblingMutePValues(track);
+}
+```
+
+`ApplyMuteTransition` is the factored helper containing the
+mute/unmute flush dispatch and `ApplyTrack` call, so the recovery path
+gets the exact same Note-Off injection, post-unmute counter, and
+`IsMuted` dispatch as the originally-fired track.
+
+### 4.4 Reflection setup is identical to Tracker §1.3
+
+Lazy bootstrap, walk the type hierarchy on `ParameterCore` (the
+runtime type behind the `IParameter` reference), find the field named
+`pvalues` of type `ConcurrentDictionary<int,int>`, cache the
+reference. Same lifecycle: `ParameterGroups` isn't populated until
+after the constructor finishes (Core §15), so do this from inside the
+first setter call, not from the constructor.
+
+```csharp
+IParameter _ownMuteParam;
+ConcurrentDictionary<int, int> _ownMutePValues;
+bool _pollSetupAttempted;
+
+bool EnsurePollSetup()
+{
+    if (_ownMutePValues != null) return true;
+    if (_pollSetupAttempted) return false;
+    _pollSetupAttempted = true;
+
+    var pg = host?.Machine?.ParameterGroups;
+    if (pg == null || pg.Count <= 2) return false;
+    _ownMuteParam = pg[2]?.Parameters?.FirstOrDefault(p => p?.Name == "Mute");
+    if (_ownMuteParam == null) return false;
+
+    var t = _ownMuteParam.GetType();
+    while (t != null && _ownMutePValues == null)
+    {
+        var f = t.GetField("pvalues",
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        if (f != null)
+            _ownMutePValues = f.GetValue(_ownMuteParam)
+                              as ConcurrentDictionary<int, int>;
+        t = t.BaseType;
+    }
+    return _ownMutePValues != null;
+}
+```
+
+The cached `IParameter` reference and `ConcurrentDictionary<int,int>`
+reference both live for the machine's lifetime — no need to refresh
+them across saves/loads.
+
+### 4.5 Cascade benefit — three failure modes, one fix
+
+Any code path that issues multiple `SetValue` calls in one tick
+benefits from the same recovery:
+
+1. **Peer control fan-out.** PeerCtrl writing to N Pedal Muter tracks
+   from inside its own `Work()` lands as N `SetValue` calls in a
+   single audio buffer.
+2. **Programmatic "do thing to many tracks".** Menu commands like
+   "Unmute All Targets" iterating the track array.
+3. **Multi-track pattern rows.** Pattern automation with Mute events
+   on multiple tracks at the same row.
+
+All three previously exhibited the "only the last track responds"
+symptom. The §4.3 polling fixes all three with no code change at the
+call sites.
+
+### 4.6 Diagnostic logging that proves the recovery worked
+
+When debugging multi-track writes, log every recovery so DebugView (or
+the Trace listener of your choice) shows you the workaround engaging:
+
+```
+T+12345ms SetMute track=5 value=0 true→false (UNMUTE) ...
+T+12345ms §14 RECOVERY track=0 pvalue=0 true→false ...
+T+12345ms §14 RECOVERY track=1 pvalue=0 true→false ...
+T+12345ms §14 RECOVERY track=2 pvalue=0 true→false ...
+T+12345ms §14 RECOVERY track=3 pvalue=0 true→false ...
+T+12345ms §14 RECOVERY track=4 pvalue=0 true→false ...
+T+12345ms §14 RECOVERY: applied 5 missed transitions
+```
+
+If the recovery line count after a multi-track write doesn't match the
+number of expected transitions, either pvalues isn't populated as
+expected (reflection bootstrap failed — check the `EnsurePollSetup`
+log line) or the writes weren't actually in the same tick.
 
 ---
 
