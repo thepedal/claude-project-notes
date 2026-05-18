@@ -9,7 +9,10 @@ Updated with findings from Pedal Plaits v1.10 build (§3.5 — preset-bundle
 deploy from the post-build target, ItemGroup pattern for filenames
 containing spaces, Message-task diagnostic for silent-Copy failures).
 Updated with findings from Pedal Gate v1.2 build (§7 — multi-input managed
-effects confirmed unsupported).
+effects, original finding of unsupported; now superseded).
+Updated with findings from Pedal Patcher v1.0 build (§7 rewritten —
+EffectBlockMulti confirmed working in ReBuzz 1813-preview; §8 added —
+channel count and naming APIs).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -586,62 +589,203 @@ machine file. Cheap to write, blocks a known footgun.
 
 ---
 
-## 7. Multi-input managed effects — confirmed unsupported
+## 7. Multi-input / multi-output effects — `EffectBlockMulti`
 
-Investigated and exhaustively tested during Pedal Gate v1.2. Two
-approaches were tried against a live ReBuzz instance; both failed with
-distinct failure modes.
+**This section supersedes the previous §7 ("Multi-input managed effects —
+confirmed unsupported") which was written against an older ReBuzz build.**
+ReBuzz 1813-preview adds `EffectBlockMulti` — full multi-channel I/O for
+effect machines is now supported via the `IList<Sample[]>` Work signature
+on both the input and output sides.
 
-### 7.1 Approach 1 — `InputCount = 2` in `MachineDecl`
+### 7.1 The correct Work signature
 
-```csharp
-[MachineDecl(
-    Name       = "Pedal Gate",
-    InputCount = 2,
-    OutputCount = 1)]
-```
-
-The machine loads and runs correctly — no crash, no error in the log.
-But only **one connection circle** appears on the machine in the graph
-UI, regardless of the declared count. A freshly placed instance
-(not a reloaded one) shows identical behaviour. `InputCount` in
-`MachineDecl` has no effect on the number of visible input pins for
-managed effects.
-
-### 7.2 Approach 2 — `IList<Sample[]>` on the input side of Work
+For an effect with multiple independent input and output channels, declare
+exactly this signature:
 
 ```csharp
-public bool Work(Sample[] output, IList<Sample[]> inputs, int n, WorkModes mode)
+public bool Work(IList<Sample[]> output, IList<Sample[]> input, int n, WorkModes mode)
 ```
 
-Machine fails to load entirely with:
+`ManagedMachineDll.GetWorkFunctionType()` matches this via reflection and
+returns `WorkFunctionTypes.EffectBlockMulti`. ReBuzz then automatically sets
+`MachineInfoFlags.MULTI_IO` on the machine, enabling the connection-circle
+UI for channel selection. No explicit flags or attributes are needed.
 
-```
-Exception: invalid Work function
-  at ReBuzz.ManagedMachine.ManagedMachineDLL.GetWorkFunctionType()
-  at ReBuzz.ManagedMachine.ManagedMachineDLL.LoadManagedMachine(String path)
-  at ReBuzz.MachineManagement.MachineManager.CreateManagedMachine(...)
-```
+`input[i]` is `null` if nothing is connected to input channel `i`; otherwise
+it is the stereo `Sample[]` buffer for that channel. `output[o]` is `null`
+if nothing is connected to output channel `o`. The machine must:
 
-`GetWorkFunctionType()` recognises only a fixed set of Work signatures
-by reflection. `IList<Sample[]>` on the **input** side is not among
-them. The `IList<Sample[]>` mechanism is **output-only** — it activates
-`MULTI_IO` for multi-out generators (see PedalTracker §12.1). Using it
-as an input argument is unrecognised and crashes the host before the
-machine's constructor is ever reached.
+1. Zero every non-null output buffer before accumulating into it.
+2. Check `input[i] == null` and `output[o] == null` before any read or write.
+3. Return `true` if any output was written, `false` if all outputs are silent.
 
-### 7.3 Rule
-
-**Do not attempt either approach again.** For all effect machines, use
-`InputCount = 1` and the standard signature:
+Minimal routing loop pattern:
 
 ```csharp
-public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
+public bool Work(IList<Sample[]> output, IList<Sample[]> input, int n, WorkModes mode)
+{
+    // Zero outputs
+    for (int o = 0; o < NumOutputs; o++)
+    {
+        if (o >= output.Count || output[o] == null) continue;
+        for (int s = 0; s < n; s++) { output[o][s].L = 0f; output[o][s].R = 0f; }
+    }
+
+    bool anyActive = false;
+    for (int i = 0; i < NumInputs; i++)
+    {
+        if (i >= input.Count || input[i] == null) continue;
+        for (int o = 0; o < NumOutputs; o++)
+        {
+            if (o >= output.Count || output[o] == null) continue;
+            // ... route input[i] → output[o] ...
+            anyActive = true;
+        }
+    }
+    return anyActive;
+}
 ```
 
-Sidechain key-input via a separate hardware-style pin is not achievable
-in the current ReBuzz managed machine API. If sidechain-like behaviour
-is needed in a future machine, investigate alternative approaches —
-for example, a control-machine architecture where a dedicated sidechain
-detector machine writes a gate-open signal to a parameter on the effect
-via peer control.
+### 7.2 Complete Work function type table (from 1813-preview source)
+
+`ManagedMachineDll.GetWorkFunctionType()` recognises exactly these
+signatures. Any other signature throws `"invalid Work function"` at
+load time.
+
+| Signature | WorkFunctionType | Machine class |
+|---|---|---|
+| `void Work()` | Control | Generator (control machine) |
+| `Sample Work(Sample)` | Effect | Effect |
+| `bool Work(Sample[] output, int n, WorkModes mode)` | GeneratorBlock | Generator |
+| `bool Work(IList<Sample[]> output, int n, WorkModes mode)` | GeneratorBlockMulti | Generator + MULTI\_IO |
+| `bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)` | EffectBlock | Effect |
+| `bool Work(IList<Sample[]> output, IList<Sample[]> input, int n, WorkModes mode)` | **EffectBlockMulti** | **Effect + MULTI\_IO** |
+
+The `MULTI_IO` flag enables the numbered connection-circle UI in the machine
+graph view for both the GeneratorBlockMulti and EffectBlockMulti types.
+
+### 7.3 What still does not work
+
+The following were tried against older ReBuzz builds and confirmed broken.
+They remain invalid:
+
+- **`InputCount = N` in `MachineDecl` alone** — has no effect on the number
+  of visible input pins for managed effects. Circle count comes from
+  `host.InputChannelCount`, not the declaration attribute.
+
+- **`bool Work(Sample[] output, IList<Sample[]> inputs, int n, WorkModes mode)`**
+  (mixed signature) — not in the recognised set; throws `"invalid Work function"`.
+
+- **`bool Work(IList<Sample[]> output, IList<Sample[]> input, ...)` on pre-1813
+  ReBuzz** — `EffectBlockMulti` did not exist before 1813-preview. On older
+  builds this signature is unrecognised and the machine fails to load.
+
+### 7.4 Previous rule retired
+
+The old rule "for all effect machines, use `InputCount = 1` and
+`Work(Sample[] output, Sample[] input, ...)`" applied only to pre-1813
+ReBuzz. It is retired. Use `EffectBlockMulti` for any new multi-channel
+effect machine built against ReBuzz ≥ 1813-preview.
+
+For sidechain-style single-extra-input designs on pre-1813 ReBuzz, the
+control-machine peer-parameter approach (from the old §7.3) remains valid
+as an alternative architecture.
+
+---
+
+## 8. Multi-channel I/O — channel count and naming APIs
+
+These APIs are required whenever a machine uses `EffectBlockMulti` or
+`GeneratorBlockMulti`. They are distinct from `MachineDecl.InputCount` /
+`OutputCount`, which have no runtime effect on channel circle count for
+managed machines.
+
+### 8.1 Setting the channel count
+
+`IBuzzMachineHost.InputChannelCount` and `OutputChannelCount` are directly
+settable properties (confirmed from 1813-preview `IBuzzMachineHost.cs`):
+
+```csharp
+public interface IBuzzMachineHost
+{
+    IMachine Machine { get; }
+    MasterInfo MasterInfo { get; }
+    SubTickInfo SubTickInfo { get; }
+    int MsToSamples(float t);
+    int OutputChannelCount { get; set; }
+    int InputChannelCount  { get; set; }
+}
+```
+
+**Do not set these in the constructor.** `host.Machine` is `null` during
+construction; `ManagedMachineHost.set_InputChannelCount` internally
+dereferences `host.Machine` and throws `NullReferenceException`.
+
+**The correct pattern** is to subscribe to `Song.MachineAdded` and set the
+counts when the machine's own `IMachine` instance appears:
+
+```csharp
+public MyMachine(IBuzzMachineHost host)
+{
+    this.host = host;
+    // ... other init ...
+    Global.Buzz.Song.MachineAdded   += OnMachineAdded;
+    Global.Buzz.Song.MachineRemoved += OnMachineRemoved;
+}
+
+void OnMachineAdded(IMachine m)
+{
+    if (m != host.Machine) return;
+    host.InputChannelCount  = NumInputs;
+    host.OutputChannelCount = NumOutputs;
+}
+
+void OnMachineRemoved(IMachine m)
+{
+    if (m != host.Machine) return;
+    Global.Buzz.Song.MachineAdded   -= OnMachineAdded;
+    Global.Buzz.Song.MachineRemoved -= OnMachineRemoved;
+}
+```
+
+This approach is taken directly from `ManagedMultiIOEffect.cs` in the
+1813-preview source tree (`Machines/ManagedMultiIOEffect/`), which is the
+authoritative reference implementation.
+
+The `MachineAdded` event fires on the UI thread after the machine is fully
+constructed and `host.Machine` is assigned, so `set_InputChannelCount`
+succeeds without error.
+
+### 8.2 Channel naming
+
+ReBuzz calls `GetChannelName(bool input, int index)` on the machine class
+via reflection (`ManagedMachineHost.cs:247`) to populate the channel labels
+shown in the connection right-click menu. Declare it as a public method:
+
+```csharp
+public string GetChannelName(bool input, int index)
+{
+    if (input)
+    {
+        if (index >= 0 && index < inputLabels.Length) return inputLabels[index];
+    }
+    else
+    {
+        if (index >= 0 && index < outputLabels.Length) return outputLabels[index];
+    }
+    return "";           // fallback — ReBuzz shows a generic "in N" / "out N" label
+}
+```
+
+Returning `null` or an empty string falls back to ReBuzz's default generic
+label for that channel index. The method is looked up by name, not by
+interface — it does not need to be declared on any interface; `public` on
+the concrete class is sufficient.
+
+### 8.3 Example: Pedal Patcher (6×6 patchbay effect)
+
+Pedal Patcher (`Machines/PedalPatcher/`) is the first machine in this
+project to use `EffectBlockMulti`. Its constructor, `OnMachineAdded`, and
+`GetChannelName` follow §8.1–§8.2 exactly and can be used as a working
+reference. Its Work loop (per-channel routing with gain ramping and
+per-pair VU metering) is in `CMachine.cs`.
