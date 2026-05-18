@@ -7,6 +7,7 @@ Updated with findings from Pedal Plaits v0.4 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.6 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.7 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v1.2 build (ReBuzz 1819-preview).
+Updated with findings from Pedal MComp v1.1 GUI build (ReBuzz 1819-preview).
 These details are absent from official documentation.
 
 Sections 1–31 are general findings that apply across managed machines.
@@ -1133,6 +1134,14 @@ public class MyMachineGui : UserControl, IMachineGUI
 }
 ```
 
+The example above assumes the GUI is **composed of standard child
+controls** (sliders, text boxes, panels) built into the UserControl's
+Content. If instead the GUI overrides `OnRender(DrawingContext)` to do
+**custom drawing** (meters, scopes, transfer curves, anything paint-
+based), `UserControl` is the wrong base class — its default template
+silently paints over your render output. See §26.7 for the symptom,
+cause, and fix.
+
 ### 26.4 Reading machine state in the GUI
 
 **Preferred:** read properties directly from the cast `IBuzzMachine` reference
@@ -1160,6 +1169,175 @@ assemblies and all WPF types (`UserControl`, `TextBlock`, `Brush`,
 - **Scanning for `IMachineGUI` directly** — ReBuzz scans for
   `IMachineGUIFactory`, not `IMachineGUI`. A class that only implements
   `IMachineGUI` without a factory will not be discovered.
+- **`UserControl` as the base class for an `OnRender`-painted GUI** — its
+  default `ControlTemplate` silently paints over your custom drawing.
+  See §26.7 for the full diagnosis and the `FrameworkElement` fix.
+
+### 26.7 OnRender custom drawing — use `FrameworkElement`, not `UserControl`
+
+The §26.3 minimal example uses `UserControl` as the base class. That's the
+right choice when the GUI is composed of standard WPF controls (sliders,
+buttons, text boxes laid out via XAML or programmatic children). It's the
+**wrong choice** for a GUI that draws its own content via
+`OnRender(DrawingContext)` — meters, transfer curves, scopes, spectrum
+displays, anything where the surface is a custom-painted canvas rather
+than a composition of off-the-shelf controls.
+
+#### Symptom
+
+You override `OnRender`, build a custom rendering of meters / curves / etc.
+The DLL loads, the parameter window opens, you can see the GUI's space
+allocated in the window — but instead of your custom drawing, all you see
+is a **solid coloured rectangle**: whichever colour you set as `Background`
+in the constructor, or a transparent gap if you didn't set Background.
+None of your `OnRender` output is visible. Adding test rectangles or even
+corner markers after the BG fill in OnRender doesn't help — they're
+invisible too.
+
+The trap is convincing because everything *looks* right: the discovery
+worked (the widget appears), the layout system gave the control its
+correct size (you can measure the coloured area), and the timer is firing
+(InvalidateVisual is called). The only thing wrong is what gets to the
+screen.
+
+#### Cause
+
+`UserControl` has a default `ControlTemplate` along the lines of:
+
+```xml
+<ControlTemplate TargetType="UserControl">
+    <Border Background="{TemplateBinding Background}"
+            BorderBrush="{TemplateBinding BorderBrush}"
+            BorderThickness="{TemplateBinding BorderThickness}">
+        <ContentPresenter />
+    </Border>
+</ControlTemplate>
+```
+
+The template's `Border` lives as a child element in the visual tree
+below the UserControl itself. WPF's render order is parent first, then
+children — so your custom `OnRender` output draws first, then the
+template's Border draws on top, with its `Background` brush completely
+covering everything underneath. The control's Background colour
+becomes the only visible thing on screen.
+
+This isn't a bug. UserControl is for *composing* child controls —
+its template's Border-plus-ContentPresenter shape exists to provide a
+uniform backdrop behind whatever child elements you slot in. For an
+OnRender-painted surface that backdrop is actively harmful: it
+unconditionally paints over your work.
+
+#### Fix
+
+Inherit from `FrameworkElement` directly:
+
+```csharp
+public class MyMachineGui : FrameworkElement, IMachineGUI
+{
+    private const double W = 560;
+    private const double H = 340;
+
+    public MyMachineGui()
+    {
+        Width  = W;
+        Height = H;
+        SnapsToDevicePixels = true;
+        UseLayoutRounding   = true;
+        // NOTE: no `Background = …` — FrameworkElement has no Background
+        // property. Paint the background inside OnRender instead.
+        // ... timer setup, etc. ...
+    }
+
+    // FrameworkElement's default MeasureOverride returns Size(0,0). Setting
+    // Width/Height as DPs feeds the default measure path, but returning
+    // the size explicitly is the belt-and-braces form.
+    protected override Size MeasureOverride(Size availableSize)
+        => new Size(W, H);
+
+    protected override void OnRender(DrawingContext dc)
+    {
+        base.OnRender(dc);
+        dc.DrawRectangle(_bgBrush, null, new Rect(0, 0, W, H));
+        // ... your custom drawing ...
+    }
+
+    // ... IMachineGUI.Machine implementation ...
+}
+```
+
+§26.2's requirement is still satisfied: `ParameterWindowVM` casts the GUI
+to `FrameworkElement`, and `FrameworkElement` is exactly that type.
+`UserControl` and `FrameworkElement` both qualify — UserControl just
+happens to come with the template that conflicts with OnRender drawing.
+
+#### What changes when you switch
+
+Three differences from UserControl, all minor:
+
+1. **No `Background` property.** Paint it explicitly inside `OnRender`
+   as the first draw call. You probably were doing this anyway.
+2. **`MeasureOverride` defaults to `Size(0,0)`.** Setting `Width` and
+   `Height` as DPs feeds the default measure path and usually works
+   without an override, but returning the size from `MeasureOverride`
+   explicitly is safer and clearer.
+3. **No `Content` property.** If you'd wanted child controls, you'd
+   need to add them via `AddVisualChild`/`AddLogicalChild`. For pure
+   OnRender-painted GUIs you don't have children, which is exactly
+   what you want.
+
+Everything else is identical: `SnapsToDevicePixels`, `UseLayoutRounding`,
+`Width`, `Height`, `Unloaded` event, `InvalidateVisual()`,
+`DispatcherTimer` interaction — all on `FrameworkElement`, all work
+the same as on `UserControl`.
+
+#### When UserControl IS still the right choice
+
+If the GUI is built from child controls — `Slider`, `TextBox`, `Button`,
+labelled `StackPanel`s — keep `UserControl`. The template is doing
+useful work in that case: it provides the `Content` property for the
+child tree and paints a uniform backdrop behind the children. §26.3's
+example assumes this scenario and is correct as written.
+
+The trap only fires when you override `OnRender` to draw the surface
+yourself. The two patterns are mutually exclusive in practice — either
+the GUI is a composition of controls (use UserControl, don't override
+OnRender) or it's a custom-painted canvas (use FrameworkElement,
+forget Background as a property). Mixing them produces exactly the
+silent-overpaint symptom above.
+
+#### Diagnosing it next time
+
+The misleading thing is that this symptom looks like a data-binding or
+machine-reference problem — "my GUI loads but doesn't show anything,
+so `_machine` must be null." Drop in a corner marker first:
+
+```csharp
+protected override void OnRender(DrawingContext dc)
+{
+    base.OnRender(dc);
+    dc.DrawRectangle(BG, null, new Rect(0, 0, W, H));
+
+    // Diagnostic: if this red square is invisible, the issue is template
+    // overpainting, not missing data. No-data symptoms would still show
+    // shapes, just without live values.
+    dc.DrawRectangle(Brushes.Red, null, new Rect(0, 0, 16, 16));
+
+    // ... rest of rendering ...
+}
+```
+
+If the red square doesn't appear, the base class is wrong. Change
+`: UserControl` to `: FrameworkElement`, drop the `Background = …`
+line from the constructor, add `MeasureOverride`. That's the entire
+fix. If the red square *does* appear but the rest doesn't, then it's
+a different problem (likely a `_machine`-null or exception-in-DrawColumn
+issue) and Core §26.4 / a try-catch around the body of OnRender is the
+next step.
+
+The shape-only diagnostic is important: text rendering via
+`FormattedText` can fail independently for other reasons (DPI not yet
+resolved, missing typeface), so a "no text, no shapes" symptom is
+diagnostically different from "no text, shapes work."
 
 ---
 
