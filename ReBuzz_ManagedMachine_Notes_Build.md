@@ -8,6 +8,8 @@ Updated with findings from Pedal Plaits v0.1 scaffolding session
 Updated with findings from Pedal Plaits v1.10 build (§3.5 — preset-bundle
 deploy from the post-build target, ItemGroup pattern for filenames
 containing spaces, Message-task diagnostic for silent-Copy failures).
+Updated with findings from Pedal Gate v1.2 build (§7 — multi-input managed
+effects confirmed unsupported).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -581,3 +583,65 @@ the DLL we reference") looks plausible and the IDE doesn't suggest
 
 The rule for scaffolding: **both usings, every time**, on the main
 machine file. Cheap to write, blocks a known footgun.
+
+---
+
+## 7. Multi-input managed effects — confirmed unsupported
+
+Investigated and exhaustively tested during Pedal Gate v1.2. Two
+approaches were tried against a live ReBuzz instance; both failed with
+distinct failure modes.
+
+### 7.1 Approach 1 — `InputCount = 2` in `MachineDecl`
+
+```csharp
+[MachineDecl(
+    Name       = "Pedal Gate",
+    InputCount = 2,
+    OutputCount = 1)]
+```
+
+The machine loads and runs correctly — no crash, no error in the log.
+But only **one connection circle** appears on the machine in the graph
+UI, regardless of the declared count. A freshly placed instance
+(not a reloaded one) shows identical behaviour. `InputCount` in
+`MachineDecl` has no effect on the number of visible input pins for
+managed effects.
+
+### 7.2 Approach 2 — `IList<Sample[]>` on the input side of Work
+
+```csharp
+public bool Work(Sample[] output, IList<Sample[]> inputs, int n, WorkModes mode)
+```
+
+Machine fails to load entirely with:
+
+```
+Exception: invalid Work function
+  at ReBuzz.ManagedMachine.ManagedMachineDLL.GetWorkFunctionType()
+  at ReBuzz.ManagedMachine.ManagedMachineDLL.LoadManagedMachine(String path)
+  at ReBuzz.MachineManagement.MachineManager.CreateManagedMachine(...)
+```
+
+`GetWorkFunctionType()` recognises only a fixed set of Work signatures
+by reflection. `IList<Sample[]>` on the **input** side is not among
+them. The `IList<Sample[]>` mechanism is **output-only** — it activates
+`MULTI_IO` for multi-out generators (see PedalTracker §12.1). Using it
+as an input argument is unrecognised and crashes the host before the
+machine's constructor is ever reached.
+
+### 7.3 Rule
+
+**Do not attempt either approach again.** For all effect machines, use
+`InputCount = 1` and the standard signature:
+
+```csharp
+public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
+```
+
+Sidechain key-input via a separate hardware-style pin is not achievable
+in the current ReBuzz managed machine API. If sidechain-like behaviour
+is needed in a future machine, investigate alternative approaches —
+for example, a control-machine architecture where a dedicated sidechain
+detector machine writes a gate-open signal to a parameter on the effect
+via peer control.
