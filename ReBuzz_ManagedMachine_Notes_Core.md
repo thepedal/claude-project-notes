@@ -8,9 +8,12 @@ Updated with findings from Pedal Plaits v0.6 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v0.7 build (ReBuzz 1819-preview).
 Updated with findings from Pedal Plaits v1.2 build (ReBuzz 1819-preview).
 Updated with findings from Pedal MComp v1.1 GUI build (ReBuzz 1819-preview).
+Updated with findings from Pedal EQ v1.3 build (§33 — WM_NOIO confirmed-
+silence handling) and Pedal Gate v1.3 sidechain build (§16.1 — constructor-
+time null state cheat sheet).
 These details are absent from official documentation.
 
-Sections 1–31 are general findings that apply across managed machines.
+Sections 1–33 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -345,6 +348,26 @@ diagnostic. Check any parameter whose `MaxValue` is exactly 255 or 65535.
 For `ValueDescriptions`, `MinValue` and `MaxValue` are auto-set to
 `0` and `descriptions.Length - 1`.
 
+**`MinValue` floor — must be ≥ 0 in ReBuzz 1819-preview onward**
+
+Negative `MinValue` is *silently* accepted at load time but ReBuzz
+internally offsets the stored parameter range to be non-negative, so
+the setter receives values shifted by `-MinValue` and DSP formulas
+that treat the raw value as the actual signed value compute the wrong
+result with no error surfaced. The machine appears to work but
+parameter readings, GUI displays, and DSP outputs are all off.
+
+This is the *worse* failure mode compared to the pre-1819 behaviour
+(which threw `Invalid MinValue` and refused to load). See
+**PedalComp Addendum §2** for the full discussion with a worked
+example from Pedal EQ v1.2 and the correct "non-negative range with
+explicit offset in DSP" pattern.
+
+The rule is: never declare `MinValue < 0`. For bipolar parameters,
+use a non-negative range with a centre default (e.g. `MinValue=0,
+MaxValue=96, DefValue=48` for a ±24 dB control) and subtract the
+centre value in the DSP / display code.
+
 ---
 
 ## 10. IBuzz.DCWriteLine — debug console output
@@ -588,6 +611,47 @@ Operations safe on the audio thread (inside `Work()` or parameter setters):
 4 TPB: `Work()` is called ~28× per tick, ~500 ticks/second ≈ 14,000 calls/second.
 Allocating even 64 bytes per call = ~900 KB/s. Keep the audio hot-path
 allocation-free.
+
+### 16.1 Constructor-time null state — what isn't available yet
+
+The constructor is also a hazardous environment, separately from the audio
+thread. Several pieces of host state aren't initialised when the machine's
+constructor runs, and code that assumes they are fails in ways that are
+sometimes silent. The pattern is general enough to be worth listing
+explicitly.
+
+Things that are **not safe to access in the constructor**:
+
+| Member | What happens | Where to access it instead |
+|--------|--------------|-----------------------------|
+| `host.Machine` | Returns `null`. The whole `host?.Machine?.…` chain short-circuits. | `Song.MachineAdded` handler (Build §8.1), or any setter / Work call after the machine is fully constructed. |
+| `host.InputChannelCount = N` (and `OutputChannelCount`) | `ManagedMachineHost.set_InputChannelCount` dereferences the still-null `host.Machine` and throws `NullReferenceException`. | `Song.MachineAdded` handler (Build §8.1). |
+| `host.Machine.ParameterGroups` | Empty/null collection. Built in step 3 of construction, after the constructor returns. | Defer to first setter or first `Work()` call (§15). |
+| `host.Machine.Graph.Buzz.Song` chain | Short-circuits to `null` because `host.Machine` is `null`. Subscribing events through this chain silently never subscribes. | `Global.Buzz.Song` — a static accessor that works in the constructor. See Build §8.1's null-conditional warning. |
+| `host.MasterInfo.SamplesPerSec` | May report 0 or a stale value before the audio engine has actually started — same lazy-init concern as in §29. | Read on first `Work()` and re-check per-Work for changes (§29). |
+
+Things that **are safe** in the constructor:
+
+- Storing the `host` reference itself in a field
+- Pre-allocating instance-level buffers and arrays
+- Subscribing to events on `Global.Buzz.Song` (and any other static
+  accessor that doesn't go through `host.Machine`)
+- Setting up timers, dispatcher hooks, and other framework state
+- Reading project-static configuration (constants, file-scope `static readonly` data)
+
+The pattern is: **the constructor is for "things that don't depend on
+host state"; first-Work or first-setter is for "things that need
+`host.Machine` populated"; `Song.MachineAdded` is the explicit signal
+that this machine instance has fully joined the graph.** Build §8.1
+documents the channel-count case; §15 documents the parameter-groups
+case; the rest of this table covers the remaining members on the same
+hazardous-in-the-constructor list.
+
+This was the underlying cause of the Pedal Gate v1.3 bug — the
+constructor used the null-conditional chain to subscribe to
+`MachineAdded`, the chain short-circuited, and the multi-input
+sidechain pins never appeared on the machine. Documented in detail in
+Build §8.1.
 
 ---
 
@@ -2227,3 +2291,220 @@ A reasonable heuristic: if you'd expect a user to wire an LFO machine
 into one of your parameters at any point, add smoothing for that
 parameter. If the parameter is "set once at song load, forgotten
 about" (e.g. limiter ceiling, output routing), skip it.
+
+---
+
+## 33. `WM_NOIO` is confirmed silence, not "no information"
+
+When an upstream machine returns `false` from its own `Work()` — the
+standard convention for "I have nothing to contribute this buffer",
+used by muted machines, effects in sleep state, generators with no
+active voices — ReBuzz delivers `WorkModes.WM_NOIO` to every machine
+downstream of it for every buffer until the upstream wakes up again.
+
+This is **silence guaranteed by the host**, not a hint or an
+optimisation opportunity. There is no input buffer to read, no
+input-derived state to update, and no audio that needs to be
+processed. The correct response is to commit to silence immediately:
+flush all decaying state, set a sleep flag, return `false`. On the
+first non-WM_NOIO buffer, clear the sleep flag and resume normal
+processing.
+
+Getting this wrong produces a CPU-amplification trap: a downstream
+effect that does full DSP work on every WM_NOIO buffer can stay
+expensive forever while the upstream is muted. The classic symptom is
+*"my song is fine until I mute Pedal Tracker, then CPU jumps and
+stays high"* — Pedal Tracker returning false from its Work makes
+ReBuzz send WM_NOIO every buffer to every downstream machine, and any
+of those that aren't WM_NOIO-aware now do their full per-sample work
+on phantom input forever.
+
+### 33.1 The trap — resetting silence counters on WM_NOIO
+
+The naive silence-detection pattern looks like this:
+
+```csharp
+// WRONG — silence counter resets on WM_NOIO, sleep never accumulates
+const int SILENCE_HOLDOFF = 32;       // ~170ms at 44.1k / 256
+int _silentBuffers = 0;
+
+public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
+{
+    if (mode == WorkModes.WM_NOIO)
+    {
+        _silentBuffers = 0;            // ← THE BUG
+        return false;
+    }
+
+    // Scan input for peak amplitude
+    float peak = ScanPeak(input, n);
+    if (peak < SILENCE_THRESHOLD)
+        _silentBuffers++;
+    else
+        _silentBuffers = 0;
+
+    if (_silentBuffers >= SILENCE_HOLDOFF)
+    {
+        FlushAllStates();
+        return false;
+    }
+
+    // ... process audio ...
+    return true;
+}
+```
+
+The intent of the WM_NOIO branch is "no input means don't count this
+as silence" — sensible-sounding. The actual effect when the upstream
+is muted: WM_NOIO arrives every buffer, the counter resets every
+buffer, the holdoff never accumulates, and processing never sleeps.
+Every buffer the machine does the full input-scan-plus-process loop on
+whatever stale data ReBuzz happens to hand it.
+
+### 33.2 The fix — treat WM_NOIO as immediate confirmed silence
+
+WM_NOIO is the host telling you definitively that there's nothing to
+process. No holdoff is needed; flush and sleep on the first
+occurrence. Pair this with an `_isSleeping` flag so that subsequent
+WM_NOIO buffers (which arrive every buffer for as long as the upstream
+stays silent) cost only a single boolean check:
+
+```csharp
+const float SILENCE_THRESHOLD = 1.0f;   // ~-90 dBFS for ±32768 samples
+const int   SILENCE_HOLDOFF   = 32;     // for input-detected silence below
+int  _silentBuffers = 0;
+bool _isSleeping    = false;
+
+public bool Work(Sample[] output, Sample[] input, int n, WorkModes mode)
+{
+    // WM_NOIO: host has guaranteed there's no input. Sleep immediately.
+    // Do NOT reset _silentBuffers here — see §33.1 for why.
+    if (mode == WorkModes.WM_NOIO)
+    {
+        if (!_isSleeping)
+        {
+            FlushAllStates();
+            _isSleeping = true;
+        }
+        return false;
+    }
+
+    // Non-WM_NOIO buffer arrived. If we were sleeping, wake up.
+    if (_isSleeping)
+    {
+        _isSleeping = false;
+        _silentBuffers = 0;
+    }
+
+    // Input-detected silence — independent holdoff path for upstream
+    // machines that *do* send audio but at amplitudes below threshold.
+    float peak = ScanPeak(input, n);
+    if (peak < SILENCE_THRESHOLD)
+        _silentBuffers++;
+    else
+        _silentBuffers = 0;
+
+    if (_silentBuffers >= SILENCE_HOLDOFF)
+    {
+        FlushAllStates();
+        return false;
+    }
+
+    // ... process audio ...
+    return true;
+}
+
+void FlushAllStates()
+{
+    // Reset every decaying-state component: filter integrators,
+    // delay-line readers, envelope followers, peak-hold meters, etc.
+    // Anything that would otherwise ring on indefinitely without
+    // input.
+}
+```
+
+The two silence paths cover different cases:
+- **WM_NOIO** — upstream returned false (mute, sleep, empty
+  generator). Immediate sleep with no holdoff.
+- **Input-detected silence** — upstream is sending audio but it's
+  below threshold (a fading tail, a silent passage in a song).
+  Holdoff lets transients through; sleep when peak stays below
+  threshold for `SILENCE_HOLDOFF` buffers.
+
+### 33.3 What `FlushAllStates()` should reset
+
+Anything that would otherwise produce or sustain non-zero output in
+the absence of input. For an effect with the typical processing
+graph:
+
+- **Filter integrators** (biquad `z1`/`z2`, SVF `lp`/`bp`/`hp` state).
+  Otherwise they ring on; for high-Q filters this is audible.
+- **Delay-line read positions** (reverb tanks, chorus/flanger
+  buffers). The audible tail must be drained before sleeping, or
+  flushing produces a stuttered echo when the machine wakes up.
+- **Envelope followers** (peak/RMS detector state for compressors,
+  gates, expanders). Otherwise the next wake-up sees a stale envelope.
+- **Peak-hold meters** for UI display. The user sees the hold dot
+  stuck at the last level otherwise.
+- **Smoothed-parameter state** if §32 smoothing is in use. Otherwise
+  the next wake-up sees a stale smoothed value mid-ramp.
+
+What you don't need to reset:
+- **Coefficient caches** (PedalComp §6 dirty-check). Coefficients
+  remain valid; nothing about sleeping invalidates them.
+- **Parameter values themselves.** The user's settings haven't
+  changed.
+- **`_lastSr`** from the §29 pattern. Sample rate hasn't changed.
+
+### 33.4 Where to add it
+
+This pattern belongs in every effect machine whose `Work()` has any
+meaningful per-sample cost. Generators and control machines aren't
+affected — generators are upstream from the WM_NOIO path; control
+machines use `void Work()` and don't receive a `mode` parameter at
+all.
+
+Audit candidates in this project:
+- ✓ Every Pedal effect (Comp, MComp, EQ, Filter, Limit, Gate,
+  Plate, Hallverb, ConVerb, Resonator, Z-Plane, HDist, Folder,
+  Shaper, Dly PCM41, invFFT...) needs WM_NOIO handling. Most have
+  some form of it; auditing all of them against this section is
+  worth the time.
+- ✗ Pedal Tracker, Plaits, M1, SH101, Juno106, FM, S950 — generators,
+  not affected (they're the *source* of WM_NOIO when muted).
+- ✗ Pedal Muter, Profiler, Chord, Follower, LFO, Presetter, ReTrig —
+  control machines, not affected.
+
+### 33.5 Discovered
+
+Pedal EQ v1.2 had the §33.1 bug. With Pedal Tracker connected into
+Pedal EQ and the tracker's Mute parameter set, the EQ's CPU jumped
+and stayed elevated for as long as the tracker stayed muted. Tracing
+showed `WM_NOIO` arriving every buffer (correct: tracker on mute
+returns false from its Work), the EQ's `_silentBuffers` counter being
+reset to 0 every buffer (the bug), the holdoff therefore never
+reaching the sleep threshold, and the full 4-band biquad cascade
+running on every buffer with whatever data ReBuzz handed it.
+
+The v1.3 fix introduced the `_isSleeping` flag and the immediate-
+flush WM_NOIO path documented in §33.2. CPU drop on a muted upstream
+was immediate and complete — the machine went from full per-sample
+work to a single boolean check per buffer.
+
+### 33.6 Interaction with §27 (transport stop)
+
+WM_NOIO and transport stop are independent signals — both can
+fire, neither implies the other:
+
+- **Transport stop, audio graph still running.** `IBuzz.Playing`
+  goes false; `Work()` keeps being called; `mode` is whatever the
+  upstream machine produces (usually not WM_NOIO if the machine is
+  generating tails). §27's forced-fade-on-falling-edge handles this.
+- **Upstream muted, transport still playing.** `IBuzz.Playing` stays
+  true; `mode = WM_NOIO`; §33's immediate-sleep handles this.
+- **Transport stop AND upstream muted.** Both fire; §27's forced
+  fade runs once, then §33's sleep takes over for the duration.
+
+The two patterns don't conflict — they're triggered by different
+conditions and reset different state. Both should be present in any
+effect that has decaying internal state and sustain-style behaviour.

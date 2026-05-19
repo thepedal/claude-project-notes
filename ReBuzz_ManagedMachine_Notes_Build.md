@@ -13,6 +13,9 @@ effects, original finding of unsupported; now superseded).
 Updated with findings from Pedal Patcher v1.0 build (§7 rewritten —
 EffectBlockMulti confirmed working in ReBuzz 1813-preview; §8 added —
 channel count and naming APIs).
+Updated with findings from Pedal Gain Multi build and Pedal Gate v1.3
+sidechain build (§7.1 reference list expanded, §8.1 amended with the
+null-conditional-chain trap, §9 added — sidechain via EffectBlockMulti).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -756,6 +759,43 @@ The `MachineAdded` event fires on the UI thread after the machine is fully
 constructed and `host.Machine` is assigned, so `set_InputChannelCount`
 succeeds without error.
 
+**Critical — use `Global.Buzz.Song`, never `host?.Machine?.Graph?.Buzz?.Song`.**
+The null-conditional form looks safer but is silently broken: `host.Machine`
+is null in the constructor, so the entire `?.` chain short-circuits to
+null, the `if (song != null)` branch never enters, the event subscription
+never happens, and `OnMachineAdded` never fires. The channel-count setter
+is never called and the connection circles never appear on the machine —
+with no error, no warning, no log line. This was the failure mode in the
+Pedal Gate v1.3 build before being fixed to use `Global.Buzz.Song` directly:
+
+```csharp
+// WRONG — looks defensive, silently never subscribes
+public MyMachine(IBuzzMachineHost host)
+{
+    this.host = host;
+    var song = host?.Machine?.Graph?.Buzz?.Song;   // ← null at this point
+    if (song != null)                              // ← branch skipped
+    {
+        song.MachineAdded   += OnMachineAdded;
+        song.MachineRemoved += OnMachineRemoved;
+    }
+}
+
+// CORRECT — Global.Buzz.Song is a static accessor that is valid
+// independently of host.Machine
+using BuzzGUI.Common;  // for Global
+
+public MyMachine(IBuzzMachineHost host)
+{
+    this.host = host;
+    Global.Buzz.Song.MachineAdded   += OnMachineAdded;
+    Global.Buzz.Song.MachineRemoved += OnMachineRemoved;
+}
+```
+
+If `Global` is preferred fully qualified to avoid a `BuzzGUI.Common` using,
+`BuzzGUI.Common.Global.Buzz.Song.MachineAdded` is equivalent.
+
 ### 8.2 Channel naming
 
 ReBuzz calls `GetChannelName(bool input, int index)` on the machine class
@@ -782,10 +822,123 @@ label for that channel index. The method is looked up by name, not by
 interface — it does not need to be declared on any interface; `public` on
 the concrete class is sufficient.
 
-### 8.3 Example: Pedal Patcher (6×6 patchbay effect)
+### 8.3 Reference implementations in this project
 
-Pedal Patcher (`Machines/PedalPatcher/`) is the first machine in this
-project to use `EffectBlockMulti`. Its constructor, `OnMachineAdded`, and
-`GetChannelName` follow §8.1–§8.2 exactly and can be used as a working
-reference. Its Work loop (per-channel routing with gain ramping and
-per-pair VU metering) is in `CMachine.cs`.
+Three machines in the Pedal series use `EffectBlockMulti` and can be
+consulted as working references. Each emphasises a different aspect:
+
+- **Pedal Patcher** (`Machines/PedalPatcher/`) — 6×6 patchbay with per-
+  channel labels and per-pair VU metering. The first machine in the
+  project to use `EffectBlockMulti`. Its constructor, `OnMachineAdded`,
+  and `GetChannelName` follow §8.1–§8.2 exactly. The Work loop in
+  `CMachine.cs` is the reference for per-channel routing with gain
+  ramping.
+
+- **Pedal Gain Multi** (`Machines/PedalGainMulti/`) — 6→1 stereo mixer
+  with per-input metering and a single output gain control. Smallest
+  working `EffectBlockMulti` machine — useful when the routing-matrix
+  complexity of Pedal Patcher is more than the new machine needs. Also
+  demonstrates `OutputChannelCount = 1` (a single stereo bus output)
+  while still using the multi-IO Work signature for its inputs.
+
+- **Pedal Gate v1.3** (`Machines/PedalGate/`) — 2-in / 1-out with the
+  second input pin used as a sidechain key signal (detection only, not
+  passed to the output). The first machine to use multi-input not for
+  routing but for sidechain processing. See §9 for the dedicated
+  sidechain pattern; Pedal Gate's source is the working reference.
+
+All three set `host.InputChannelCount` and `host.OutputChannelCount`
+from `Song.MachineAdded` per §8.1, all three implement `GetChannelName`
+per §8.2, and all three handle `input[i] == null` and `output[o] == null`
+defensively per §7.1.
+
+---
+
+## 9. Sidechain via `EffectBlockMulti`
+
+Sidechain input — a second audio pin used purely for detection while the
+first pin carries the audio being processed — is a common need for
+dynamics machines (gates, compressors, duckers) and a few creative
+effects (envelope-shaped filters, ducked delays). ReBuzz supports it
+via `EffectBlockMulti` (§7) with a small, specific pattern that's worth
+documenting separately from the general multi-channel case in §8.
+
+This section is built on Pedal Gate v1.3 — the first machine in the
+project to do sidechain detection on a second input pin.
+
+### 9.1 The shape
+
+Two input channels declared via `host.InputChannelCount = 2` (set from
+`Song.MachineAdded`, per §8.1). `input[0]` is the main signal; `input[1]`
+is the optional sidechain key. The output is a single stereo bus —
+`host.OutputChannelCount = 1`, `output[0]` is the only output channel.
+
+```csharp
+public bool Work(IList<Sample[]> output, IList<Sample[]> input, int n, WorkModes mode)
+{
+    Sample[] main = (input  != null && input.Count  > 0) ? input[0]  : null;
+    Sample[] sc   = (input  != null && input.Count  > 1) ? input[1]  : null;
+    Sample[] out0 = (output != null && output.Count > 0) ? output[0] : null;
+
+    if (mode == WorkModes.WM_NOIO || main == null || out0 == null)
+        return false;
+
+    // Run detection on sidechain if connected, otherwise on main.
+    Sample[] detect = sc ?? main;
+
+    // ... per-sample loop: read detect[i] for envelope/threshold,
+    //                      apply resulting gain to main[i], write to out0[i] ...
+}
+```
+
+The key idiom is **`Sample[] detect = sc ?? main;`** — if no sidechain is
+wired, detection falls back automatically to the main input (i.e. the
+machine behaves as a regular non-sidechain gate/compressor). This is
+exactly the behaviour users expect: connect a sidechain to get sidechain
+operation, leave it disconnected to get conventional self-detection. No
+parameter or mode switch is needed.
+
+### 9.2 Channel naming
+
+`GetChannelName` should return clearly labelled names so users can see
+in the connection right-click menu which pin is which:
+
+```csharp
+public string GetChannelName(bool input, int index)
+{
+    if (!input) return null;                          // single output, default label
+    return index == 0 ? "Main" : "Sidechain";
+}
+```
+
+`"Main"` and `"Sidechain"` are the conventional labels — match them if
+you can, so users moving between dynamics machines in the project see
+consistent terminology.
+
+### 9.3 What sidechain does NOT need
+
+A few things people sometimes add and that aren't necessary:
+
+- **No `SidechainEnable` parameter.** Connection state is the enable.
+  If `input[1]` is null, no sidechain is wired; if it's non-null, one
+  is. The user makes or breaks the connection in the graph view — no
+  parameter is needed to express the same thing.
+- **No mode switch between "self" and "sidechain" detection.** The
+  `sc ?? main` pattern handles both cases in one Work loop. Adding a
+  user-facing mode is redundant with the connection state.
+- **No "mix sidechain into main" path.** The sidechain pin is detection
+  only; its audio never reaches the output. If a user wants the
+  sidechain source to be audible, they wire it to the master bus
+  separately. Mixing sidechain into the main output silently is
+  surprising behaviour — don't.
+
+### 9.4 Pre-1813 fallback
+
+On ReBuzz builds before 1813-preview, `EffectBlockMulti` does not exist
+(§7.3) and this pattern fails to load with `invalid Work function`. The
+historical workaround was the control-machine peer-parameter approach
+(an external machine writes to a parameter on the dynamics machine,
+which then drives detection). That pattern remains valid for builds
+that need to target pre-1813 ReBuzz but isn't the recommended approach
+for new machines — pin sidechain via `EffectBlockMulti` is simpler,
+more idiomatic, and doesn't require a separate machine in the graph.
