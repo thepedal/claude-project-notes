@@ -11,9 +11,13 @@ Updated with findings from Pedal MComp v1.1 GUI build (ReBuzz 1819-preview).
 Updated with findings from Pedal EQ v1.3 build (§33 — WM_NOIO confirmed-
 silence handling) and Pedal Gate v1.3 sidechain build (§16.1 — constructor-
 time null state cheat sheet).
+Updated with findings from Pedal Profiler2 v1.7 build (§§34–40 —
+audio-thread chunking, MachinePerformanceData, EngineSettings,
+MasterTap, Buzz sample scale, MachineState format, reflection-cache
+pattern; ReBuzz 1826-preview).
 These details are absent from official documentation.
 
-Sections 1–33 are general findings that apply across managed machines.
+Sections 1–40 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -2508,3 +2512,613 @@ fire, neither implies the other:
 The two patterns don't conflict — they're triggered by different
 conditions and reset different state. Both should be present in any
 effect that has decaying internal state and sustain-style behaviour.
+
+---
+
+## 34. ReBuzz audio-thread chunking — the ~256-sample sub-chunk
+
+ReBuzz's `WorkManager` processes audio in chunks of **at most 256 samples**,
+regardless of the ASIO buffer size set by the user or delivered by the
+driver. From `WorkManager.cs`:
+
+```csharp
+samplesToProcess = min(remaining / 2, 256);
+// clamped further to not cross a tick boundary
+```
+
+When the driver delivers a 2048-sample buffer, ReBuzz internally runs the
+audio graph **eight times back-to-back**, processing 256 samples per
+iteration. Each iteration is a full pass: parameter setters fire, every
+machine's `Work()` runs, audio sums to the master, and the chunk loop
+continues until the driver buffer is filled.
+
+### 34.1 Implications for control-machine timing measurement
+
+A control machine's `Work()` is invoked **once per chunk**, not once per
+ASIO buffer. Code that measures wall-clock period between consecutive
+`Work()` calls — for buffer-period inference, dropout detection, etc. —
+sees the **chunk** period, typically ~5.33 ms at 48 kHz with 256-sample
+chunks, regardless of what buffer size is configured upstream.
+
+```csharp
+long now = Stopwatch.GetTimestamp();
+double periodMs = (now - _prevTimestamp) * 1000.0 / Stopwatch.Frequency;
+// periodMs ≈ 5.33 ms even with 2048-sample ASIO buffer
+```
+
+This is not a bug — it's the engine's chunking architecture, driven by:
+- Sub-tick parameter dispatch needing fine-grained boundaries (see §1, §27)
+- A fixed `SubTickSize` field on `IBuzz` (260 in observed builds) that
+  constrains chunk boundaries
+
+### 34.2 Implications for performance budget
+
+Per-chunk processing means **per-chunk host overhead**. Any internal
+ReBuzz work that runs once per audio cycle — parameter dispatch, MIDI
+polling, sub-tick advancement, machine iteration in `CallTick()` — runs
+per chunk, not per ASIO buffer. If host overhead is N ms per chunk,
+increasing the ASIO buffer **multiplies** total host work rather than
+reducing per-chunk pressure.
+
+Concretely: if host overhead is 5 ms per chunk at 256 samples (5.33 ms
+wall-clock budget), there is no headroom whether the ASIO buffer is 256
+samples or 2048 samples. The driver gives more wall time, but ReBuzz
+fills it with N chunks of identical near-budget work.
+
+### 34.3 Recommended diagnostic
+
+If a song produces dropouts and increasing the ASIO buffer doesn't help,
+the cause is per-chunk host overhead, not per-machine DSP cost. Measure
+each machine's engine-reported CPU via `MachinePerformanceData` (§35) —
+typically these sum to a few percent of audio time. The remainder is
+host overhead, which only ReBuzz upstream changes can reduce.
+
+### 34.4 Discovered
+
+Pedal Profiler2 v1.7 (May 2026) — investigation of an 11.5% dropout rate
+that persisted across every user-side change tried: OS priority,
+driver, song complexity, transport state, even closing the profiler's
+own GUI. Buffer Sweep across multiple ASIO buffer sizes (256 / 512 /
+1024 / 2048 samples) showed `BudgetMs` stayed at 5.33 ms regardless,
+and `Unaccounted` stayed at ~5 ms regardless. The 5.33 ms traced
+back to 256 samples × (48 kHz)⁻¹ — the chunk size, not the buffer size.
+
+---
+
+## 35. Per-machine CPU tracking via MachinePerformanceData
+
+`IMachine.PerformanceDataCurrent` returns a
+`BuzzGUI.Interfaces.MachinePerformanceData` object with four `Int64`
+fields that the engine populates continuously while audio runs:
+
+| field              | meaning                                              |
+|--------------------|------------------------------------------------------|
+| `CycleCount`       | accumulated QPC ticks spent in Work() lifetime-to-date |
+| `PerformanceCount` | == CycleCount in observed builds (legacy alias)      |
+| `SampleCount`      | accumulated audio samples processed lifetime-to-date |
+| `MaxEngineLockTime`| max lock-wait observed (multithreading mode)         |
+
+### 35.1 Reading per-machine CPU fraction
+
+The engine measures `PerformanceCount` in QueryPerformanceCounter ticks
+— the same source as `System.Diagnostics.Stopwatch.Frequency`. To
+compute a CPU fraction usable as "% of audio time", capture two reads
+at known sample-count intervals and apply:
+
+```csharp
+double cpuFraction = (deltaPerf * (double)sampleRate)
+                   / (deltaSamp * (double)Stopwatch.Frequency);
+double msPerBuffer = cpuFraction * budgetMs;
+```
+
+Where `deltaPerf` and `deltaSamp` are the diffs between successive
+reads. Sample rate is constant for a session; `Stopwatch.Frequency` is
+fixed for the process lifetime.
+
+### 35.2 PerformanceData vs PerformanceDataCurrent
+
+Both properties return objects of the same type. In observed builds:
+
+- `PerformanceDataCurrent` — live cumulative counters that advance with
+  every chunk processed
+- `PerformanceData` — usually all zeros. Likely a snapshot updated only
+  when ReBuzz's CPU Monitor window is visible; ignore it for headless
+  measurement
+
+Use `PerformanceDataCurrent` for live readings and compute deltas over
+your own sampling window.
+
+### 35.3 Native machines report zero
+
+`PerformanceCount` and `SampleCount` are populated only for **managed**
+machines (where `IMachine.ManagedMachine != null`). Native machines —
+including the Master and any third-party VST or original-Buzz machines
+— leave these fields at zero permanently. Filter native machines out
+of any "engine total" calculation:
+
+```csharp
+foreach (var m in song.Machines)
+{
+    if (m.ManagedMachine == null) continue;  // native — engine perf N/A
+    var perf = m.PerformanceDataCurrent;
+    // ...
+}
+```
+
+### 35.4 Reflection cache pattern
+
+The property and fields are stable across reads but resolving them via
+reflection every call is wasteful. Resolve once on the first non-null
+read, then keep the `PropertyInfo` and `FieldInfo` references for the
+lifetime of the instance:
+
+```csharp
+PropertyInfo? _perfDataCurrentProp;
+FieldInfo?    _perfCountField;
+FieldInfo?    _sampleCountField;
+
+(long perf, long samp)? ReadEnginePerf(IMachine m)
+{
+    try
+    {
+        _perfDataCurrentProp ??= m.GetType().GetProperty("PerformanceDataCurrent");
+        var obj = _perfDataCurrentProp?.GetValue(m);
+        if (obj == null) return null;
+        _perfCountField   ??= obj.GetType().GetField("PerformanceCount");
+        _sampleCountField ??= obj.GetType().GetField("SampleCount");
+        if (_perfCountField == null || _sampleCountField == null) return null;
+        return (
+            (long)(_perfCountField.GetValue(obj) ?? 0L),
+            (long)(_sampleCountField.GetValue(obj) ?? 0L)
+        );
+    }
+    catch { return null; }
+}
+```
+
+See §40 for why this cache pattern needs to be per-instance, not static.
+
+### 35.5 Cross-thread safety
+
+The Int64 fields are written by the audio thread and read from the UI
+thread. On x64 Windows these reads are atomic at the field level, but
+the pair `(PerformanceCount, SampleCount)` can be momentarily
+inconsistent (one updated, the other not). Small EMA smoothing across
+UI ticks absorbs the single-tick error; for one-shot precise
+measurements, take two reads ≥10 ms apart and average.
+
+### 35.6 Discovered
+
+Pedal Profiler2 v1.3 — investigating why the "solo measurement" cost
+(mute everything else, measure buffer period) was much larger than
+expected for Pedal MComp (~5 ms vs ~0.2 ms expected). Reflection dump
+of `MachineCore` surfaced `performanceData` and `performanceDataCurrent`
+as concrete fields with non-zero `PerformanceCount`. Reading them
+directly produced ~1.3% of audio time for MComp — confirming that
+"solo" was dominated by per-chunk host overhead (§34), not real DSP
+work.
+
+---
+
+## 36. EngineSettings — runtime audio engine configuration
+
+`IBuzz` exposes a non-public `engineSettings` field referencing a
+`BuzzGUI.Common.Settings.EngineSettings` instance. Reading it requires
+reflection with `NonPublic` flags:
+
+```csharp
+var fi = buzz.GetType().GetField("engineSettings",
+    BindingFlags.NonPublic | BindingFlags.Instance);
+var settings = fi?.GetValue(buzz);
+```
+
+### 36.1 Properties relevant to audio behaviour
+
+| property                    | type     | purpose                                        |
+|-----------------------------|----------|------------------------------------------------|
+| `PriorityProfile`           | enum     | OS audio thread priority — `NormalAppPriority`, `HighAppPriority`, `AllFocusOnAudio` |
+| `Multithreading`            | bool     | If true, audio graph runs on multiple worker threads |
+| `ProcessMutedMachines`      | bool     | If false (default), muted machines skip `Work()` entirely |
+| `LowLatencyGC`              | bool     | If true, ReBuzz sets `GCSettings.LatencyMode = SustainedLowLatency` |
+| `MachineDelayCompensation`  | bool     | Compensates output for per-machine latency     |
+| `SubTickResolution`         | enum     | Sub-tick processing granularity                |
+| `SubTickTiming`             | bool     | Fire setters at sub-tick boundaries, not just tick boundaries |
+| `AccurateBPM`               | bool     | Higher-precision BPM tracking                  |
+| `EqualPowerPanning`         | bool     | Master pan law                                  |
+
+### 36.2 `ProcessMutedMachines = false` means muting is real
+
+When `ProcessMutedMachines` is `false` (the default), a muted machine's
+`Work()` is **not called at all** that buffer. The output is treated as
+silence. Consequences:
+
+- Solo-measurement schemes that mute everything except one target
+  machine actually measure that machine in isolation — other machines
+  contribute zero CPU.
+- A muted-by-design "sleep" mode in your own machine (§33) works as
+  expected: ReBuzz won't waste cycles invoking your bypassed code.
+
+### 36.3 Toggling settings reflects live
+
+Changes the user makes in ReBuzz's settings window propagate to
+`engineSettings` immediately — no restart needed. Reflection reads see
+the current state. A machine that wants to react to setting changes
+can poll `engineSettings.X` per tick rather than caching across
+sessions.
+
+### 36.4 PriorityProfile changes don't always help
+
+A common assumption is that switching to `AllFocusOnAudio` cures audio
+glitches by giving the audio thread higher OS scheduling priority.
+Empirically (Pedal Profiler2 investigation, May 2026) this is not
+always true. A session showing 11.5% dropout rate with
+`NormalAppPriority` produced **identical** rates with
+`AllFocusOnAudio`. The cause was per-chunk host overhead (§34), not
+OS thread scheduling — and the OS priority knob can't help when the
+work simply doesn't fit in the budget.
+
+---
+
+## 37. MasterTap — audio-thread hook on the master output
+
+`IBuzz` exposes a `MasterTap` field declared as
+`Action<float[], bool, SongTime>`. ReBuzz invokes any delegates on this
+field **from the audio thread** after master mixing, with the
+rendered master output buffer.
+
+### 37.1 Subscribing via reflection
+
+The field name's visibility may vary across ReBuzz versions, and the
+`SongTime` type lives in `BuzzGUI.Interfaces.MachineInterface` —
+different namespace than `BuzzGUI.Interfaces` (the more common `using`).
+Subscribe by reflection-combining with the field's actual delegate
+type, sidestepping any namespace ambiguity:
+
+```csharp
+Delegate? _hookedHandler;
+
+void HookMasterTap()
+{
+    try
+    {
+        var fi = buzz.GetType().GetField("MasterTap",
+            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (fi == null) return;
+
+        var delegateType = fi.FieldType;
+        var handler = GetType().GetMethod(nameof(OnMasterTap),
+            BindingFlags.NonPublic | BindingFlags.Instance);
+        if (handler == null) return;
+
+        var bound = Delegate.CreateDelegate(delegateType, this, handler);
+        var existing = fi.GetValue(buzz) as Delegate;
+        fi.SetValue(buzz, Delegate.Combine(existing, bound));
+        _hookedHandler = bound;  // save for clean unhook
+    }
+    catch { /* fail closed — log to DC console if useful */ }
+}
+
+void OnMasterTap(float[] samples, bool stereo, SongTime time)
+{
+    // AUDIO THREAD — see §37.2
+}
+```
+
+`Delegate.CreateDelegate(delegateType, target, methodInfo)` does
+structural signature matching by the CLR's rules. As long as your
+method's parameter types are structurally compatible with the field's
+declared delegate type, the bind succeeds even when the `SongTime`
+your code references isn't the same one the field declares.
+
+### 37.2 Audio-thread constraints
+
+The handler runs on the audio thread, in the same call stack as the
+engine's per-buffer work. Anything done here adds directly to per-chunk
+overhead (§34). Hard rules:
+
+- **No allocations.** No `new`, no string interpolation, no LINQ. Use
+  pre-allocated buffers and `volatile` fields for output to the UI.
+- **No locks.** Reading via `volatile` and writing via `Interlocked`
+  is safe; `lock` blocks risk audio-thread deadlock against UI-thread
+  locks (see §21).
+- **No exceptions out.** Wrap everything in `try { ... } catch { }`.
+  An unhandled exception in `OnMasterTap` is caught by the host but
+  still causes a hard buffer miss.
+- **No host calls.** Don't call back into `IBuzz`, `Song`, machines,
+  or properties that might IPC (see §21).
+
+Realistic cost target is a single pass over `samples` with cheap
+arithmetic — peak detection, RMS sum-of-squares, simple statistics.
+At 48 kHz with 256-sample stereo chunks, the handler is invoked ~187
+times per second, so per-call budget is large in theory (~5 ms) but
+practical work should stay under 50 µs to leave room for everything
+else.
+
+### 37.3 Coexisting with other subscribers
+
+`MasterTap` is a multicast Action field. Use `Delegate.Combine` to add
+yourself and `Delegate.Remove` to leave cleanly. Save the bound
+delegate you registered (not a freshly constructed one at unhook
+time) so `Remove` can identify it by reference:
+
+```csharp
+void UnhookMasterTap()
+{
+    if (_hookedHandler == null) return;
+    var fi = buzz.GetType().GetField("MasterTap",
+        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+    var existing = fi?.GetValue(buzz) as Delegate;
+    fi?.SetValue(buzz, Delegate.Remove(existing, _hookedHandler));
+    _hookedHandler = null;
+}
+```
+
+Replacing the field with your own delegate (rather than combining)
+would silently drop any other subscriber. Always combine.
+
+### 37.4 Buzz sample scale
+
+`MasterTap` samples arrive in **±32768 range**, not normalised ±1.0
+(see §38). Convert before any dB calculation:
+
+```csharp
+double db = 20.0 * Math.Log10(peak / 32768.0);
+```
+
+---
+
+## 38. Buzz sample scale convention — ±32768
+
+Buzz machines use floating-point sample values, but the **full-scale
+convention is ±32768** (16-bit integer equivalent), not the normalised
+±1.0 range used in most other modern audio software. This is a legacy
+of original Buzz's heritage and is preserved in ReBuzz for
+compatibility with native machines.
+
+The scale shows up in three places:
+
+### 38.1 `Sample` struct output
+
+`Sample` holds two floats but their conventional range is ±32768.
+Returning `new Sample(1.0f, 1.0f)` produces audio at roughly -90 dBFS
+— practically inaudible. Full-scale generation uses values around
+±32768:
+
+```csharp
+// Full-scale white noise
+output[i] = new Sample(_rng.NextSingle() * 65536f - 32768f);
+```
+
+### 38.2 MasterTap samples
+
+The `float[] samples` array delivered by `MasterTap` (§37) is in the
+same ±32768 range. Convert to dBFS by dividing first:
+
+```csharp
+double db = 20.0 * Math.Log10(peak / 32768.0);
+// peak/32768 ∈ [0, 1] = normalised → dBFS in (-∞, 0]
+```
+
+### 38.3 stereoSamples field
+
+`MachineCore.stereoSamples` (a `Sample[]` field on the concrete
+machine type, reachable via reflection) holds the machine's
+most-recent output buffer for visualisation. Same scale.
+
+### 38.4 The driver-boundary conversion
+
+ReBuzz divides by 32768 and clamps to ±1.0 only at the ASIO / WASAPI
+output stage, just before handing samples to the driver. Internally
+everything stays in the ±32768 domain — your DSP code, parameter
+mappings, accumulator buffers, and analysis hooks all operate in
+that range.
+
+The implication for analysis code (peak meters, RMS calculations,
+clip detection) is to apply the ÷32768 conversion at the boundary
+between sample-domain code and dB-domain code, and not before.
+
+---
+
+## 39. MachineState persistence — byte[] property format
+
+A managed machine can persist arbitrary state into the song file by
+implementing a `MachineState` property of type `byte[]` (declared in
+`IBuzzMachine.cs:28`).
+
+```csharp
+public byte[] MachineState
+{
+    get { /* serialise state */ }
+    set { /* deserialise state */ }
+}
+```
+
+ReBuzz calls the getter when saving the song and writes the returned
+bytes into the song file. On load, it calls the setter with the same
+bytes **before** the GUI is created — so GUIs can read state from the
+machine instance in their `Machine` setter without timing concerns.
+
+### 39.1 Recommended framing
+
+A bare `byte[]` is fragile: any layout change breaks all saved
+songs. Frame with magic + version + length-prefixed body so unknown
+formats can be safely ignored:
+
+```
+bytes 0..3    magic  (e.g. "PP2S" as UInt32 little-endian)
+byte  4       version (start at 1, increment on layout change)
+bytes 5..N    payload (length-prefixed UTF-8 strings, fixed-width ints)
+```
+
+```csharp
+const uint MAGIC   = 0x53325050u;  // "PP2S"
+const byte VERSION = 1;
+
+public byte[] MachineState
+{
+    get
+    {
+        try
+        {
+            using var ms = new MemoryStream();
+            using var bw = new BinaryWriter(ms);
+            bw.Write(MAGIC);
+            bw.Write(VERSION);
+            // ... write fields, prefixing strings with UInt16 length ...
+            return ms.ToArray();
+        }
+        catch { return Array.Empty<byte>(); }
+    }
+    set
+    {
+        if (value == null || value.Length < 5) return;
+        try
+        {
+            using var ms = new MemoryStream(value);
+            using var br = new BinaryReader(ms);
+            if (br.ReadUInt32() != MAGIC) return;     // not our format
+            byte v = br.ReadByte();
+            if (v != VERSION) return;                  // future version
+            // ... read fields with bounds checks ...
+        }
+        catch { /* corrupt — silently start fresh */ }
+    }
+}
+```
+
+### 39.2 Forward-compatibility tactics
+
+For state expected to grow over time, two strategies:
+
+- **Append-only optional fields.** Newer versions read the version
+  byte; if it matches, read all known fields, then check
+  `BinaryReader.PeekChar() != -1` to see if more data exists.
+  Tolerate trailing bytes from future versions (the version stays
+  the same; only the trailing payload grows).
+- **Discrete versions.** Increment `VERSION` on every layout change.
+  Older builds silently ignore newer-version state (return on
+  version mismatch). Users on old builds get "reset to defaults"
+  rather than a crash.
+
+Mix the two: bump `VERSION` for breaking changes, append optional
+fields for additive ones.
+
+### 39.3 What goes in state vs parameters
+
+Parameters (declared via `[ParameterDecl]`) are automatically
+persisted by ReBuzz — values, mode, etc. `MachineState` is for
+everything else:
+
+- Wavetables or sample data the machine generated or loaded
+- Multi-character preset names (parameters are int-valued)
+- UI state (last-viewed page, expanded sections, selected machine
+  name in a profiler/inspector)
+- Anything that doesn't fit cleanly into a 32-bit-ish parameter slot
+
+Don't duplicate parameter values into MachineState — they're already
+persisted by the parameter system, and a duplicate copy can drift
+out of sync on load.
+
+### 39.4 Discovered
+
+Pedal Profiler2 v1.1 — the inspector window needed to remember which
+machine the user had selected across song save/load. `PersistedSelection`
+serialised as a length-prefixed UTF-8 string via the framing in §39.1
+— roughly ten lines of get/set code, robust to truncation and ready
+for future additions without breaking existing saved songs.
+
+---
+
+## 40. Reflection cache pattern — surviving ReBuzz internal changes
+
+ReBuzz exposes many useful runtime fields and properties only via
+reflection (engine settings, performance data, audio engine internals,
+MasterTap). Per-call reflection lookup is wasteful in hot UI-timer
+paths; caching the `MemberInfo` references is fast but fragile against
+host renames between versions. The pattern that survives both:
+
+```csharp
+// State — null = not yet resolved; non-null = resolved, use it
+PropertyInfo? _engineSettingsProp;
+bool _engineSettingsResolveFailed;  // tried and failed — don't retry
+
+EngineSettingsInfo? ReadEngineSettings()
+{
+    if (_engineSettingsResolveFailed) return null;
+    var buzz = _subscribedBuzz;
+    if (buzz == null) return null;
+
+    try
+    {
+        if (_engineSettingsProp == null)
+        {
+            _engineSettingsProp = buzz.GetType().GetField("engineSettings",
+                BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance);
+            if (_engineSettingsProp == null)
+            {
+                _engineSettingsResolveFailed = true;
+                return null;
+            }
+        }
+        // ... read fields, return populated DTO ...
+    }
+    catch
+    {
+        _engineSettingsResolveFailed = true;
+        return null;
+    }
+}
+```
+
+### 40.1 Why fail-closed beats retry
+
+Reflection lookups against missing members return null or throw on
+field access. Retrying every UI tick (often 10 Hz) adds CPU cost in a
+hot path and produces a stream of null returns or caught exceptions
+that GC pressure can compound. The fail-closed pattern:
+
+- Try once on first call
+- If it works, cache the references and use them forever
+- If it fails, set a "don't try again" flag and silently return null
+
+The downside is that if ReBuzz adds the member later in a session
+(which doesn't actually happen — internals are populated at startup),
+you'd miss it. The upside is zero per-call overhead in the failure
+case, even when running for hours.
+
+### 40.2 NonPublic | Public | Instance covers visibility shifts
+
+Use all three flags when looking up host internals:
+
+```csharp
+BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.Instance
+```
+
+Buzz / ReBuzz field visibility has shifted across versions — public
+auto-property in one build, private field with property accessor in
+the next, internal in yet another. The combined flags catch all
+variants without needing version detection.
+
+### 40.3 Reflection caches must be per-instance, not static
+
+Different `IBuzz` or `IMachine` instances might be different concrete
+types (rare but possible — test mocks, alternate engine builds, future
+factory variations). Cache `MemberInfo` references on your GUI or
+machine instance, not in `static` fields shared across types. The
+performance cost of one resolution per instance is negligible; the
+correctness benefit is significant.
+
+A second reason: per-instance caching means each instance's
+`_resolveFailed` flag is independent. If one machine in the song
+fails to resolve a member (rare but possible during partial host
+reload), other machines remain unaffected.
+
+### 40.4 Discovered
+
+Pedal Profiler2 — needed to read four different ReBuzz internals
+(engine settings, per-machine performance data, master tap, audio
+engine state). Initial attempts with `static` reflection caches and
+exception spam in the resolve path made the UI sluggish after a few
+minutes — the per-instance fail-closed pattern dropped UI-tick cost
+to negligible after the first resolution, and stayed there for the
+session.
