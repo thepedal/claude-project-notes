@@ -9,6 +9,10 @@ This file is a derived snapshot — refresh it when machines are added,
 renamed, or archived.
 
 **Last refreshed:** 2026-05-22 (35 repos).
+**Last corrected:** 2026-05-23 — curated columns reconciled against the
+addenda (BTDSys-PeerCtrl-ReBuzz row, pedal-profiler2 version/description,
+addenda list and counts). The GitHub list was *not* re-pulled; this pass
+only fixed fields the API doesn't supply.
 
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
@@ -44,7 +48,7 @@ machines need touching?" by grepping for the relevant Core/Build
 
 | Repo                    | Type       | Last pushed | ReBuzz vs     | Addendum | Description                                                |
 |-------------------------|------------|-------------|---------------|----------|------------------------------------------------------------|
-| BTDSys-PeerCtrl-ReBuzz  | control    | 2026-04-04  | ?             |          | Port of BTDSys PeerCtrl                                    |
+| BTDSys-PeerCtrl-ReBuzz  | control    | 2026-05-22  | 1817-preview  | Y        | Port of BTDSys PeerCtrl                                    |
 | pedal-chord             | control    | 2026-04-25  | 1817-preview  |          | Chord peer controller with arpeggiation                    |
 | pedal-chorus            | effect     | 2026-05-02  | ?             |          | Chorus effect                                              |
 | pedal-comp              | effect     | 2026-05-02  | ?             | Y        | Compressor effect                                          |
@@ -73,7 +77,7 @@ machines need touching?" by grepping for the relevant Core/Build
 | pedal-plate             | effect     | 2026-05-01  | ?             |          | Plate reverb                                               |
 | pedal-presetter         | control    | 2026-05-13  | ?             |          | Change presets on target machines                          |
 | pedal-profiler          | diagnostic | 2026-04-26  | ?             |          | Global CPU dashboard — v1                                  |
-| pedal-profiler2         | diagnostic | 2026-05-21  | 1826-preview  | Y        | Per-machine inspector — v2 (Core §§34–40 source)           |
+| pedal-profiler2         | diagnostic | 2026-05-21  | 1827-preview  | Y        | Per-machine inspector — v2 (Core §§34–41 source)           |
 | pedal-ReBuzz-patcher    | utility    | 2026-04-08  | ?             |          | Patching machine                                           |
 | pedal-retrig            | effect     | 2026-05-16  | ?             |          | Port of 'genre' by intoxicated (retrigger)                 |
 | pedal-shaper            | effect     | 2026-05-16  | ?             |          | Waveshaper distortion                                      |
@@ -81,18 +85,31 @@ machines need touching?" by grepping for the relevant Core/Build
 | pedal-zplane            | effect     | 2026-05-07  | ?             |          | Z-Plane filter (4-corner morph)                            |
 
 ReBuzz versions in this table come from the "Updated with findings
-from …" log at the top of `ReBuzz_ManagedMachine_Notes_Core.md`. Most
-rows are `?` because the version wasn't stamped — that's a gap to
-fill in over time, not evidence the machines are stale.
+from …" log at the top of `ReBuzz_ManagedMachine_Notes_Core.md`, or
+from the machine's own addendum (e.g. BTDSys-PeerCtrl-ReBuzz's
+1817-preview is recorded in PeerCtrl §16). Most rows are `?` because
+the version wasn't stamped — that's a gap to fill in over time, not
+evidence the machines are stale.
 
 ---
 
 ## Machines with detailed addenda
 
-Six machines have their own notes file. To support impact analysis,
-each should grow a `## Depends on` section listing the Core/Build
-§-references it relies on. The lists below are seeds — flesh out from
-each addendum as time allows.
+Seven machines (with live repos) have their own notes file. To support
+impact analysis, each should grow a `## Depends on` section listing the
+Core/Build §-references it relies on. The lists below are seeds — flesh
+out from each addendum as time allows.
+
+(An eighth addendum, `ReBuzz_ManagedMachine_Notes_PedalSH101.md`, has no
+matching public repo — see Gaps and orphans below.)
+
+### BTDSys-PeerCtrl-ReBuzz — `ReBuzz_ManagedMachine_Notes_PeerCtrl.md`
+- Port of BTDSys PeerCtrl: a peer controller that maps a 0–100% Value
+  through a piecewise-linear curve onto a target machine's parameter,
+  with inertia/glide and MIDI input.
+- Depends on: Build §1 (csproj), Build §1.3 (deploy target); Core §2
+  (control classification via `void Work()`), §4 (`SendControlChanges()`
+  after writing to a target).
 
 ### pedal-comp — `ReBuzz_ManagedMachine_Notes_PedalComp.md`
 - The original debugging target that produced Core §§1–N. Effectively
@@ -107,6 +124,8 @@ each addendum as time allows.
   (multi-track note workaround) likely relevant, Tracker addendum
   §§11–12 (programmatic pattern manipulation, multi-out per-track
   generators), MPE integration (Tracker addendum §11.1, §11.2).
+  1827: §16.6 confirms SubTickTiming + AudioBufferFillThread are
+  red herrings for the multi-out contract (already checked clean).
 
 ### pedal-invFFT — `ReBuzz_ManagedMachine_Notes_PedalInvFFT.md`
 - Additive synth via inverse FFT.
@@ -129,10 +148,13 @@ each addendum as time allows.
 
 ### pedal-profiler2 — `ReBuzz_ManagedMachine_Notes_PedalProfiler2.md`
 - Per-machine inspector; the May 2026 dropout investigation.
-- Depends on: Core §§34–40 (audio-thread chunking,
+- Depends on: Core §§34–41 (audio-thread chunking,
   `MachinePerformanceData`, `EngineSettings`, `MasterTap`, Buzz sample
-  scale, `MachineState` format, reflection-cache pattern). Core §2
-  (control machine).
+  scale, `MachineState` format, reflection-cache pattern, and §41
+  `AudioBufferFillThread`). Core §2 (control machine).
+  1827: built/tested through v1.7.7 on 1827-preview — MasterTap moved
+  to a GUI-thread event (§37) and the fill-thread cadence (§41) both
+  required handling; see PP2 §13.
 
 ---
 
@@ -142,7 +164,7 @@ each addendum as time allows.
   repo.** Either the machine is private, archived, or named differently
   on GitHub. Worth resolving — either publish, rename the notes file,
   or annotate the addendum to say "intentionally private".
-- **29 machines have no dedicated addendum.** That's fine — most don't
+- **28 machines have no dedicated addendum.** That's fine — most don't
   need one. Add an addendum only when a machine surfaces non-obvious
   findings worth recording, or when its setup deviates from Core/Build
   conventions in a way future-you will need to remember.
