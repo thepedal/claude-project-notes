@@ -15,9 +15,14 @@ Updated with findings from Pedal Profiler2 v1.7 build (§§34–40 —
 audio-thread chunking, MachinePerformanceData, EngineSettings,
 MasterTap, Buzz sample scale, MachineState format, reflection-cache
 pattern; ReBuzz 1826-preview).
+Updated with findings from Pedal Profiler2 v1.7.4–v1.7.7 builds on
+ReBuzz 1827-preview (§§36–37, 41 — MasterTap moved to a GUI-thread
+event; new EngineSettings.SubTickResolution and AudioBufferFillThread;
+PriorityProfileType enum membership changed; new §41 documents the
+background-fill-thread timing regime).
 These details are absent from official documentation.
 
-Sections 1–40 are general findings that apply across managed machines.
+Sections 1–41 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -2573,7 +2578,36 @@ each machine's engine-reported CPU via `MachinePerformanceData` (§35) —
 typically these sum to a few percent of audio time. The remainder is
 host overhead, which only ReBuzz upstream changes can reduce.
 
-### 34.4 Discovered
+### 34.4 SubTickResolution does not change the 256 clamp (1827+)
+
+ReBuzz 1827 added an `EngineSettings.SubTickResolution` enum
+(`Normal=1, Lower=2, Low=3`; see §36) used as:
+
+```csharp
+int subTickCount = SamplesPerTick / SubTickSize / (int)SubTickResolution;
+```
+
+Higher resolution values produce **fewer, larger sub-ticks** (less
+sub-tick event processing and parameter dispatch per tick — "Lower
+values decrease CPU load" per its description). But the chunk processed
+per `Work()` is still `Math.Min(remaining/2, 256)`, clamped further to
+sub-tick/tick boundaries. With larger sub-ticks the sub-tick clamp binds
+less often, so the chunk stays at ~256 samples. `SubTickResolution`
+therefore reduces per-tick overhead at the margin but does **not**
+enlarge the chunk — the per-chunk host floor is unchanged.
+
+### 34.5 AudioBufferFillThread changes the chunk cadence (1827+)
+
+When `EngineSettings.AudioBufferFillThread` is enabled (§41), a 1 ms
+multimedia timer pre-fills a ring buffer ahead of the ASIO callback,
+reading the audio graph in **variable-size blocks** (~190–225 samples
+observed) rather than fixed 256-sample chunks. A control machine's
+`Work()` then runs on the fill thread, and any wall-clock period it
+measures is the **fill-chunk cadence**, not the ASIO callback period and
+not a fixed 256. Code that infers buffer size from `Work()` timing must
+treat the measured period as cadence-only when this setting is on.
+
+### 34.6 Discovered
 
 Pedal Profiler2 v1.7 (May 2026) — investigation of an 11.5% dropout rate
 that persisted across every user-side change tried: OS priority,
@@ -2582,6 +2616,16 @@ own GUI. Buffer Sweep across multiple ASIO buffer sizes (256 / 512 /
 1024 / 2048 samples) showed `BudgetMs` stayed at 5.33 ms regardless,
 and `Unaccounted` stayed at ~5 ms regardless. The 5.33 ms traced
 back to 256 samples × (48 kHz)⁻¹ — the chunk size, not the buffer size.
+
+A follow-up on ReBuzz 1827 (PP2 v1.7.4–v1.7.7) confirmed the floor
+holds: with `SubTickResolution=Low` and `AudioBufferFillThread=True`,
+the chunk cadence dropped to ~192 samples (3.99 ms) and the dropout
+rate improved ~18% relative (≈12% → ≈9.8%), but `Unaccounted` stayed
+at 99.7%. The fill thread cushions transient overruns; it does not
+remove the per-chunk host overhead. SOLO measurement (mute all other
+machines) still showed 100% of budget with peaks unchanged at ~42 ms —
+isolating the one cheap machine created no headroom, proving the cost
+is host-side, not machine-side.
 
 ---
 
@@ -2716,15 +2760,21 @@ var settings = fi?.GetValue(buzz);
 
 | property                    | type     | purpose                                        |
 |-----------------------------|----------|------------------------------------------------|
-| `PriorityProfile`           | enum     | OS audio thread priority — `NormalAppPriority`, `HighAppPriority`, `AllFocusOnAudio` |
+| `PriorityProfile`           | enum     | OS audio thread priority. **Enum changed in 1827** — was `NormalAppPriority, HighAppPriority, AllFocusOnAudio`; now `NormalAppPriority, AllFocusOnAudio, AllDefaults` (`HighAppPriority` removed). Read via `ToString()`, never by ordinal (the ordinals shifted). Marked "(restart)". |
 | `Multithreading`            | bool     | If true, audio graph runs on multiple worker threads |
 | `ProcessMutedMachines`      | bool     | If false (default), muted machines skip `Work()` entirely |
 | `LowLatencyGC`              | bool     | If true, ReBuzz sets `GCSettings.LatencyMode = SustainedLowLatency` |
 | `MachineDelayCompensation`  | bool     | Compensates output for per-machine latency     |
-| `SubTickResolution`         | enum     | Sub-tick processing granularity                |
+| `SubTickResolution`         | enum     | `Normal=1, Lower=2, Low=3`. Divides the sub-tick count (§34.4) — "Lower values decrease CPU load". Higher value = fewer/larger sub-ticks = less per-tick overhead. Does not change the 256 chunk clamp. |
 | `SubTickTiming`             | bool     | Fire setters at sub-tick boundaries, not just tick boundaries |
 | `AccurateBPM`               | bool     | Higher-precision BPM tracking                  |
 | `EqualPowerPanning`         | bool     | Master pan law                                  |
+| `AudioBufferFillThread`     | bool     | **New in 1827**, default false, "(restart)". Background ring-buffer fill thread that decouples audio-graph processing from the ASIO callback. Materially changes control-machine timing — see §41. |
+
+The reflection access pattern is unchanged across 1819→1827: `engineSettings`
+is still a private instance field. Note it also appears as a private field on
+both `SongCore` and `AudioEngine` (constructor-injected), so any of those
+objects can be used to reach the same instance.
 
 ### 36.2 `ProcessMutedMachines = false` means muting is real
 
@@ -2759,107 +2809,115 @@ work simply doesn't fit in the budget.
 
 ---
 
-## 37. MasterTap — audio-thread hook on the master output
+## 37. MasterTap — master-output hook (audio thread ≤1826, GUI thread 1827+)
 
-`IBuzz` exposes a `MasterTap` field declared as
-`Action<float[], bool, SongTime>`. ReBuzz invokes any delegates on this
-field **from the audio thread** after master mixing, with the
-rendered master output buffer.
+`IBuzz` exposes `MasterTap`, carrying the rendered master output buffer.
+**Its declaration and threading changed between builds — this is the most
+consequential 1827 change for any machine that hooks it:**
 
-### 37.1 Subscribing via reflection
+- **ReBuzz ≤1826** — a plain multicast field `Action<float[], bool, SongTime>`,
+  invoked directly **on the audio thread** after master mixing.
+- **ReBuzz 1827+** — a proper field-like `event Action<float[], bool, SongTime>`.
+  The engine computes its own peak (`maxSampleLeft/Right`, pre-scaled by
+  1/32768), copies the buffer into a freshly allocated `float[]`, and
+  marshals the callback to the **GUI thread** via `dispatcher.BeginInvoke`.
+  The interface comment now reads "fired in the GUI thread".
 
-The field name's visibility may vary across ReBuzz versions, and the
-`SongTime` type lives in `BuzzGUI.Interfaces.MachineInterface` —
-different namespace than `BuzzGUI.Interfaces` (the more common `using`).
-Subscribe by reflection-combining with the field's actual delegate
-type, sidestepping any namespace ambiguity:
+A handler written to the strict audio-thread rules in §37.2 is correct on
+*both* builds (those rules are simply unnecessary on 1827), so write to them
+and you need no per-version branching in the handler body.
+
+### 37.1 Subscribing — prefer the event accessor, fall back to the field
+
+Because 1827 makes `MasterTap` an `event`, the robust approach is to try the
+event's `add`/`remove` accessors first (atomic against other subscribers),
+and fall back to direct backing-field manipulation for ≤1826 where it was a
+plain field. In both cases build the handler with
+`Delegate.CreateDelegate(handlerType, this, methodInfo)` so the CLR matches
+the signature structurally — this sidesteps the fact that `SongTime` lives in
+`BuzzGUI.Interfaces.MachineInterface`, a different namespace than the common
+`BuzzGUI.Interfaces` `using`.
 
 ```csharp
-Delegate? _hookedHandler;
+Delegate? _hooked;
+bool _viaEvent;
 
 void HookMasterTap()
 {
-    try
+    const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+    var t = buzz.GetType();
+    var mi = GetType().GetMethod(nameof(OnMasterTap), BindingFlags.NonPublic | BindingFlags.Instance);
+    if (mi == null) return;
+
+    // 1827+: proper event — use add accessor (atomic, correct)
+    var ev = t.GetEvent("MasterTap", F);
+    if (ev?.EventHandlerType != null)
     {
-        var fi = buzz.GetType().GetField("MasterTap",
-            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-        if (fi == null) return;
-
-        var delegateType = fi.FieldType;
-        var handler = GetType().GetMethod(nameof(OnMasterTap),
-            BindingFlags.NonPublic | BindingFlags.Instance);
-        if (handler == null) return;
-
-        var bound = Delegate.CreateDelegate(delegateType, this, handler);
-        var existing = fi.GetValue(buzz) as Delegate;
-        fi.SetValue(buzz, Delegate.Combine(existing, bound));
-        _hookedHandler = bound;  // save for clean unhook
+        var d = Delegate.CreateDelegate(ev.EventHandlerType, this, mi);
+        ev.AddEventHandler(buzz, d);
+        _hooked = d; _viaEvent = true; return;
     }
-    catch { /* fail closed — log to DC console if useful */ }
+
+    // ≤1826: plain field — combine onto the backing delegate
+    var fi = t.GetField("MasterTap", F);
+    if (fi == null) return;
+    var d2 = Delegate.CreateDelegate(fi.FieldType, this, mi);
+    fi.SetValue(buzz, Delegate.Combine(fi.GetValue(buzz) as Delegate, d2));
+    _hooked = d2; _viaEvent = false;
 }
 
-void OnMasterTap(float[] samples, bool stereo, SongTime time)
-{
-    // AUDIO THREAD — see §37.2
-}
-```
-
-`Delegate.CreateDelegate(delegateType, target, methodInfo)` does
-structural signature matching by the CLR's rules. As long as your
-method's parameter types are structurally compatible with the field's
-declared delegate type, the bind succeeds even when the `SongTime`
-your code references isn't the same one the field declares.
-
-### 37.2 Audio-thread constraints
-
-The handler runs on the audio thread, in the same call stack as the
-engine's per-buffer work. Anything done here adds directly to per-chunk
-overhead (§34). Hard rules:
-
-- **No allocations.** No `new`, no string interpolation, no LINQ. Use
-  pre-allocated buffers and `volatile` fields for output to the UI.
-- **No locks.** Reading via `volatile` and writing via `Interlocked`
-  is safe; `lock` blocks risk audio-thread deadlock against UI-thread
-  locks (see §21).
-- **No exceptions out.** Wrap everything in `try { ... } catch { }`.
-  An unhandled exception in `OnMasterTap` is caught by the host but
-  still causes a hard buffer miss.
-- **No host calls.** Don't call back into `IBuzz`, `Song`, machines,
-  or properties that might IPC (see §21).
-
-Realistic cost target is a single pass over `samples` with cheap
-arithmetic — peak detection, RMS sum-of-squares, simple statistics.
-At 48 kHz with 256-sample stereo chunks, the handler is invoked ~187
-times per second, so per-call budget is large in theory (~5 ms) but
-practical work should stay under 50 µs to leave room for everything
-else.
-
-### 37.3 Coexisting with other subscribers
-
-`MasterTap` is a multicast Action field. Use `Delegate.Combine` to add
-yourself and `Delegate.Remove` to leave cleanly. Save the bound
-delegate you registered (not a freshly constructed one at unhook
-time) so `Remove` can identify it by reference:
-
-```csharp
 void UnhookMasterTap()
 {
-    if (_hookedHandler == null) return;
-    var fi = buzz.GetType().GetField("MasterTap",
-        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-    var existing = fi?.GetValue(buzz) as Delegate;
-    fi?.SetValue(buzz, Delegate.Remove(existing, _hookedHandler));
-    _hookedHandler = null;
+    const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+    var t = buzz.GetType();
+    if (_viaEvent)
+        t.GetEvent("MasterTap", F)?.RemoveEventHandler(buzz, _hooked);
+    else
+    {
+        var fi = t.GetField("MasterTap", F);
+        if (fi != null) fi.SetValue(buzz, Delegate.Remove(fi.GetValue(buzz) as Delegate, _hooked));
+    }
+    _hooked = null;
 }
 ```
 
-Replacing the field with your own delegate (rather than combining)
-would silently drop any other subscriber. Always combine.
+Note: a field-like event's compiler-generated backing field has the same name
+("MasterTap") and is private, so `GetField(..., NonPublic)` finds it on 1827
+too — meaning the field path also works there. But it bypasses the atomic
+add/remove, so prefer the event path when `GetEvent` returns non-null.
+
+### 37.2 Handler constraints (write to the strict bar regardless of build)
+
+On ≤1826 the handler runs on the audio thread; on 1827+ it runs on the GUI
+thread. Writing to the audio-thread bar is correct and harmless on both:
+
+- **No allocations** — no `new`, string interpolation, or LINQ; write results
+  to pre-allocated `volatile` fields.
+- **No locks** — `volatile` reads / `Interlocked` writes; never `lock`
+  (audio-thread deadlock risk on ≤1826; see §21).
+- **No exceptions out** — wrap in `try { } catch { }`.
+- **No host calls** — don't re-enter `IBuzz`/`Song`/machines.
+
+Realistic work is one linear pass over `samples` (peak, RMS). On ≤1826 the
+handler is invoked once per chunk (~187/s at 256-sample chunks); on 1827 it
+is queued per chunk to the dispatcher.
+
+### 37.3 1827 per-chunk allocation caveat
+
+The 1827 `MasterTapSamples` allocates `float[] samples = new float[count]`
+**every chunk** (plus a dispatcher closure) before `BeginInvoke`. At ~190–250
+chunks/s that is a measurable Gen-0/Gen-1 allocation stream even when no
+machine is doing real work. It does not (by itself) cause dropouts — Gen 2
+stays flat — but it raises the Gen 1 rate. A host-side fix would be a reusable
+buffer; from a machine's side there is nothing to do but be aware that hooking
+MasterTap on 1827 is not the only source of that allocation (the engine
+allocates regardless of whether anyone is subscribed, as long as the buffer
+copy path runs).
 
 ### 37.4 Buzz sample scale
 
-`MasterTap` samples arrive in **±32768 range**, not normalised ±1.0
-(see §38). Convert before any dB calculation:
+`MasterTap` samples arrive in **±32768 range**, not normalised ±1.0 (see §38).
+Convert before any dB calculation:
 
 ```csharp
 double db = 20.0 * Math.Log10(peak / 32768.0);
@@ -2916,6 +2974,13 @@ that range.
 The implication for analysis code (peak meters, RMS calculations,
 clip detection) is to apply the ÷32768 conversion at the boundary
 between sample-domain code and dB-domain code, and not before.
+
+Confirmation from 1827 internals: the engine's own master VU code
+(`MasterTapSamples`, see §37) computes `maxSampleLeft/Right` and
+multiplies by `1.0f / 32768.0f` to land in the normalised 0..1 domain
+before metering — i.e. ReBuzz itself treats the master buffer as
+±32768 and converts on the way to a meter, exactly as machine analysis
+code should.
 
 ---
 
@@ -3122,3 +3187,60 @@ exception spam in the resolve path made the UI sluggish after a few
 minutes — the per-instance fail-closed pattern dropped UI-tick cost
 to negligible after the first resolution, and stayed there for the
 session.
+
+---
+
+## 41. AudioBufferFillThread — decoupled ring-buffer fill (1827+)
+
+ReBuzz 1827 added `EngineSettings.AudioBufferFillThread` (default false,
+"(restart)"). When enabled it changes the audio timing model in a way
+that matters to any control machine measuring time in `Work()`.
+
+### 41.1 What it does
+
+With the setting off, the audio graph is pulled directly from the ASIO
+callback in fixed ≤256-sample chunks (§34). With it on, a 1 ms
+`MultimediaTimer` runs a background thread that pre-fills a ring buffer
+ahead of the driver:
+
+```csharp
+// CommonAudioProvider, fill thread (≈1 ms timer)
+int readSize = threadBuffer.Length - threadBufferFillLevel;
+if (readSize > 0) FillTheBuffer(readSize);     // → workManager.ThreadReadSpeedAdjust → MainAudioFillBuffer
+// ASIO Read() then just copies out of threadBuffer
+```
+
+The graph is processed on the **fill thread**, in blocks sized by "how
+much the ring buffer drained since the last timer tick" — i.e. variable,
+not a fixed 256. The ASIO callback becomes a cheap memcpy.
+
+### 41.2 Implications for control-machine timing
+
+1. **`Work()` runs on the fill thread**, not the ASIO callback thread.
+2. **The measured `Work()` period is the fill-chunk cadence**, which is
+   variable (~190–225 samples observed at a nominal 256/48 kHz config).
+   It is *not* the ASIO buffer period and *not* a fixed 256-sample chunk.
+3. Any heuristic that infers ASIO buffer size from `Work()` timing breaks
+   under this setting — the period reflects the fill cadence only. A
+   buffer-size detector should widen its change threshold (a ±15–20%
+   tick-to-tick wobble is normal fill jitter; real ASIO changes are ≥2×).
+
+### 41.3 Effect on dropouts
+
+The ring buffer is a cushion: the fill thread can run ahead and absorb
+transient overruns that would otherwise be immediate dropouts. In the
+1827 measurements this gave a modest improvement (~18% relative drop in
+dropout rate) but did **not** remove the per-chunk host overhead floor
+(§34) — `Unaccounted` stayed ~99.7%, SOLO stayed at 100% of budget, and
+peaks stayed ~42 ms. It cushions, it does not cure.
+
+### 41.4 Discovered
+
+Pedal Profiler2 v1.7.4–v1.7.7 on ReBuzz 1827. Enabling the fill thread
+moved PP2's measured chunk budget from 5.33 ms (256 spl) to ~4.0 ms
+(~192 spl) and introduced ~16% tick-to-tick jitter that tripped PP2's
+Buffer Sweep "buffer changed" detector (then at a 10% threshold),
+producing spurious re-stabilisations. Raising the threshold to 35%
+fixed it. The episode is the concrete reason §41.2(3) exists: with the
+fill thread on, treat the `Work()` period as cadence-only and don't map
+it to ASIO buffer size.

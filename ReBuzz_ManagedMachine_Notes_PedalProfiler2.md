@@ -1,6 +1,10 @@
 # ReBuzz Managed Machine Notes — Pedal Profiler2
 
 Source: Pedal Profiler2 v1.7 build on ReBuzz 1826-preview.
+Updated through Pedal Profiler2 v1.7.7 on ReBuzz 1827-preview (§§3, 5, 6,
+8 and the §13 case study — MasterTap GUI-thread event, SubTickResolution
+and AudioBufferFillThread, the spike-cooldown statistics gotcha, and a
+two-build comparison).
 
 Pedal Profiler2 is a single-machine inspector — a follow-on to Pedal
 Profiler v1 (the global CPU dashboard). It coexists with v1 and adds
@@ -12,7 +16,7 @@ investigation deepened.
 This document captures both the implementation details and the lessons
 from using the tool, especially the audio-thread chunking finding that
 closed that investigation. General ReBuzz facts surfaced during the
-work live in `ReBuzz_ManagedMachine_Notes_Core.md` §§34–40; this file
+work live in `ReBuzz_ManagedMachine_Notes_Core.md` §§34–41; this file
 references them as `Core §N`.
 
 Local numbering starts at 1 and is independent of Core.
@@ -242,6 +246,26 @@ reporting host-overhead issues. The raw numbers (buffer column
 showing 256 across all rows; unaccounted column showing 99% across
 all rows) are unambiguous.
 
+### 5.4 Caveat — only valid with AudioBufferFillThread OFF (1827+)
+
+ReBuzz 1827's `AudioBufferFillThread` (Core §41) makes the audio graph
+run on a background fill thread that reads the ring buffer in variable
+blocks. PP2's `BudgetMs` then measures the **fill-chunk cadence**, which
+jitters ~15–20% tick-to-tick and is decoupled from the ASIO buffer
+entirely. Two consequences:
+
+- The Sweep can no longer map ASIO buffer size → overhead, because the
+  measured budget no longer reflects the ASIO buffer.
+- The jitter tripped the original 10% "buffer changed" detector, causing
+  spurious re-stabilisation rows. v1.7.7 raised the threshold to 35% so
+  fill-thread jitter is ignored while real ASIO changes (≥2×) still
+  register.
+
+To use the Buffer Sweep as a true ASIO-buffer overhead map, turn
+`AudioBufferFillThread` off first. With it on, the Sweep still records
+the fill-chunk budget (useful as a single data point) but the
+"change buffer to capture another" workflow won't track ASIO changes.
+
 ---
 
 ## 6. Spike attribution and timing
@@ -273,20 +297,16 @@ running, never the cause).
 
 ### 6.2 Interval statistics
 
-When ≥2 spikes are captured, the summary line includes
+When ≥2 spikes are captured, the summary line *can* show
 `intervals μ=Xms σ=Yms (label)` where the label is:
 
-- **periodic** (CV < 0.15) — strong indication of a regular host
-  event (timer, DPC, GC) rather than random load fluctuation
+- **periodic** (CV < 0.15) — a regular host event (timer, DPC, GC)
 - **semi-periodic** (CV < 0.40)
 - **irregular** — otherwise
 
-CV = coefficient of variation = σ / μ. Periodic spikes at constant
-intervals are a smoking gun for a specific regular cause. Irregular
-spikes correlate with content (note triggers, parameter automation).
-For the May 2026 investigation the label was "irregular" — confirming
-the spikes were random small-disturbance amplifications, not a
-periodic host event.
+CV = coefficient of variation = σ / μ. **But this statistic is only valid
+when overruns are sparse — see the cooldown gotcha in §6.4, which is the
+more important thing to understand about this panel.**
 
 ### 6.3 Display
 
@@ -295,6 +315,39 @@ duration, Δ-since-previous, and the active-machine list (the
 currently-selected machine highlighted in red, the row tinted when
 present). Useful for eyeballing whether spikes cluster at certain
 song positions or arrive evenly distributed.
+
+### 6.4 The cooldown artifact — trust SpikeRawTotal, not the interval
+
+The recorded spike ring is **cooldown-limited**: the machine records at
+most one spike per `SPIKE_COOLDOWN_MS` (500 ms), so the ring stays a
+readable list rather than filling with eight entries from a single 50 ms
+burst. The trap: when real overruns are *frequent* (which at a 10%+
+dropout rate they are), the recorded spikes get spaced out to the
+cooldown floor, quantised to chunk boundaries — and the resulting
+intervals collapse to ~512 ms with **σ≈0**, masquerading as a clean
+"periodic" event that does not exist.
+
+This bit during the 1827 testing: PP2 reported `μ=512ms σ=0ms (periodic)`
+and it looked exactly like a 512 ms software timer. It wasn't. 512 ms is
+96 chunks × 5.33 ms — the cooldown (500 ms) rounded up to the next chunk,
+repeating. There is no 512 ms timer in ReBuzz; the nearest real timers
+are 500 ms (MIDI activity, wall-clock, would show jitter) and 33 ms
+(VU/engine).
+
+The fix (v1.7.5): the machine now counts **every** >150%-baseline overrun
+with no cooldown into `Profile2Snapshot.SpikeRawTotal`, and publishes
+`ElapsedSec`. The GUI computes the true rate `SpikeRawTotal / ElapsedSec`
+and, when the mean recorded interval is within 25% of the cooldown floor,
+suppresses the bogus periodicity label and shows instead:
+
+```
+overruns 23/s (recorded list capped at 1/0.5s — intervals not meaningful)
+```
+
+Rule of thumb: **the spike list is for attribution (who was active), not
+for rate.** For rate, read the `overruns N/s` figure (`SpikeRawTotal`).
+The periodicity label only appears — and is only trustworthy — when
+overruns are genuinely sparser than the cooldown.
 
 ---
 
@@ -376,29 +429,44 @@ A correctly-scaled meter shows negative dBFS values during normal
 music (typically -20 to -6 dB peaks), with 0 dB indicating digital
 full scale.
 
-### 8.3 Thread safety
+### 8.3 Thread safety and the 1827 subscription change
 
-The audio-thread handler updates `volatile float` fields with peak and
-RMS. The UI tick reads them — single-float reads/writes are atomic
-on x64. Peak-hold decay logic runs UI-side, not in the audio handler,
-which lets the audio handler stay minimal:
+The handler updates `volatile float` fields with peak and RMS; the UI
+tick reads them (single-float reads/writes are atomic on x64). Peak-hold
+decay runs UI-side, keeping the handler minimal:
 
 ```csharp
 volatile float _masterPeakL, _masterPeakR;
 volatile float _masterRmsL,  _masterRmsR;
 
-// Audio thread — sets the volatiles
-void OnMasterTap(float[] s, bool stereo, SongTime t) { /* ... */ }
+void OnMasterTap(float[] s, bool stereo, SongTime t) { /* one pass: peak + RMS */ }
 
-// UI thread — reads them and applies peak-hold decay
 void RefreshMasterOutput()
 {
-    float peak = _masterPeakL;        // atomic on x64
+    float peak = _masterPeakL;   // atomic on x64
     /* apply decay, draw bar */
 }
 ```
 
-No locks, no allocations, no exceptions out of the audio handler.
+No locks, no allocations, no exceptions out — written to the audio-thread
+bar so it is correct on both build families (Core §37.2).
+
+**1827 change.** `MasterTap` became a GUI-thread `event` (was an
+audio-thread `Action` field in ≤1826). Two effects on this panel:
+
+- The original v1.7 hook used `GetField` + `Delegate.Combine` on the
+  field. That happens to still work on 1827 (the field-like event's
+  private backing field is named `MasterTap` and is found with the
+  `NonPublic` flag), but it's fragile against ReBuzz's own subscribers
+  (HD Recorder, Signal Analysis). v1.7.4 switched to preferring the event
+  accessor (`GetEvent` → `AddEventHandler`) with the field path as
+  fallback — see Core §37.1. This is what made the VU light up on 1827.
+- The handler now runs on the GUI thread, so the `volatile`/no-alloc
+  discipline is technically unnecessary on 1827 — but it's harmless and
+  keeps one code path for both builds.
+
+The `÷32768` scaling (v1.7.2, §8.2) was the other fix needed to get the
+meter reading sane dBFS instead of nonsensical +75 dB.
 
 ### 8.4 Use case
 
@@ -560,3 +628,62 @@ needed visibility and the next layer needed instrumentation. The
 final layout (§1) is the residual structure of that investigation
 preserved as features. Each section corresponds to a question that
 had to be answered to move forward.
+
+---
+
+## 13. The 1827 follow-up — optimizations tested, floor confirmed
+
+After the 1826 diagnosis, the ReBuzz dev shipped 1827 with two new
+engine knobs aimed at exactly this kind of overhead: `SubTickResolution`
+(Core §36, §34.4) and `AudioBufferFillThread` (Core §41). PP2 v1.7.4–
+v1.7.7 were used to measure their effect. The verdict: real but modest
+improvement, structural floor unchanged.
+
+### 13.1 Two-build comparison (one Juno106, ~0.3% engine cost)
+
+| metric            | 1826 / Normal | 1827 / Low + fillthread |
+|-------------------|---------------|--------------------------|
+| chunk budget      | 5.33 ms (256 spl) | ~4.0 ms (~192 spl)   |
+| dropout rate      | ~12%          | ~9.8%                    |
+| peak              | ~42 ms        | ~42 ms                   |
+| Unaccounted       | 99.7%         | 99.7%                    |
+| Engine Total      | 0.3%          | 0.3%                     |
+| SOLO              | 100% of budget | 100% of budget          |
+| overruns          | (cooldown-hidden) | 23/s                 |
+
+`SubTickResolution=Low` reduces per-tick sub-tick processing but doesn't
+enlarge the 256 clamp (Core §34.4). `AudioBufferFillThread` moves the
+graph onto a ring-buffer fill thread (Core §41), cushioning transient
+overruns — that cushion is where the ~18% relative dropout reduction
+came from. But the per-chunk host floor (~5 ms of work the host does
+regardless of machine count) is untouched: Unaccounted stayed at 99.7%,
+and SOLO (mute every other machine) stayed pegged at 100% of budget with
+peaks unchanged. Isolating the one cheap machine created no headroom —
+the cleanest possible proof the cost is host-side.
+
+### 13.2 What 1827 also changed for the tool itself
+
+- **MasterTap → GUI-thread event** (Core §37). The v1.7 field hook had to
+  become event-accessor-preferring (v1.7.4) to be robust; that's what got
+  the Master Output VU working on 1827.
+- **dBFS scaling** (v1.7.2) — `÷32768` so the VU reads sane dBFS.
+- **Spike-cooldown gotcha exposed** (v1.7.5) — the higher overrun
+  visibility on 1827 made the false-periodicity artifact obvious; fixed
+  by reporting `overruns/s` from `SpikeRawTotal` (§6.4).
+- **Fill-thread chunk jitter** (v1.7.7) — the variable fill-chunk size
+  tripped the Buffer Sweep change detector; threshold raised 10%→35%
+  (§5.4).
+- **GC note** — 1827's `MasterTapSamples` allocates a `float[]` per chunk,
+  raising the Gen 1 rate (Core §37.3). Gen 2 stays flat, so it's not a
+  dropout factor, but it shows up on the GC line.
+
+### 13.3 The standing recommendation
+
+The dev's direction is right — sub-tick reduction plus a fill-thread
+cushion are exactly the levers that touch per-chunk overhead. But the
+binding constraint remains the ~5 ms of fixed host work per ≤256-sample
+chunk. The report to put in front of the dev is unchanged in substance,
+now with a stronger evidence package: a one-Juno song (0.3% engine cost)
+shows 99.7% unaccounted per chunk and SOLO pinned at 100%; `Low` +
+`AudioBufferFillThread` help ~18% relative; the floor is host overhead,
+not machine work, not buffer cushioning, not any user-reachable setting.
