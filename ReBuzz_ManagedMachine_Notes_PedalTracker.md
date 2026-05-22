@@ -471,6 +471,16 @@ For effects like `0EDx` (note delay) and `0E9x` (retrigger), schedule by
 sample count using `host.MasterInfo.SamplesPerTick * delayTicks`. Decrement
 the counter every Work() by `n` samples.
 
+### 7.8 `ParameterCore.pvalues` field type is NOT stable across builds
+
+The private `pvalues` field we reflect into for multi-track note
+recovery changed type between ReBuzz builds — `ConcurrentDictionary<int,int>`
+up to ~1818, `int[256]` in 1827. A bare `as` cast silently nulled on
+the new type and killed all multi-track playback. The reader must
+detect the field shape at runtime. **This is a specific instance of a
+general hazard — see §16 for the full lesson and the audit list of
+every reflection site that needs checking on each ReBuzz upgrade.**
+
 ---
 
 ## 8. Diagnostic methodology that worked
@@ -1510,3 +1520,158 @@ exposes it as an option, and you have to decide whether your
 workload benefits more from the CPU saving or suffers more from
 the state discontinuity. Pedal Tracker's answer happens to be
 "render always". Document yours either way.
+
+---
+
+## 16. Cross-build reflection fragility (the 1827 pvalues break)
+
+This is the most important lesson for long-term maintenance: **every
+place we reach into ReBuzz internals via reflection is a latent break
+waiting for the next ReBuzz build.** One of them (the `pvalues` field)
+broke between 1818 and 1827 and took out all multi-track playback.
+
+### 16.1 What broke
+
+The multi-track simultaneous-note recovery (§ "Multi-track
+simultaneous-note workaround", and notes §1) depends on reading each
+parameter's private `pvalues` field by reflection. The recovery
+exists because ReBuzz delivers only ONE `SetNote` per parameter per
+tick — when several tracks have a note on the same row they all write
+the shared Note parameter and only the last writer survives in the
+engine's `parametersChanged` dictionary. We recover the others by
+reading their raw `pvalues` before the post-tick NoValue reset.
+
+In ReBuzz ≤1818, `ParameterCore.pvalues` was:
+
+```csharp
+ConcurrentDictionary<int, int> pvalues;
+```
+
+In ReBuzz 1827 it became:
+
+```csharp
+int[] pvalues = new int[256];
+```
+
+Our reflection did:
+
+```csharp
+fi.GetValue(p) as ConcurrentDictionary<int, int>;   // → null on int[]
+```
+
+The `as` cast silently returned **null** for the new `int[]` field.
+No exception, no error — `GetPValuesField` just returned null for
+every parameter, `EnsurePollFields` bailed, `PollAllPValues` recovered
+nothing, and only the one directly-delivered track ever triggered.
+
+Symptom as seen by the user: "multi-out only plays the last track."
+The "last" track is whichever one wrote the Note parameter last that
+tick (the surviving `parametersChanged` entry).
+
+### 16.2 Why it was hard to see
+
+The failure is silent and several layers removed from the symptom:
+
+- The routing/dispatch path is completely intact — buffers, channel
+  mapping, `UpdateOutputs`, summing all unchanged. Reading that code
+  reveals nothing because nothing there is wrong.
+- The bug is in note *delivery*, not audio *routing*, but the symptom
+  ("only one track of audio") looks like a routing problem.
+- The `as` cast fails silently. There's no crash to trace back from.
+
+What cracked it: instrumenting our OWN Work to log, per call, which
+voices were active and which output slots held data. The trace showed
+`act=2` (one voice) with all per-track output slots empty — proving
+our render/publish were correct and the problem was upstream, in how
+many voices ever got triggered. From there the pvalues recovery was
+the obvious suspect.
+
+**Lesson: when a symptom points "downstream" but the downstream code
+is provably correct, instrument the boundary — log what your own code
+actually received and produced. Don't keep re-reading the code that
+isn't wrong.**
+
+### 16.3 The fix: tolerate multiple field shapes
+
+`GetPValuesField` now returns a reader (`Func<int,int>`) that detects
+the backing representation at runtime and closes over whichever is
+present:
+
+```csharp
+static System.Func<int, int> GetPValuesField(IParameter p)
+{
+    var fi = p.GetType().GetField("pvalues",
+        BindingFlags.NonPublic | BindingFlags.Instance);
+    if (fi == null) return null;
+    object raw = fi.GetValue(p);
+    if (raw == null) return null;
+    int noValue = p.NoValue;
+
+    if (raw is int[] arr)
+        return track => ((uint)track < (uint)arr.Length) ? arr[track] : noValue;
+
+    if (raw is ConcurrentDictionary<int, int> dict)
+        return track => dict.TryGetValue(track, out int v) ? v : noValue;
+
+    if (raw is System.Collections.IDictionary idict)        // last resort
+        return track => idict.Contains(track) ? (int)idict[track] : noValue;
+
+    return null;
+}
+```
+
+The reader closes over the array reference. Safe because 1827 never
+reallocates `pvalues` (fixed `int[256]`, cleared via `Array.Fill`).
+Same DLL now works on 1818 (dictionary) and 1827 (array).
+
+### 16.4 The general rule for reflection into ReBuzz
+
+Every reflection access into ReBuzz internals must:
+
+1. **Find by name, not assume type.** Get the `FieldInfo`/`MethodInfo`
+   first; check it's non-null before using it.
+2. **Detect the shape at runtime.** Use `is`-pattern checks
+   (`raw is int[]`, `raw is ConcurrentDictionary<...>`), never a bare
+   `as` cast that silently nulls on a type change.
+3. **Degrade gracefully.** If the field/shape is unrecognised, return
+   a safe default and keep the machine working (even if a feature is
+   reduced) rather than crashing or silently producing wrong output.
+4. **Fail loudly in debug.** Consider a one-time `DCWriteLine` when a
+   reflection target isn't found, so the next break is visible in the
+   console instead of manifesting as a mystery audio symptom.
+
+### 16.5 Other reflection sites to audit on each ReBuzz upgrade
+
+These are the places Pedal Tracker reaches into ReBuzz internals.
+**Check every one when a new ReBuzz build appears:**
+
+| Site | What it reflects | Risk if it breaks |
+|------|------------------|-------------------|
+| `GetPValuesField` | `ParameterCore.pvalues` | Multi-track notes lost (this bug) |
+| Matilde import | `MachineCore.EditorMachine`, MPE internals (`MPEPatternsDB`, `MPEPattern`, `MPEPatternColumn`) | Pattern import fails |
+| `EnsurePollFields` | `ParameterGroups[2].Parameters` by name | pvalue recovery disabled |
+
+The Matilde-import chain (notes §11) is the most elaborate and the
+most likely to break next — it reflects through three layers of
+ModernPatternEditor internals that have no public-interface contract.
+When it breaks, the same defensive approach applies: detect shape,
+tolerate variation, degrade gracefully (import becomes a no-op with a
+console warning rather than a crash).
+
+### 16.6 Things that were NOT the cause (ruled out, don't re-chase)
+
+The user had enabled two new 1827 settings; both were investigated and
+are **red herrings** for this bug:
+
+- **SubTickTiming** — chops the work block into sub-tick-sized pieces,
+  so `Work()` is now called with variable, smaller `nSamples`
+  (observed: 256, 202, 54, 18...) multiple times per tick. This
+  changes block sizing but not note delivery. Our per-block math and
+  newRow detection (via `Song.PlayPosition`) handle variable `n`
+  correctly.
+- **AudioBufferFillThread** — a background output-buffer fill in
+  `CommonAudioProvider`, a layer above per-machine Work dispatch.
+  Doesn't touch the multi-out contract.
+
+The actual cause was purely the `pvalues` field-type change, which is
+independent of both settings.
