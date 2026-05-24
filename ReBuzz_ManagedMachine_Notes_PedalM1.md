@@ -516,6 +516,63 @@ Two design points worth flagging:
 `_ownVolumeParam` via the `Machine.ParameterGroups` walk (Core §15)
 because parameter groups aren't populated when the constructor runs.
 
+### 6.1 The pvalues field-shape break (carried over from Tracker §16)
+
+Pedal M1 v1.1's first build shipped with the *old* reflection shape and
+reproduced the exact regression Tracker §16 documents: chords collapsed
+to last-track-only on the user's ReBuzz build. Root cause is identical —
+`ParameterCore.pvalues` changed representation across ReBuzz versions:
+
+```
+ReBuzz ≤1818 : ConcurrentDictionary<int,int> pvalues;
+ReBuzz ≥1827 : int[] pvalues = new int[256];
+```
+
+The original `GetPValuesField` did `fi.GetValue(p) as
+ConcurrentDictionary<int,int>`, and the `as` cast returns **null** on
+the `int[]` form — no exception, no log. Polling then recovered nothing
+and only the directly-delivered (last) track triggered.
+
+The fix is the shape-tolerant reader from Tracker §16.3: instead of
+returning the dictionary, return a `Func<int,int>` that detects the
+backing representation once and closes over whichever is present:
+
+```csharp
+static Func<int,int> GetPValuesReader(IParameter p)
+{
+    var fi = p.GetType().GetField("pvalues",
+        BindingFlags.NonPublic | BindingFlags.Instance);
+    if (fi == null) return null;
+    object raw = fi.GetValue(p);
+    if (raw == null) return null;
+    int noValue = p.NoValue;
+
+    if (raw is int[] arr)
+        return track => ((uint)track < (uint)arr.Length) ? arr[track] : noValue;
+    if (raw is ConcurrentDictionary<int,int> dict)
+        return track => dict.TryGetValue(track, out int v) ? v : noValue;
+    return null;
+}
+```
+
+Both shapes normalise to the same downstream contract: "give me the raw
+pvalue for track `t`, or `NoValue` if absent." The `pv != noVal` filter
+in `PollSiblingTracks` then works unchanged for either backing store —
+for `int[]`, untouched tracks read back `NoValue` (set by the post-tick
+reset, Tracker §1.2); for the dictionary, absent tracks miss the
+`TryGetValue` and the reader substitutes `NoValue`.
+
+**The meta-lesson, again:** every reflection reach into ReBuzz
+internals is a latent break waiting for the next build. This one had
+already been found and fixed once in Pedal Tracker — and still shipped
+broken in Pedal M1 because the machine was written from the *notes'*
+description of the workaround rather than from Pedal Tracker's *fixed*
+source. When porting a documented workaround, port the latest hardened
+version of it, not the original formulation the notes lead with. The
+`as`-cast version appears earlier in the Tracker notes (§1.3) than the
+shape-tolerant fix (§16.3); reading top-to-bottom and stopping at the
+first implementation reproduces the bug.
+
 ---
 
 ## 7. Filter character — why "gentle non-resonant 2-pole" matters

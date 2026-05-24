@@ -8,11 +8,14 @@ A directory of every public managed machine under
 This file is a derived snapshot — refresh it when machines are added,
 renamed, or archived.
 
-**Last refreshed:** 2026-05-22 (35 repos).
-**Last corrected:** 2026-05-23 — curated columns reconciled against the
-addenda (BTDSys-PeerCtrl-ReBuzz row, pedal-profiler2 version/description,
-addenda list and counts). The GitHub list was *not* re-pulled; this pass
-only fixed fields the API doesn't supply.
+**Last refreshed:** 2026-05-22 — API list only. That pull predated
+pedal-faze-r and missed pedal-sh101; both are reflected below but were
+added by hand, not from the API.
+**Last corrected:** 2026-05-24 — added pedal-faze-r (pushed today,
+post-refresh) and its addendum entry; finished folding in pedal-sh101 and
+removed its now-stale orphan note; addenda reordered to match the table;
+recount to 37. The GitHub list was *not* re-pulled — this pass only
+touched fields the API doesn't supply.
 
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
@@ -44,7 +47,7 @@ machines need touching?" by grepping for the relevant Core/Build
 
 ---
 
-## Roster (35 machines)
+## Roster (37 machines)
 
 | Repo                    | Type       | Last pushed | ReBuzz vs     | Addendum | Description                                                |
 |-------------------------|------------|-------------|---------------|----------|------------------------------------------------------------|
@@ -56,6 +59,7 @@ machines need touching?" by grepping for the relevant Core/Build
 | pedal-dly-PCM41         | effect     | 2026-05-05  | 1819-preview  |          | PCM41-style tape delay                                     |
 | pedal-do-nuttin         | template   | 2026-05-12  | ?             |          | "Do nothing" machine — minimal scaffold                    |
 | pedal-eq                | effect     | 2026-05-17  | 1819-preview  |          | EQ effect (Core §33 source: v1.3 WM_NOIO handling)         |
+| pedal-faze-r            | generator  | 2026-05-24  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
 | pedal-fft               | effect     | 2026-05-02  | ?             |          | FFT distortion with harmonics                              |
 | pedal-filter            | effect     | 2026-05-19  | ?             |          | Filter effect                                              |
 | pedal-fm                | generator  | 2026-05-03  | ?             |          | FM synth                                                   |
@@ -80,6 +84,7 @@ machines need touching?" by grepping for the relevant Core/Build
 | pedal-profiler2         | diagnostic | 2026-05-21  | 1827-preview  | Y        | Per-machine inspector — v2 (Core §§34–41 source)           |
 | pedal-ReBuzz-patcher    | utility    | 2026-04-08  | ?             |          | Patching machine                                           |
 | pedal-retrig            | effect     | 2026-05-16  | ?             |          | Port of 'genre' by intoxicated (retrigger)                 |
+| pedal-sh101             | generator  | 2026-05-07  | 1819-preview  | Y        | Monophonic Roland SH-101 emulation (synth-voice patterns)  |
 | pedal-shaper            | effect     | 2026-05-16  | ?             |          | Waveshaper distortion                                      |
 | pedal-tracker           | tracker    | 2026-05-09  | ?             | Y        | Tracker machine — Matilde-compatible                       |
 | pedal-zplane            | effect     | 2026-05-07  | ?             |          | Z-Plane filter (4-corner morph)                            |
@@ -91,17 +96,20 @@ from the machine's own addendum (e.g. BTDSys-PeerCtrl-ReBuzz's
 the version wasn't stamped — that's a gap to fill in over time, not
 evidence the machines are stale.
 
+> Note: a clone-based check on 2026-05-24 found a few last-commit dates
+> newer than the `Last pushed` values above (notably **pedal-tracker**,
+> whose tip is later than its listed 2026-05-09). These weren't edited
+> here because the column is defined as the API's `pushed_at`; reconcile
+> them on the next full GitHub refresh once the REST quota resets.
+
 ---
 
 ## Machines with detailed addenda
 
-Seven machines (with live repos) have their own notes file. To support
-impact analysis, each should grow a `## Depends on` section listing the
-Core/Build §-references it relies on. The lists below are seeds — flesh
-out from each addendum as time allows.
-
-(An eighth addendum, `ReBuzz_ManagedMachine_Notes_PedalSH101.md`, has no
-matching public repo — see Gaps and orphans below.)
+Nine machines (all with live repos) have their own notes file, listed in
+table order. To support impact analysis, each should grow a `## Depends on`
+section listing the Core/Build §-references it relies on. The lists below
+are seeds — flesh out from each addendum as time allows.
 
 ### BTDSys-PeerCtrl-ReBuzz — `ReBuzz_ManagedMachine_Notes_PeerCtrl.md`
 - Port of BTDSys PeerCtrl: a peer controller that maps a 0–100% Value
@@ -118,14 +126,18 @@ matching public repo — see Gaps and orphans below.)
   Build §1.2 (csproj properties), §1.3 (post-build deploy), §2
   (AssemblyName).
 
-### pedal-tracker — `ReBuzz_ManagedMachine_Notes_PedalTracker.md`
-- Matilde-compatible tracker; cross-machine pattern manipulation.
-- Depends on: Core §§1–2 (Work / control classification), §14
-  (multi-track note workaround) likely relevant, Tracker addendum
-  §§11–12 (programmatic pattern manipulation, multi-out per-track
-  generators), MPE integration (Tracker addendum §11.1, §11.2).
-  1827: §16.6 confirms SubTickTiming + AudioBufferFillThread are
-  red herrings for the multi-out contract (already checked clean).
+### pedal-faze-r — `ReBuzz_ManagedMachine_Notes_PedalFazeR.md`
+- 8-voice polyphonic phase-distortion synth (Casio CZ lineage): two PD
+  oscillators per voice (mix/ring/sync), a DCW "wave" envelope standing in
+  for a filter, amp + pitch envelopes, one LFO, a gentle non-resonant tone
+  LP, selectable Off/2×/4× oversampling; no GUI. Faze-R-specific material is
+  the phase-distortion engine + contextual DCW (§§1–3) and the oversampling
+  decimator (§4); poly/voicing is inherited from M1/Core.
+- Depends on: Build §1.2 (csproj — fully compliant), §1.3 (deploy →
+  `Gear\Generators`; also ships a preset bundle), §2 (`.NET` AssemblyName);
+  Core §14 (multi-track note recovery — poly), §27, §29; M1 §5, §7 (tone-LP
+  topology), §10 (poly voice architecture); SH101 §1 (`FastPow2`), §8 (mixer
+  headroom). Built on 1827-preview.
 
 ### pedal-invFFT — `ReBuzz_ManagedMachine_Notes_PedalInvFFT.md`
 - Additive synth via inverse FFT.
@@ -156,14 +168,30 @@ matching public repo — see Gaps and orphans below.)
   to a GUI-thread event (§37) and the fill-thread cadence (§41) both
   required handling; see PP2 §13.
 
+### pedal-sh101 — `ReBuzz_ManagedMachine_Notes_PedalSH101.md`
+- Monophonic Roland SH-101 emulation: single VCO (saw/pulse/sub/noise off
+  one shared phase), ZDF Moog-ladder VCF, ADSR, LFO, portamento; no GUI,
+  no internal sequencer. The addendum's findings are general per-sample
+  synth-voice patterns, not SH-101-specific.
+- Depends on: Build §1.2 (csproj — fully compliant), §1.3 (deploy →
+  `Gear\Generators`), §2 (`.NET` AssemblyName suffix), §4 (`NoWarn
+  MSB3277`); Core (managed-generator `Work()` / note handling), §7 (note
+  encoding); PedalComp §1 (±32768 sample range), §5 (fast curve
+  approximation — generalised to base-2 `FastPow2` here).
+
+### pedal-tracker — `ReBuzz_ManagedMachine_Notes_PedalTracker.md`
+- Matilde-compatible tracker; cross-machine pattern manipulation.
+- Depends on: Core §§1–2 (Work / control classification), §14
+  (multi-track note workaround) likely relevant, Tracker addendum
+  §§11–12 (programmatic pattern manipulation, multi-out per-track
+  generators), MPE integration (Tracker addendum §11.1, §11.2).
+  1827: §16.6 confirms SubTickTiming + AudioBufferFillThread are
+  red herrings for the multi-out contract (already checked clean).
+
 ---
 
 ## Gaps and orphans
 
-- **`ReBuzz_ManagedMachine_Notes_PedalSH101.md` has no matching public
-  repo.** Either the machine is private, archived, or named differently
-  on GitHub. Worth resolving — either publish, rename the notes file,
-  or annotate the addendum to say "intentionally private".
 - **28 machines have no dedicated addendum.** That's fine — most don't
   need one. Add an addendum only when a machine surfaces non-obvious
   findings worth recording, or when its setup deviates from Core/Build
