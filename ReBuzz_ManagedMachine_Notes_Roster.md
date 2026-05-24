@@ -8,14 +8,19 @@ A directory of every public managed machine under
 This file is a derived snapshot — refresh it when machines are added,
 renamed, or archived.
 
-**Last refreshed:** 2026-05-22 — API list only. That pull predated
-pedal-faze-r and missed pedal-sh101; both are reflected below but were
-added by hand, not from the API.
-**Last corrected:** 2026-05-24 — added pedal-faze-r (pushed today,
-post-refresh) and its addendum entry; finished folding in pedal-sh101 and
-removed its now-stale orphan note; addenda reordered to match the table;
-recount to 37. The GitHub list was *not* re-pulled — this pass only
-touched fields the API doesn't supply.
+**Last refreshed:** 2026-05-24 — full GitHub API pull (38 repos).
+Reconciled the list and every `Last pushed` against `pushed_at`. Changes
+this pull: added **pedal-juno106** (new); corrected **pedal-Faze-R** to its
+canonical GitHub casing; refreshed 9 stale push dates (chord, fm, invFFT,
+M1 and tracker had all been re-pushed since the prior snapshot). No
+deletions, archived repos, or forks. `ReBuzz vs` is unaffected by the
+pull — the API doesn't carry it.
+
+**Version stamps (2026-05-24):** pedal-fm, pedal-invFFT, pedal-M1,
+pedal-juno106 and pedal-tracker stamped **1827-preview** — their recent
+v1.x commits explicitly target the ReBuzz 1827 "pvalues field" multi-track
+fix, so they were demonstrably built/tested against 1827. Source: the
+commit messages, not the Core log.
 
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
@@ -47,22 +52,22 @@ machines need touching?" by grepping for the relevant Core/Build
 
 ---
 
-## Roster (37 machines)
+## Roster (38 machines)
 
 | Repo                    | Type       | Last pushed | ReBuzz vs     | Addendum | Description                                                |
 |-------------------------|------------|-------------|---------------|----------|------------------------------------------------------------|
-| BTDSys-PeerCtrl-ReBuzz  | control    | 2026-05-22  | 1817-preview  | Y        | Port of BTDSys PeerCtrl                                    |
-| pedal-chord             | control    | 2026-04-25  | 1817-preview  |          | Chord peer controller with arpeggiation                    |
+| BTDSys-PeerCtrl-ReBuzz  | control    | 2026-05-21  | 1817-preview  | Y        | Port of BTDSys PeerCtrl                                    |
+| pedal-chord             | control    | 2026-05-23  | 1817-preview  |          | Chord peer controller with arpeggiation                    |
 | pedal-chorus            | effect     | 2026-05-02  | ?             |          | Chorus effect                                              |
 | pedal-comp              | effect     | 2026-05-02  | ?             | Y        | Compressor effect                                          |
 | pedal-converb           | effect     | 2026-05-07  | ?             |          | Convolution reverb (SIMD, wavefile IRs)                    |
 | pedal-dly-PCM41         | effect     | 2026-05-05  | 1819-preview  |          | PCM41-style tape delay                                     |
 | pedal-do-nuttin         | template   | 2026-05-12  | ?             |          | "Do nothing" machine — minimal scaffold                    |
 | pedal-eq                | effect     | 2026-05-17  | 1819-preview  |          | EQ effect (Core §33 source: v1.3 WM_NOIO handling)         |
-| pedal-faze-r            | generator  | 2026-05-24  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
+| pedal-Faze-R            | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
 | pedal-fft               | effect     | 2026-05-02  | ?             |          | FFT distortion with harmonics                              |
 | pedal-filter            | effect     | 2026-05-19  | ?             |          | Filter effect                                              |
-| pedal-fm                | generator  | 2026-05-03  | ?             |          | FM synth                                                   |
+| pedal-fm                | generator  | 2026-05-23  | 1827-preview  |          | FM synth                                                   |
 | pedal-folder            | effect     | 2026-05-16  | ?             |          | Wavefolding distortion                                     |
 | pedal-follower          | control    | 2026-05-05  | ?             |          | Envelope follower → param assignment                       |
 | pedal-gain              | effect     | 2026-04-29  | ?             |          | Gain with mute and inertia                                 |
@@ -70,46 +75,42 @@ machines need touching?" by grepping for the relevant Core/Build
 | pedal-gate              | effect     | 2026-05-18  | 1819-preview  |          | Noise gate (Core §16.1 source: v1.3 sidechain build)       |
 | pedal-hallverb          | effect     | 2026-05-02  | ?             |          | Hall reverb                                                |
 | pedal-hdist             | effect     | 2026-05-16  | ?             |          | Harmonic distortion                                        |
-| pedal-invFFT            | generator  | 2026-05-09  | ?             | Y        | Inverse-FFT additive synth (K5000-inspired)                |
+| pedal-invFFT            | generator  | 2026-05-23  | 1827-preview  | Y        | Inverse-FFT additive synth (K5000-inspired)                |
+| pedal-juno106           | generator  | 2026-05-23  | 1827-preview  |          | Roland Juno-106 emulation                                  |
 | pedal-LFmono            | effect     | 2026-04-29  | ?             |          | Low-frequency mono-maker                                   |
 | pedal-lfo               | control    | 2026-05-05  | ?             |          | LFO → param assignment                                     |
 | pedal-limit             | effect     | 2026-04-17  | ?             |          | Limiter effect                                             |
-| pedal-M1                | generator  | 2026-05-10  | ?             | Y        | 8-voice poly dual-PCM-osc synth, Korg M1 voice architecture|
+| pedal-M1                | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice poly dual-PCM-osc synth, Korg M1 voice architecture|
 | pedal-mcomp             | effect     | 2026-05-19  | 1819-preview  |          | Multi-band compressor (Core mentions v1.1 GUI build)       |
 | pedal-muter             | control    | 2026-05-14  | ?             | Y        | Mute other machines                                        |
 | pedal-plaits            | generator  | 2026-05-12  | 1819-preview  |          | Port of Mutable Instruments Plaits                         |
 | pedal-plate             | effect     | 2026-05-01  | ?             |          | Plate reverb                                               |
 | pedal-presetter         | control    | 2026-05-13  | ?             |          | Change presets on target machines                          |
 | pedal-profiler          | diagnostic | 2026-04-26  | ?             |          | Global CPU dashboard — v1                                  |
-| pedal-profiler2         | diagnostic | 2026-05-21  | 1827-preview  | Y        | Per-machine inspector — v2 (Core §§34–41 source)           |
+| pedal-profiler2         | diagnostic | 2026-05-22  | 1827-preview  | Y        | Per-machine inspector — v2 (Core §§34–41 source)           |
 | pedal-ReBuzz-patcher    | utility    | 2026-04-08  | ?             |          | Patching machine                                           |
 | pedal-retrig            | effect     | 2026-05-16  | ?             |          | Port of 'genre' by intoxicated (retrigger)                 |
-| pedal-sh101             | generator  | 2026-05-07  | 1819-preview  | Y        | Monophonic Roland SH-101 emulation (synth-voice patterns)  |
+| pedal-sh101             | generator  | 2026-05-06  | 1819-preview  | Y        | Monophonic Roland SH-101 emulation (synth-voice patterns)  |
 | pedal-shaper            | effect     | 2026-05-16  | ?             |          | Waveshaper distortion                                      |
-| pedal-tracker           | tracker    | 2026-05-09  | ?             | Y        | Tracker machine — Matilde-compatible                       |
+| pedal-tracker           | tracker    | 2026-05-22  | 1827-preview  | Y        | Tracker machine — Matilde-compatible                       |
 | pedal-zplane            | effect     | 2026-05-07  | ?             |          | Z-Plane filter (4-corner morph)                            |
 
 ReBuzz versions in this table come from the "Updated with findings
-from …" log at the top of `ReBuzz_ManagedMachine_Notes_Core.md`, or
-from the machine's own addendum (e.g. BTDSys-PeerCtrl-ReBuzz's
-1817-preview is recorded in PeerCtrl §16). Most rows are `?` because
-the version wasn't stamped — that's a gap to fill in over time, not
-evidence the machines are stale.
-
-> Note: a clone-based check on 2026-05-24 found a few last-commit dates
-> newer than the `Last pushed` values above (notably **pedal-tracker**,
-> whose tip is later than its listed 2026-05-09). These weren't edited
-> here because the column is defined as the API's `pushed_at`; reconcile
-> them on the next full GitHub refresh once the REST quota resets.
+from …" log at the top of `ReBuzz_ManagedMachine_Notes_Core.md`, from
+the machine's own addendum (e.g. BTDSys-PeerCtrl-ReBuzz's 1817-preview is
+recorded in PeerCtrl §16), or from an explicit version reference in the
+machine's commit history (e.g. the five 1827 "pvalues" multi-track fixes).
+Remaining `?` rows just weren't stamped — that's a gap to fill in over
+time, not evidence the machines are stale.
 
 ---
 
 ## Machines with detailed addenda
 
-Nine machines (all with live repos) have their own notes file, listed in
-table order. To support impact analysis, each should grow a `## Depends on`
-section listing the Core/Build §-references it relies on. The lists below
-are seeds — flesh out from each addendum as time allows.
+Nine machines have their own notes file, listed in table order. To support
+impact analysis, each should grow a `## Depends on` section listing the
+Core/Build §-references it relies on. The lists below are seeds — flesh
+out from each addendum as time allows.
 
 ### BTDSys-PeerCtrl-ReBuzz — `ReBuzz_ManagedMachine_Notes_PeerCtrl.md`
 - Port of BTDSys PeerCtrl: a peer controller that maps a 0–100% Value
@@ -126,7 +127,7 @@ are seeds — flesh out from each addendum as time allows.
   Build §1.2 (csproj properties), §1.3 (post-build deploy), §2
   (AssemblyName).
 
-### pedal-faze-r — `ReBuzz_ManagedMachine_Notes_PedalFazeR.md`
+### pedal-Faze-R — `ReBuzz_ManagedMachine_Notes_PedalFazeR.md`
 - 8-voice polyphonic phase-distortion synth (Casio CZ lineage): two PD
   oscillators per voice (mix/ring/sync), a DCW "wave" envelope standing in
   for a filter, amp + pitch envelopes, one LFO, a gentle non-resonant tone
@@ -192,11 +193,12 @@ are seeds — flesh out from each addendum as time allows.
 
 ## Gaps and orphans
 
-- **28 machines have no dedicated addendum.** That's fine — most don't
+- **29 machines have no dedicated addendum.** That's fine — most don't
   need one. Add an addendum only when a machine surfaces non-obvious
   findings worth recording, or when its setup deviates from Core/Build
-  conventions in a way future-you will need to remember.
-- **27 machines have an unknown ReBuzz version.** Not necessarily a
+  conventions in a way future-you will need to remember. (Newest without
+  one: **pedal-juno106**.)
+- **23 machines have an unknown ReBuzz version.** Not necessarily a
   problem, but when ReBuzz changes in a way that might affect them,
   the answer to "is this still good?" is "build it and find out."
   Stamping the version in each machine's `README.md` would close this

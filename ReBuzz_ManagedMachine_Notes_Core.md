@@ -20,9 +20,13 @@ ReBuzz 1827-preview (§§36–37, 41 — MasterTap moved to a GUI-thread
 event; new EngineSettings.SubTickResolution and AudioBufferFillThread;
 PriorityProfileType enum membership changed; new §41 documents the
 background-fill-thread timing regime).
+Updated with findings from the ReBuzz 1827 `pvalues` field-shape change
+(§42 — `ParameterCore.pvalues` went from `ConcurrentDictionary<int,int>`
+to `int[256]`, silently nulling the §14 multi-track poll; fixed across
+pedal-fm/M1/invFFT/juno106/tracker).
 These details are absent from official documentation.
 
-Sections 1–41 are general findings that apply across managed machines.
+Sections 1–42 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
 Pedal Muter). Each addendum uses its own local 1–N numbering and refers back
 to this file as `Core §N`.
@@ -557,6 +561,10 @@ public void SetNote(Note value, int track)
 - `_ownNoteParam` must be obtained LAZILY (on first `SetNote` call), not in the
   constructor. `ParameterGroups` are populated by `CreateParameterDelegates()`
   which runs AFTER the constructor. See §15.
+
+**1827 update:** `pvalues` is no longer a `ConcurrentDictionary<int,int>` —
+it's an `int[256]` from 1827+, so the `as` cast above returns null and
+silently disables this poll. Use the shape-tolerant reader in §42 instead.
 
 ---
 
@@ -3244,3 +3252,97 @@ producing spurious re-stabilisations. Raising the threshold to 35%
 fixed it. The episode is the concrete reason §41.2(3) exists: with the
 fill thread on, treat the `Work()` period as cadence-only and don't map
 it to ASIO buffer size.
+
+---
+
+## 42. `pvalues` field-shape change — multi-track delivery breaks on 1827 (1827+)
+
+This section patches §14 (multi-track simultaneous note delivery) and is a
+concrete instance of the fail-tolerant reflection stance in §40. If you use
+the §14 poll, you need this on 1827+.
+
+### 42.1 What changed
+
+`ParameterCore.pvalues` — the per-track value store the §14 workaround polls
+by reflection — changed its backing type:
+
+- **≤1826** (the shape §14 documents): `ConcurrentDictionary<int,int>` —
+  sparse, track index → value, only fired tracks present.
+- **1827+**: a fixed `int[256]`, indexed by track, cleared in place with
+  `Array.Fill(..., NoValue)` and never reassigned.
+
+The field name (`pvalues`), visibility (private instance), and meaning are
+unchanged — only the container type flipped.
+
+### 42.2 Why it silently broke multi-track chords / multi-out
+
+The §14 listing caches the reflected field and casts it straight to the
+concrete type:
+
+```csharp
+_ownNotePValues = fi.GetValue(_ownNoteParam) as ConcurrentDictionary<int,int>;
+```
+
+On 1827 the field is an `int[256]`, so the `as` cast returns **null** — no
+exception. The poll guard `if (_ownNotePValues != null)` then never runs, and
+the machine falls all the way back to the original §14 engine bug: when two
+pattern tracks fire on the same tick, `parametersChanged` keeps only the last
+track's note and the rest are dropped.
+
+Symptom, build-dependent and easy to misread as a regression in your own
+voice code: chords spread across multiple tracks of one generator collapse to
+a single note, and the tracker's multi-out delivery loses all but one column.
+Nothing logs; the notes are just gone.
+
+### 42.3 The fix — a shape-tolerant reader
+
+Don't cast to a concrete collection. Detect the backing shape once and return
+a `Func<int,int>` mapping track → raw pvalue (or the parameter's `NoValue`),
+closing over whichever container is present:
+
+```csharp
+// track -> raw pvalue, or NoValue if no entry / out of range.
+// Tolerates both pvalues backing shapes:
+//   ReBuzz ≤1826 : ConcurrentDictionary<int,int>
+//   ReBuzz 1827+ : int[256]  (fixed, Array.Fill-cleared, never reassigned)
+static Func<int,int> GetPValuesReader(IParameter p)
+{
+    int noVal = p.NoValue;
+    var fi = p.GetType().GetField("pvalues",
+        BindingFlags.NonPublic | BindingFlags.Instance);
+    object raw = fi?.GetValue(p);
+
+    if (raw is ConcurrentDictionary<int,int> dict)            // ≤1826
+        return t => dict.TryGetValue(t, out int v) ? v : noVal;
+    if (raw is int[] arr)                                     // 1827+
+        return t => (uint)t < (uint)arr.Length ? arr[t] : noVal;
+    return _ => noVal;                                        // unknown → no-op
+}
+```
+
+Notes:
+- The `int[]` branch is bounds-checked with the `(uint)` cast trick — one
+  comparison that rejects both negative and over-range track indices.
+- Both branches are allocation-free and safe to call on the audio thread: a
+  `ConcurrentDictionary` read takes no lock, and an array index is a plain
+  load. No resize or rehash happens on read.
+- The `_ => noVal` fallthrough means a future, unrecognised shape degrades to
+  "no multi-track recovery" rather than throwing on the audio thread — the
+  same fail-closed posture as §40.1. You lose chord recovery, not the machine.
+
+### 42.4 Replacing §14's cast
+
+Swap §14's stored `ConcurrentDictionary<int,int> _ownNotePValues` for a
+`Func<int,int> _ownNotePValues`, initialise it via `GetPValuesReader(...)`
+inside `TryInitPValues()`, and in the sibling-track loop read
+`int pv = _ownNotePValues(t);` instead of `TryGetValue`. Behaviour on ≤1826
+is byte-for-byte identical; 1827+ is recovered. Apply the same reader to any
+other polled track parameter (velocity/volume, wave, command/arg columns).
+
+### 42.5 Discovered
+
+Surfaced as silently-dropped chords on ReBuzz 1827 across every managed
+machine relying on the §14 poll. Fixed in pedal-fm v1.3, pedal-M1 v1.2,
+pedal-invFFT v2.3, pedal-juno106 v1.5, and pedal-tracker v1.7.3 (multi-out).
+The reader and its per-parameter application are written up in full in the
+Pedal Tracker addendum §16. (ReBuzz 1827-preview.)
