@@ -142,12 +142,14 @@ wins and needed no new analysis.
 - **Transport-stop fast-fade** (Core §27): `ForcedRelease` on the amp *and*
   DCW envelopes — fading amp alone would leave the wave frozen mid-distortion
   on the tail, so both go.
-- **Output scaling:** `SoftClip(mono · volN) · 32768`, with **no** per-voice
-  0.5 pre-scale. Unlike M1 §10 (fixed mixer scaling), Faze-R relies on the
-  soft clip to absorb polyphonic summing — a single voice sits at a healthy
-  level and big chords saturate gently rather than clipping hard (SH101 §8
-  option 3). The DC blocker (`Filter.cs`) catches the offset the resonant
-  shapes carry.
+-  **Output scaling:** `SoftClip(mono · MIX_HEADROOM · volN) · 32768` with
+   `MIX_HEADROOM = 0.4` (≈ −8 dB). v1.0.0 shipped with no headroom (soft clip
+   alone), which crushed chords from ~4 voices up; v1.0.1 adopts the M1 §10
+   fixed-headroom approach — a single voice sits well below the clip knee, so
+   chords sum clean and the soft clip is only a safety net for dense, loud
+   chords (8 voices ≈ 0.99). Per-voice level is lower as a result; set output
+   with Volume / the master. The resonant DCW clamp (§2) and the steeper
+   decimator (§4, 16·os+1 taps, ~−75 dB alias rejection) also landed in v1.0.1.
 
 ## 7. Files
 
