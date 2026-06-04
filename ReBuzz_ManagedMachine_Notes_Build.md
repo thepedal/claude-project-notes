@@ -18,6 +18,9 @@ sidechain build (§7.1 reference list expanded, §8.1 amended with the
 null-conditional-chain trap, §9 added — sidechain via EffectBlockMulti).
 Updated from Pedal Add-R v0.7.1 work (§10 added — commit message
 conventions; no double quotes).
+Updated from Pedal Add-R v0.8 work (§3.1 amended — preset bundle filename
+`<MachineName>.prs.xml` (exact match) auto-loads on machine create; the
+legacy `_Presets` form remains importable but not auto-loaded).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -230,11 +233,30 @@ produces files ReBuzz will accept.
 - **Extension is `.prs.xml`**, not `.xml`. ReBuzz uses the double extension
   to distinguish preset bundles from arbitrary XML in the gear folder. A
   file named `MyMachine_Presets.xml` is silently ignored.
-- **Filename is otherwise free** — common convention is
-  `<MachineName>_Presets.prs.xml` but any base name works. Note that this
-  convention puts a space in the filename for any machine whose name has
-  one (`Pedal Plaits_Presets.prs.xml`, `Pedal Comp_Presets.prs.xml`);
-  §3.5 covers the MSBuild deploy pattern that handles this robustly.
+- **Filename determines whether ReBuzz auto-loads the bundle on machine
+  create.** Two cases:
+  - **`<MachineName>.prs.xml`** (filename exactly equal to the machine
+    name plus the `.prs.xml` extension, e.g. `Pedal Add-R.prs.xml`,
+    `Pedal Comp.prs.xml`): ReBuzz auto-loads the bundle as the active
+    preset set the moment the machine is dropped into a song. No import
+    step needed; presets show up directly in the right-click menu. **This
+    is the recommended form for any new machine.**
+  - **Any other base name** (the legacy convention being
+    `<MachineName>_Presets.prs.xml`): the bundle is recognised and
+    parseable by ReBuzz but only loads as importable presets, not as the
+    active set. The user has to right-click the machine and import from
+    the bundle to get the patches into the menu. Existing machines using
+    this form keep working; new machines should not use it.
+
+  Both forms put a space in the filename for any machine whose name has
+  one (`Pedal Plaits.prs.xml`, `Pedal Comp.prs.xml`); §3.5 covers the
+  MSBuild deploy pattern that handles the space robustly.
+
+  When updating an existing machine that shipped under the `_Presets`
+  form to the auto-load form, rename the file and remove the old one
+  from the gear folder during deploy — otherwise both bundles load and
+  the preset menu shows everything twice. A `<Delete Files="...">` task
+  before the `<Copy>` in the deploy target handles this cleanly.
 - **Place alongside the `.dll`** in the same gear subfolder
   (`Gear/Generators` or `Gear/Effects`).
 - **Encoding is UTF-8 with BOM.** A BOM-less UTF-8 file may load but
@@ -344,7 +366,8 @@ rest of the bank stays untouched and continues producing identical XML.
 
 Keep the generator script alongside the source (e.g. `gen_presets.py`)
 but **do not deploy it** — it's not part of what ReBuzz needs at runtime.
-The deployed bundle is just `<Machine>_Presets.prs.xml` + `<Machine>.dll`.
+The deployed bundle is just `<MachineName>.prs.xml` (§3.1 auto-load
+form) + `<MachineName>.NET.dll`.
 
 ### 3.5 Deploying the bundle from the post-build target
 
@@ -364,13 +387,13 @@ copy — looks fine and works for filenames without spaces:
 ```
 
 This fails silently when the bundle's filename contains a space (e.g.
-`Pedal Plaits_Presets.prs.xml`, which is the inevitable form of the
-§3.1 convention for any machine whose name has a space): the literal-
-string `SourceFiles` value with an embedded space gets mis-parsed in
-some MSBuild paths so the Copy can't resolve the source, and
-`ContinueOnError="true"` (which is necessary for the DLL lock case)
-suppresses the failure entirely. The build succeeds, the build log
-shows no warning, and the bundle just isn't there.
+`Pedal Plaits.prs.xml` — the §3.1 auto-load form for any machine whose
+name has a space): the literal-string `SourceFiles` value with an
+embedded space gets mis-parsed in some MSBuild paths so the Copy can't
+resolve the source, and `ContinueOnError="true"` (which is necessary
+for the DLL lock case) suppresses the failure entirely. The build
+succeeds, the build log shows no warning, and the bundle just isn't
+there.
 
 **The robust pattern:** declare the bundle as an `ItemGroup` item and
 reference it via `@(...)`. MSBuild items are typed objects rather than
@@ -379,7 +402,7 @@ round-trip cleanly into the Copy task.
 
 ```xml
 <ItemGroup>
-  <PresetBundle Include="My Machine_Presets.prs.xml" />
+  <PresetBundle Include="My Machine.prs.xml" />
 </ItemGroup>
 
 <Target Name="DeployToReBuzz" AfterTargets="Build">
@@ -398,12 +421,12 @@ round-trip cleanly into the Copy task.
 
 Notes on the shape:
 
-- **`Include="My Machine_Presets.prs.xml"`** is a relative path resolved
-  against the `.csproj` directory; MSBuild handles the space natively
-  in the `Include` attribute's path-parsing rules and stores the result
-  as a single ITaskItem. The subsequent `@(PresetBundle)` expansion in
-  `SourceFiles` passes that item through as-is rather than reparsing
-  the name as a string list.
+- **`Include="My Machine.prs.xml"`** uses the §3.1 auto-load filename form
+  (machine name + `.prs.xml`, no `_Presets` suffix). MSBuild handles the
+  space natively in the `Include` attribute's path-parsing rules and
+  stores the result as a single ITaskItem. The subsequent
+  `@(PresetBundle)` expansion in `SourceFiles` passes that item through
+  as-is rather than reparsing the name as a string list.
 - **`Message` lines before each `Copy`** surface in normal-verbosity
   build output so a deploy that's silently skipped (lock contention,
   missing source, permissions) still produces a visible trace. Without
