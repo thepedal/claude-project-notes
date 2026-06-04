@@ -16,6 +16,8 @@ channel count and naming APIs).
 Updated with findings from Pedal Gain Multi build and Pedal Gate v1.3
 sidechain build (§7.1 reference list expanded, §8.1 amended with the
 null-conditional-chain trap, §9 added — sidechain via EffectBlockMulti).
+Updated from Pedal Add-R v0.7.1 work (§10 added — commit message
+conventions; no double quotes).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -942,3 +944,58 @@ which then drives detection). That pattern remains valid for builds
 that need to target pre-1813 ReBuzz but isn't the recommended approach
 for new machines — pin sidechain via `EffectBlockMulti` is simpler,
 more idiomatic, and doesn't require a separate machine in the graph.
+
+---
+
+## 10. Commit message conventions — no double quotes
+
+Avoid the double-quote character (`"`) in commit messages. Use parens,
+em-dashes, italics in markdown-rendered targets, or simply inline the
+reference without quoting it. Single quotes / apostrophes are fine when
+grammatically required. Backticks for `code` and identifier spans are
+fine — they survive shell escaping and render uniformly across tooling.
+
+### 10.1 Why
+
+Two practical reasons that compound:
+
+- **Shell-escape hazard.** `git commit -m "..."` wraps the whole message
+  in double quotes on most shells. Any inner double quote either breaks
+  the command or has to be escaped, and the right escape varies by
+  shell (`bash`, `zsh`, `PowerShell`, `cmd.exe` all differ slightly).
+  Even when an IDE or tool handles it for you, paste-into-shell flows
+  (copying from chat, from review, from issue threads) hit this hard.
+- **Inconsistent rendering across paste targets.** Some platforms
+  smart-quote `"foo"` to `“foo”` on paste, some leave it literal, some
+  strip the quotes entirely. The result is that the same message reads
+  differently in `git log`, on the hosting site, in PR descriptions,
+  in linked issues, and in chat. Avoiding the character avoids all of
+  it.
+
+The right thing to type is whatever conveys the meaning without the
+quote: a parenthetical, an em-dash, an italicised phrase, or just the
+bare term. Code-fenced or backtick-spanned identifiers are also fine
+and often clearer than quoting prose.
+
+### 10.2 Rewrites
+
+| WRONG | RIGHT |
+|---|---|
+| `Pluck - Vox ("oh"-ish percussive)` | `Pluck - Vox (oh-ish percussive)` |
+| `the "S&H Glitch" preset` | `the SH Glitch preset` (or rename to avoid `&` too — see §3.2) |
+| `param renamed from "LFO->Pitch" to "Mod Pitch"` | `param renamed from LFO->Pitch to Mod Pitch` |
+| `fixes the "click on retrigger" bug` | `fixes the click-on-retrigger bug` |
+| `adds a "what's new" banner` | `adds a what's-new banner` |
+
+### 10.3 Where the rule applies
+
+Commit messages, PR titles and descriptions, release notes, changelog
+entries — anywhere the text might be shell-escaped or pasted between
+tools. Source code, README prose, and code-comment text are not subject
+to this rule (the C# compiler and markdown renderers both handle
+double quotes correctly in their contexts).
+
+The rule is conservative — even a single double quote in a commit
+message can trip the shell-escape path. Default to the alternatives;
+add quotes back only if there's a specific reason a particular phrase
+needs them, which is rare.
