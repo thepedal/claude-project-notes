@@ -45,8 +45,8 @@ via `/p:BuzzDir=...`. References (ReBuzz, BuzzGUI.Interfaces, BuzzGUI.Common)
 are all `Private=false`. Settings UI is built in code, not XAML (`<Page
 Remove>` / `<EmbeddedResource Remove>` strip all `.xaml`) to dodge BAML issues.
 
-Last built/tested against **1817-preview** per the Roster; not re-verified
-against 1827. See §7 for the 1827 consideration relevant to the next phase.
+Built/tested against **1827-preview** as of v1.5.4 (§9). Verified clean — no
+source changes were needed for the 1827 rebuild.
 
 ---
 
@@ -120,18 +120,21 @@ locked at every Swing value** — the trigger count over a loop is unchanged by
 swing, only the spacing alternates. Humanize jitter is added on top of the
 swung base, non-cumulative, so it never drifts the tempo either.
 
-### 3.1 The granularity limitation (the live issue)
+### 3.1 The granularity limitation — whole-tick only (resolved in v1.5.5, §10)
 
-Because `longT`/`shortT` are whole ticks, swing resolution is bounded by Speed:
+In whole-tick mode `longT`/`shortT` are whole ticks, so swing resolution is
+bounded by Speed:
 
 - **Speed=2**: the only integer split of `2×Speed=4` near a shuffle is 3/1, so
   *every* non-zero Swing collapses to the same 3:1 feel. No gradation.
 - **Speed=3**: Swing=50 gives a clean 2:1.
 - **Speed≥4**: the full 0–100 range produces meaningfully distinct ratios.
 
-So today swing is only nuanced at higher Speed. At the low Speed values you'd
-use for fast arps over high BPM/TPB, swing is coarse or absent. This is the
-central thing to fix in the next phase (§7).
+So swing is only nuanced at higher Speed. At the low Speed values you'd use for
+fast arps over high BPM/TPB, swing is coarse or absent. **v1.5.5 (§10) fixes
+this** by counting the step clock in sub-ticks when the host runs Sub-Tick
+Timing, giving R× finer placement. This limitation is therefore only in effect
+when Sub-Tick Timing is off.
 
 ---
 
@@ -232,16 +235,13 @@ write on Pedal Chord's own parameters.
 The reason this file exists. The live constraint is §3.1: whole-tick swing is
 coarse/absent at low Speed. Levers, roughly in order of payoff vs. effort:
 
-1. **Subtick / fractional firing.** ReBuzz 1827 ships **SubTickTiming** (Buzz
-   machine interface v42+): the engine subdivides each tick and delivers
-   setter calls at sub-tick boundaries, and the Modern Pattern Editor stores
-   event times in a sub-tick base so off-grid events play at their true
-   position instead of snapping up. For Pedal Chord this is the real fix —
-   firing the arp at a fractional position within a tick (via `PosInTick` +
-   sample counting, the machinery is already half there) would give smooth
-   swing at *any* Speed, killing the §3.1 cliff. Caveat: only machines built
-   against interface v42+ see sub-tick setter delivery, and the machine is
-   currently stamped 1817-preview — **rebuild/retest against 1827 first.**
+1. **Subtick / fractional firing — DONE in v1.5.5 (§10).** ReBuzz 1827 ships
+   **SubTickTiming**: the engine subdivides each tick into `SubTicksPerTick`
+   sub-ticks and works machines per sub-tick. Pedal Chord now counts its step
+   clock in sub-ticks when SubTickTiming is on, giving R× finer swing — see §10
+   for the implementation and verification. Version eligibility is automatic
+   (§9.2: managed machines report `HostVersion`=66 on 1827). The remaining
+   levers below are still open.
 2. **Master Groove sync (§4.1).** Bring back `GrooveData` as a base layer so
    the arp inherits the song's groove for free, with Swing scaling on top.
    Cheap and very Buzz-idiomatic.
@@ -263,10 +263,148 @@ groove sync (2) as a base.
 
 The Roster lists `pedal-chord` (control, last pushed 2026-05-23, 1817-preview)
 with the **Addendum column blank**. When this file lands in the project, flip
-that to **Y**, and add under the per-machine notes index:
+that to **Y**, bump **ReBuzz vs** to **1827-preview** (v1.5.4, §9), update
+**Last pushed**, and add under the per-machine notes index:
 
 > ### pedal-chord — `ReBuzz_ManagedMachine_Notes_PedalChord.md`
 > - Single-voice (v1.5+) chord/arp peer controller. Whole-tick integer swing;
 >   next phase moves to sub-tick (1827) for low-Speed swing resolution.
 > - Depends on: Build §1.2/§1.3/§2/§4; Core §2, §4, §7, §8, §15. Core §14
 >   *was* relevant pre-v1.5 (multi-track) but no longer applies (§6).
+>   1827: rebuilt clean as v1.5.4 — no source change (§9); §42 and §37 don't
+>   apply.
+
+---
+
+## 9. The 1827 rebuild — v1.5.4
+
+v1.5.4 is a recompile-and-retest against ReBuzz 1827-preview, verified against
+the 1827 source. **No functional source changes were required**; only the
+README version/changelog were touched. The build itself needs nothing special
+— the csproj references `$(BuzzDir)\*.dll`, so building against a 1827 install
+links the 1827 API DLLs automatically (§1).
+
+### 9.1 Why nothing broke — the three 1827 changes vs. this machine
+
+The three consequential 1827 changes (per Core §42, §37, and the SubTick work):
+
+- **`pvalues` field-shape flip (Core §42)** — only bites the §14 multi-track
+  reflection poll. Pedal Chord is single-voice since v1.5 (§6) and removed all
+  reflection hacks; it never polls `pvalues`. **N/A.**
+- **MasterTap → GUI-thread event (Core §37)** — only bites machines that hook
+  `MasterTap`. Pedal Chord doesn't. **N/A.**
+- **SubTickTiming / AudioBufferFillThread** — changes `Work()` cadence (finer,
+  more frequent calls). Pedal Chord gates *all* per-tick logic on the §2
+  `newTick` (PosInTick-reset) detection, which is robust to any call frequency.
+  Verified in the 1827 source (`WorkManager.cs`): `masterInfo.PosInTick`
+  advances by each processed chunk and resets to 0 *only* at the full tick
+  boundary; SubTickTiming further subdivides the chunk and resets a separate
+  `PosInSubTick`, but never touches `PosInTick`'s tick-relative meaning. So
+  `newTick = pit < _prevPit` fires exactly once per tick, never spuriously
+  mid-tick. **Correct on 1827, with or without SubTickTiming.**
+
+The one remaining ReBuzz-internal reflection site, `EnsureTrackCount`, tries
+the public `IMachine.TrackCount` setter first (still `{ get; set; }` in 1827)
+and only falls back to reflection inside a try/catch — the Core §40/§16.4
+defensive pattern. No issue.
+
+### 9.2 The managed-machine interface-version mechanism (matters for §7)
+
+Confirmed in `ManagedMachineDll.cs`: a managed machine reports
+`nmi.Version = Global.Buzz.HostVersion`, and `ReBuzzCore.HostVersion => 66` on
+1827. So **every managed machine running on 1827 reports interface version 66**
+— inherited from the host at runtime, not baked into the DLL. The engine's
+sub-tick setter-delivery gate (`MachineWorkInstance.Tick`, `WorkManager`
+control/non-control loops) checks `DLL.Info.Version >= 42`, which a managed
+machine therefore passes automatically. Consequence for the next phase: there
+is **no version attribute to set in Pedal Chord's source** to "enable subtick";
+eligibility is automatic on 1827. Sub-tick swing is purely a matter of reading
+`SubTickInfo` in `Work()` and firing on sub-tick boundaries, plus the user
+enabling SubTickTiming in engine settings.
+
+---
+
+## 10. Sub-tick swing — v1.5.5
+
+Resolves the §3.1 low-Speed granularity limit by counting the arp step clock in
+**sub-ticks** instead of whole ticks when the host runs SubTickTiming. Pending
+on-hardware confirmation at time of writing; verified by simulation (§10.3).
+
+### 10.1 Mechanism (verified against the 1827 source)
+
+- `IBuzzMachineHost.SubTickInfo` (`SubTicksPerTick`, `CurrentSubTick` [0..R-1],
+  `SamplesPerSubTick`, `PosInSubTick`) is populated per processed chunk by
+  `MachineManager.UpdateMasterAndSubTickInfoToHost()`, called in
+  `WorkManager`'s render loop **before** each `ReadWork()` (which works control
+  machines every chunk via `CollectControlMachinesThatCanWork`). With
+  SubTickTiming on, chunks are clamped to sub-tick boundaries, so a control
+  machine's `Work()` runs at least once per sub-tick.
+- `MasterInfo.PosInTick` is unchanged by SubTickTiming — it stays tick-relative
+  and resets only at the tick boundary (§2, §9.1). So the existing `newTick`
+  detector is still the *tick* clock; `CurrentSubTick` edges give the *sub-tick*
+  clock.
+- When SubTickTiming is **off**, `SubTicksPerTick` is 0 → the machine uses
+  `R = 1` → identical whole-tick behaviour. No new parameter; it follows the
+  host setting.
+
+### 10.2 The change (three edits, no new parameter)
+
+Let `R = SubTicksPerTick` when `> 1`, else `1`. In `Work()`:
+
+```csharp
+int  R = (sti != null && sti.SubTicksPerTick > 1) ? sti.SubTicksPerTick : 1;
+_curR  = R;
+bool newStep = (R > 1) ? (newTick || sti.CurrentSubTick != _prevSub) : newTick;
+_prevSub = (R > 1) ? sti.CurrentSubTick : 0;
+```
+
+- **Arp step** decrements/fires on `newStep` (sub-tick clock).
+- **Note-offs** (Length, in ticks) stay gated on `newTick` — *this split is the
+  critical correctness point*: counting Length in sub-ticks would make every
+  note R× too short.
+
+In `StepArp` the reload period is scaled by R, preserving the
+`long + short == period` tempo lock at R× resolution:
+
+```csharp
+int   R      = _curR < 1 ? 1 : _curR;
+int   period = 2 * _vs.Speed * R;                 // step units (sub-ticks)
+float ratio  = 1f + _vs.Swing / 100f;
+int   longT  = (int)Math.Round(period * ratio / (ratio + 1.0));
+int   shortT = Math.Max(1, period - longT);
+longT        = Math.Max(1, period - shortT);
+// ... parity toggle as before ...
+int drift  = _vs.Humanize > 0 ? (int)Math.Round(_vs.Speed * R * _vs.Humanize / 200.0) : 0;
+```
+
+`ArpTicks` (the countdown field, name retained) now counts step-units. It is
+reloaded by `StepArp` on every fire, so the design stays in the proven
+integer-countdown family (§4) — no floats, no accumulator fragility.
+
+### 10.3 Verification (simulation)
+
+64-tick runs, trigger count and gap spread by R/Speed/Swing:
+
+- **Tempo locked at all R**: 33 fires/64t at Speed 2, 17 at Speed 4 — average
+  gap = Speed exactly, every R and Swing. `long + short == period` always.
+- **R=1 reproduces v1.5.4 exactly**: Speed 2 straight until Swing≈80, then the
+  coarse 3:1 cliff.
+- **R=8, Speed 2 (the win)**: Swing 20/40/60/80 → 1.13:1 / 1.46:1 / 1.67:1 /
+  1.91:1 — smooth low-Speed gradation that whole-tick could not produce.
+  Swing=100 approaches but doesn't reach a literal 2:1 (ratio = 1+Swing/100
+  caps long at 2/3 of period; it tends to 2:1 as period grows with Speed/R).
+
+### 10.4 Known transient
+
+If the user toggles SubTickTiming (or changes SubTickResolution) *during*
+continuous playback of a held arp, the in-flight `ArpTicks` countdown is in the
+old unit for one step, producing a single off gap before the next `StepArp`
+reload self-corrects. Every NoteOn calls `Start()`→`StepArp`, which reloads in
+the current unit, so the window is only a sustained arp across a live setting
+change — rare. Not worth rescaling state to avoid; documented instead.
+
+### 10.5 Open follow-ons (unchanged from §7)
+
+Master-Groove sync (§4.1), a groove-pattern selector, and a per-step offset
+column remain open. Sub-tick now gives the *resolution*; groove sync would give
+the *source feel* — they compose (groove as base, Swing scaling on top).
