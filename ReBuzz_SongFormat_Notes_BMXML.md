@@ -6,6 +6,14 @@ songs). All claims below were verified either against the ReBuzz loader source
 or by **byte-exact round-trip** (regenerate a real saved blob and compare ==
 original). Where a fact is empirical-only it is marked *(empirical)*.
 
+Updated with findings from the Limani assembly session: load-time machine
+**positions** (§2.4), **held-note-on-load** suppression (§2.5), MPE event
+values as **literal parameter values** not just notes (§4.3), and the corrected,
+verified mechanism for **song tempo** — BPM/TPB live as events in a pattern on
+the **Master's own track**, not in the Master parameters, which the BMXML
+loader ignores (§8). The §8 tempo finding supersedes an earlier (wrong)
+"can't be set from the file" conclusion.
+
 This file documents the **XML song format** and the **Modern Pattern Editor
 (MPE) note-data blob** — i.e. how a `.bmxml` song is laid out on disk and how
 playable note data is actually stored. It is a different concern from the
@@ -121,6 +129,39 @@ timbre is set by their own parameters, not by this blob.
 > wrapped format — it is the **raw MPE blob** (starts `FF 01 …`), with no
 > 5-byte version/size header. See §4.
 
+### 2.4 Machine-view positions (`<X>` / `<Y>`)
+
+Each machine carries normalized float coordinates (`<X>`, `<Y>`, roughly the
+range −1.5 … +1.5; Master is at `0,0`). **Machines saved at `0,0` stack
+directly on top of the Master in the machine view.** When assembling a song
+from blocks that were never positioned (e.g. spliced from a file where the user
+left everything at the origin), assign each visible generator a **distinct**
+`X`/`Y` so nothing overlaps on first load. Hidden `Modern Pattern Editor`
+machines can stay at `0,0` — they don't appear in the machine view.
+
+The position element appears once per machine, right after `<Type>Generator</Type>`:
+`<Type>Generator</Type><X>-1.2</X><Y>0.4</Y>` — target it there when editing.
+
+### 2.5 Load-time held note (silence on load)
+
+Every machine's **Track**-group `Note` parameter (`<Type>Note</Type>`) stores a
+*current* value — a snapshot of the last note sounding when the song was saved
+— and this is **separate from the sequenced notes** in the editor blob. On load
+ReBuzz applies this stored value, so a **non-zero** Track `Note` makes the
+machine sound the instant the file loads (a sustaining synth holds it as a
+drone; a percussive Plaits just makes one decaying hit). This is independent of
+the Play button.
+
+To guarantee **no sound until Play**, set every generator's Track `Note` stored
+value to its `NoValue` (`0`). Playback is unaffected — performance notes come
+from the sequencer/editor blob, not this parameter:
+
+```python
+# clear all held notes (the <Value> precedes the <Type>Note</Type>)
+out = re.sub(r'<Value>\d+</Value>(\s*</Value>\s*</Values>\s*<Type>Note</Type>)',
+             r'<Value>0</Value>\1', out)
+```
+
 ---
 
 ## 3. Where playable notes live (the big one)
@@ -218,12 +259,17 @@ int32  colIdx               # 0-based column index
 int32  reserved = 0
 byte   flag     = 0
 int32  eventCount
-eventCount × { int32 pos ; int32 value }     # pos = row * 240 ; value = note byte
+eventCount × { int32 pos ; int32 value }     # pos = row * 240 ; value = column's param value
 int32 ×4 trailer  (all = 4)                  # per-column, not per-row
 ```
 
 - `pos = row * 240` *(empirical; 240 = internal ticks per row)*.
-- `value` is the §3.2 note byte (e.g. `66` = C#4, `65` = C-4 drum trigger).
+- `value` is the **literal value of that column's parameter** at that row. For a
+  **Note** column it's the note byte (§3.2; e.g. `66` = C#4, `65` = C-4 drum
+  trigger). For a non-note parameter column it's that parameter's raw integer
+  value — e.g. the Master's BPM/TPB columns carry `60` and `4` verbatim (§8),
+  not note-encoded. So events automate any pattern-editable parameter, not just
+  notes.
 - The trailer is four int32s each `= 4`, **once per column** regardless of how
   many events — so blob size scales with event count only.
 
@@ -326,10 +372,14 @@ Workflow used for Limani:
    `<Source>`.
 4. For every generator, set PatternCore to one empty `00` pattern at the full
    length (§3), and replace its editor's `<Data>` with a freshly generated blob
-   (§5).
+   (§5). Give the **Master** a `00` pattern too and write BPM/TPB into its
+   `pe1` editor blob (§8).
 5. Rebuild `<MachineConnections>` (every generator **and** every editor → Master)
-   and `<Sequences>` (one per generator).
-6. Set `LoopEnd`/`SongEnd` to the song length; write with the BOM.
+   and `<Sequences>` (one per generator **plus one for `Master`** carrying the
+   tempo pattern, §8).
+6. Assign distinct `<X>`/`<Y>` to every visible generator (§2.4), clear all
+   Track `Note` stored values to `0` (§2.5), set `LoopEnd`/`SongEnd` to the song
+   length, and write with the BOM.
 
 ### 6.1 Nesting-aware block extraction (gotcha)
 
@@ -404,13 +454,55 @@ strings:
 
 ---
 
-## 8. Playback parameters
+## 8. Song tempo (BPM / TPB) — set via a Master-track pattern
 
-- Pattern timing is **TPB 4** (4 rows per beat ⇒ 16 rows per bar).
-- BPM is **set after load** (Limani is designed for **60 BPM**). At 60 BPM /
-  TPB 4 the row rate is 4 rows/s, so 16 bars = 256 rows ≈ **64 s**.
-- The root `Speed` element was `0` in working files; tempo came from the
-  ReBuzz transport, not this field.
+**Tempo does not come from the Master's parameters.** The BMXML loader reads
+BPM/TPB from the *in-session* Master prototype and never copies the saved
+Master parameter values into it (`BMXMLFile.cs` ~242–245 reads
+`masterGlobals.Parameters[1/2].GetValue(0)`, with **no** `CopyParameters` for
+the Master — unlike every other machine). So editing the file's Master `<Value>`
+for BPM/TPB has **no effect** on load. (The binary `.bmx` loader *does* restore
+them, because it `SetValue`s all params from the file before reading — a
+load-path asymmetry, not a format difference.)
+
+**Tempo travels as events in a pattern on the Master's own track.** This is the
+working mechanism, verified against a real saved file:
+
+- The Master has its own `Modern Pattern Editor` (`_x0001_pe1`) and a PatternCore
+  pattern (e.g. `00`). Its editor blob holds that pattern with **3 column-records
+  = the Master's Global params**, in order: **col 0 = Volume, col 1 = BPM,
+  col 2 = TPB**.
+- Put an event at **row 0** in the columns you want to set, with the **literal**
+  value (not note-encoded): BPM `60` in col 1, TPB `4` in col 2. Leave col 0
+  (Volume) empty to keep master volume.
+- Add a `<Sequence>` with `<Machine>Master</Machine>` playing that pattern
+  (`Time 0`, `Span` = pattern length). The Master must be sequenced for the
+  events to fire.
+
+Concrete generator (column-indexed events; reuses the §5 layout):
+
+```python
+def build_master_tempo_blob(bpm, tpb):
+    # Master Global columns: 0=Volume, 1=BPM, 2=TPB ; literal values at row 0
+    return build_blob_cols('Master', '00', 3, {1: [(0, bpm)], 2: [(0, tpb)]})
+# build_blob_cols is build_blob (§5) generalized to take {col: [(row,value)]}
+```
+
+Notes & caveats:
+
+- **Values are literal.** col 1 value `60` = 60 BPM; col 2 value `8` = TPB 8.
+  Confirmed against a reference saved at BPM 60 / TPB 8.
+- It is good practice to also set the Master Global `<Value>` for BPM/TPB to the
+  same numbers (harmless metadata; honored by the `.bmx` loader or a fixed XML
+  loader), but the **pattern events are what actually take effect**.
+- The cached 1817–1827 source had the Master BPM/TPB `SubscribeEvents`
+  **commented out** (`ReBuzzCore.CreateMaster` ~1815–1816) and the play engine
+  derives tempo from internal `bpm`/`tpb` fields — which led to an earlier
+  (wrong) conclusion that a Master pattern couldn't drive tempo. The **shipping
+  Build 1827 applies it**; trust the live artifact over the cached source.
+- Timing maths: at 60 BPM / TPB 4 the row rate is 4 rows/s, so 16 bars =
+  256 rows ≈ 64 s. The top-level `<Speed>` element is unrelated to tempo
+  (a legacy int, `0` in working files).
 
 ---
 
@@ -470,3 +562,10 @@ decoding. Always emit with the UTF-8 BOM (§1).
    spliced in.
 6. MPE blob length header ("mystery bytes") ⇒ it's the **uint32 total blob
    length** (§4.1); cracking it enabled byte-exact blob generation.
+7. Synths droned the instant the song loaded ⇒ a non-zero **Track `Note`**
+   stored value is a load-time held note; clear it to `0` (§2.5).
+8. Spliced-in machines all stacked on Master ⇒ they were saved at `X=Y=0`;
+   assign distinct positions (§2.4).
+9. BPM/TPB wouldn't load from the Master parameters ⇒ the BMXML loader ignores
+   them; tempo must be a **pattern on the Master track** (col 1 = BPM,
+   col 2 = TPB, literal values, row 0) with the Master sequenced (§8).
