@@ -12,7 +12,9 @@ values as **literal parameter values** not just notes (§4.3), and the corrected
 verified mechanism for **song tempo** — BPM/TPB live as events in a pattern on
 the **Master's own track**, not in the Master parameters, which the BMXML
 loader ignores (§8). The §8 tempo finding supersedes an earlier (wrong)
-"can't be set from the file" conclusion.
+"can't be set from the file" conclusion. Also adds **multi-track/polyphony**
+encoding (§4.6) — `<TrackCount>` plus track-major repeated columns, with the
+per-record `track` field that earlier looked like a constant `reserved 0`.
 
 This file documents the **XML song format** and the **Modern Pattern Editor
 (MPE) note-data blob** — i.e. how a `.bmxml` song is laid out on disk and how
@@ -162,6 +164,18 @@ out = re.sub(r'<Value>\d+</Value>(\s*</Value>\s*</Values>\s*<Type>Note</Type>)',
              r'<Value>0</Value>\1', out)
 ```
 
+> Note for multi-track machines (§4.6): only **track 0**'s `<Value>` is
+> immediately before `</Values>`, so this regex clears just that one. Tracks
+> 1…N take the parameter default (Note default `0`), so they stay silent anyway.
+
+### 2.6 Track count (polyphony)
+
+The number of tracks (voices) is the **`<TrackCount>`** of the **Track**
+parameter group (`ParameterGroups[2]`). The loader builds the machine with that
+many tracks. Raising it (e.g. to 6) gives that many note columns per pattern;
+the matching change in the editor blob is in §4.6. Some machines are
+monophonic (e.g. Pedal SH101) and ignore a higher count.
+
 ---
 
 ## 3. Where playable notes live (the big one)
@@ -256,7 +270,7 @@ columns are emitted, but only the note column carries events.
 ```
 asciiz columnName           # = the GENERATOR's name (e.g. "Bass"), not editor's
 int32  colIdx               # 0-based column index
-int32  reserved = 0
+int32  track                # track index (0 for single-track machines & non-track columns)
 byte   flag     = 0
 int32  eventCount
 eventCount × { int32 pos ; int32 value }     # pos = row * 240 ; value = column's param value
@@ -264,6 +278,10 @@ int32 ×4 trailer  (all = 4)                  # per-column, not per-row
 ```
 
 - `pos = row * 240` *(empirical; 240 = internal ticks per row)*.
+- `track` is the voice index. It is `0` for non-track columns and for any
+  single-track machine — which is why it looks like a constant zero until you
+  examine a multi-track machine (§4.6). For a track-group parameter column it
+  carries the track number.
 - `value` is the **literal value of that column's parameter** at that row. For a
   **Note** column it's the note byte (§3.2; e.g. `66` = C#4, `65` = C-4 drum
   trigger). For a non-note parameter column it's that parameter's raw integer
@@ -277,15 +295,20 @@ int32 ×4 trailer  (all = 4)                  # per-column, not per-row
 
 The number of column-records equals the machine's exposed pattern-column count.
 Notes land in that machine's **Note parameter** column — which is **not always
-the last column**, so determine it empirically (enter one note, save, decode):
+the last column**, so determine it empirically (enter one note, save, decode).
+The table below is the **single-track** layout; `base` = the colIdx of the first
+track-group parameter (= number of non-track columns), and machines with >1
+track-group param have more than one track column (see §4.6).
 
-| Machine (Library) | role in Limani | columns | **note column** |
-|---|---|---|---|
-| Pedal Plaits   | drums (Kick/Snare/HatClosed/HatOpen) | 14 | **12** |
-| Pedal SH101    | Bass | 26 | **25** (last) |
-| Pedal invFFT   | Pad  | 29 | **28** (last) |
-| Pedal Juno106  | Comp | 26 | **25** (last) |
-| Pedal Faze-R   | Lead | 69 | **67** (NOT last — col 68 exists) |
+| Machine (Library) | role | total cols (1 trk) | note col | track-group params | `base` |
+|---|---|---|---|---|---|
+| Pedal Plaits   | drums | 14 | **12** | 2 (Note, Velocity) | 12 |
+| Pedal SH101    | Bass | 26 | **25** (last) | 1 (Note) — **monophonic** | 25 |
+| Pedal invFFT   | Pad  | 29 | **28** (last) | 1 (Note) | 28 |
+| Pedal Juno106  | Comp | 26 | **25** (last) | 1 (Note) | 25 |
+| Pedal Faze-R   | Lead | 69 | **67** (NOT last) | 2 (Note@67, Velocity@68) | 67 |
+
+(`base` is also `total cols − (track-params × 1)` for the single-track case.)
 
 ### 4.5 Length-agnostic
 
@@ -295,24 +318,61 @@ and a 256-row full-song pattern use identical structure; only the event `pos`
 values and the PatternCore `<Length>` differ. This is why a single long
 pattern per machine works.
 
+### 4.6 Multiple tracks (polyphony)
+
+A machine's track count is set by **`<TrackCount>`** in its **Track** parameter
+group (group index 2). The loader reads `machineData.ParameterGroups[2].TrackCount`
+and builds the machine with that many tracks; per-track parameter values that
+aren't present default (so you need not expand the Track group's `<Values>` to
+N entries — though ReBuzz writes N on save). Setting `<TrackCount>6</TrackCount>`
+makes the machine load with 6 tracks; the pattern editor then shows that many
+note columns.
+
+In the **blob**, extra tracks do **not** add new colIdx values — each
+track-group parameter column **repeats once per track at the same colIdx**, in
+**track-major** order (all of track 0's track columns, then track 1's, …), and
+each record carries its **`track`** index (§4.3). So:
+
+```
+recordCount = base + trackCount × (number of track-group params)
+column layout = [ col 0 … col base-1 (non-track, track 0) ]
+                [ for t in 0..trackCount-1:  for each track-param colIdx pc:  (pc, track=t) ]
+```
+
+Example — 6-track Juno106 (`base`=25, one track param Note@25):
+`recordCount = 25 + 6×1 = 31`; columns 0–24 once, then colIdx 25 six times with
+`track` = 0…5. Verified **byte-exact** against a real 6-track save. A 6-track
+Faze-R (two track params 67/68) gives `67 + 6×2 = 79`, emitting `(67,t)` then
+`(68,t)` for each track.
+
+A given voice's notes live in that track's note-column record; **track 0** is the
+first track-param record group, so an existing single-track part stays in place
+when you raise the track count and leave tracks 1…N empty.
+
+**Monophonic machines.** Some generators cap at one track (e.g. **Pedal SH101**),
+and a higher `<TrackCount>` won't give real polyphony — verify per machine. When
+in doubt, save one instance at the desired track count and decode it.
+
 ---
 
 ## 5. Verified generator & decoder (Python)
 
-This `build_blob` reproduced **all 8** reference blobs byte-for-byte.
+This `build_blob` reproduced **all 8** single-track reference blobs
+byte-for-byte; `build_blob_mt` reproduces the multi-track (6-track) reference
+byte-for-byte. Use `build_blob_mt` for everything — it subsumes `build_blob`.
 
 ```python
 import struct, base64
 
 def build_blob(machine_name, patterns):
-    # patterns: list of dict(name=str, ncols=int, notecol=int, events=[(row,value),...])
+    # single-track form. patterns: list of dict(name, ncols, notecol, events=[(row,value)])
     body = struct.pack('<i', len(patterns))
     for p in patterns:
         body += p['name'].encode('latin1') + b'\x00'
         body += struct.pack('<iii', 4, 4, p['ncols'])       # f1, f2, recordCount
         for c in range(p['ncols']):
             body += machine_name.encode('latin1') + b'\x00'  # column name = GEN name
-            body += struct.pack('<ii', c, 0) + b'\x00'       # colIdx, reserved, flag
+            body += struct.pack('<ii', c, 0) + b'\x00'       # colIdx, track(=0), flag
             evs = p['events'] if c == p['notecol'] else []
             body += struct.pack('<i', len(evs))
             for row, val in sorted(evs):
@@ -320,6 +380,25 @@ def build_blob(machine_name, patterns):
             body += struct.pack('<iiii', 4, 4, 4, 4)         # trailer
     total = 2 + 4 + len(body)                                 # magic + lenfield + body
     return b'\xff\x01' + struct.pack('<I', total) + body
+
+def build_blob_mt(machine_name, patname, track_param_cols, trackcount, events):
+    # multi-track. track_param_cols = colIdx of each Track-group param (e.g. [25]
+    # Note, or [67,68] Note+Velocity). Non-track columns are 0..min(cols)-1.
+    # events keyed by (track, colIdx) -> [(row,value),...]. Track-major order.
+    base = min(track_param_cols)
+    recs = base + trackcount * len(track_param_cols)
+    body = struct.pack('<i', 1) + patname.encode('latin1') + b'\x00' \
+         + struct.pack('<iii', 4, 4, recs)
+    def rec(colidx, track, evs):
+        r = machine_name.encode('latin1') + b'\x00' + struct.pack('<ii', colidx, track) \
+          + b'\x00' + struct.pack('<i', len(evs))
+        for row, val in sorted(evs): r += struct.pack('<ii', row * 240, val)
+        return r + struct.pack('<iiii', 4, 4, 4, 4)
+    out = b''.join(rec(c, 0, []) for c in range(base))        # non-track columns
+    for t in range(trackcount):
+        for pc in track_param_cols:
+            out += rec(pc, t, events.get((t, pc), []))
+    return b'\xff\x01' + struct.pack('<I', 2 + 4 + len(body + out)) + body + out
 
 def to_data_element(blob):                                    # editor <Data> = raw blob, b64
     return base64.b64encode(blob).decode('ascii')
@@ -338,12 +417,12 @@ def decode_blob(blob):
         name, o = rd_s(o); f1, o = rd_i(o); f2, o = rd_i(o); rec, o = rd_i(o)
         cols = []
         for _ in range(rec):
-            cn, o = rd_s(o); col, o = rd_i(o); _, o = rd_i(o); o += 1; evc, o = rd_i(o)
+            cn, o = rd_s(o); col, o = rd_i(o); track, o = rd_i(o); o += 1; evc, o = rd_i(o)
             ev = []
             for _ in range(evc):
                 pos, o = rd_i(o); val, o = rd_i(o); ev.append((pos // 240, val))
             o += 16                          # trailer
-            if ev: cols.append((col, ev))
+            if ev: cols.append((col, track, ev))
         pats.append((name, rec, cols))
     assert o == len(blob)                    # clean parse ends exactly at EOF
     return pats
@@ -569,3 +648,6 @@ decoding. Always emit with the UTF-8 BOM (§1).
 9. BPM/TPB wouldn't load from the Master parameters ⇒ the BMXML loader ignores
    them; tempo must be a **pattern on the Master track** (col 1 = BPM,
    col 2 = TPB, literal values, row 0) with the Master sequenced (§8).
+10. Multi-track (6-track) synths ⇒ set `<TrackCount>` and repeat each track
+    column per track; the int32 after colIdx that looked like `reserved 0` is the
+    **track index** (§4.6). SH101 is monophonic and won't honor it.
