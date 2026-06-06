@@ -16,15 +16,28 @@ loader ignores (§8). The §8 tempo finding supersedes an earlier (wrong)
 encoding (§4.6) — `<TrackCount>` plus track-major repeated columns, with the
 per-record `track` field that earlier looked like a constant `reserved 0`.
 
+**Control-machine layer (new, §12).** The earlier "Pedal Chord throws an NRE,
+dropped" conclusion was **wrong** — the NRE came from a *fabricated* machine
+block (§6's cardinal rule), not from the machine. With a **real** Pedal Chord
+block, one control machine per voice drives a target generator with live
+chords or arpeggios; §12 is the full song-authoring recipe (state-targeting,
+the 14-column map, chord vs arp modes, polyphony rules), verified working in
+Limani against `chordref.bmxml` (chords) and `arpref.bmxml` (arps). **§13** then
+generalises the whole pipeline into a **spec → song** recipe — the standing goal
+of being able to ask for "a piece in style X, instruments Y/Z, tempo T."
+
 This file documents the **XML song format** and the **Modern Pattern Editor
 (MPE) note-data blob** — i.e. how a `.bmxml` song is laid out on disk and how
 playable note data is actually stored. It is a different concern from the
 `ReBuzz_ManagedMachine_Notes_*` files (which cover writing the machines
 themselves). Cross-references to those use `Core §N` etc.
 
-Worked example throughout: the song **"Limani"** (18 machines: a 4-piece Plaits
-drum kit + bass/lead/pad/comp synths, ~64 s, D Hijaz). Its build script is the
-canonical implementation of everything here.
+Worked example throughout: the song **"Limani"** (**26 machines**: a 4-piece
+Plaits drum kit played directly, + bass/lead/pad/comp synths each **driven by
+its own Pedal Chord** control machine, ~64 s, D Hijaz). Its build script is the
+canonical implementation of everything here. (The original Limani drove the
+synths with hand-written melodies; it was later converted to the control-machine
+layer of §12 — both arrangements are valid and the format facts are identical.)
 
 ---
 
@@ -143,6 +156,19 @@ machines can stay at `0,0` — they don't appear in the machine view.
 
 The position element appears once per machine, right after `<Type>Generator</Type>`:
 `<Type>Generator</Type><X>-1.2</X><Y>0.4</Y>` — target it there when editing.
+
+> **Visible range is bounded — off-canvas machines don't render *(empirical,
+> Limani §12 session).*** A machine loads, plays, and shows in the **sequencer**
+> regardless of its `X`/`Y`, but the **machine view** only draws the populated
+> region. In Limani the real machines span roughly **X ∈ [−1.2, 0.82],
+> Y ∈ [−1.25, 1.0]**; four control machines parked at **X = 1.6** loaded and
+> ran correctly (audible, sequenced) but were **invisible in the machine view**
+> because they sat past the right edge. Keep every machine you want to *see*
+> within the cluster the other machines occupy (a safe rule of thumb is to stay
+> inside the min/max `X`/`Y` already used by the song); the user can drag them
+> anywhere afterwards and ReBuzz re-saves the new spot. This is independent of
+> connections — an unconnected generator (e.g. a Pedal Chord, §12) still draws,
+> as long as it's on-canvas.
 
 ### 2.5 Load-time held note (silence on load)
 
@@ -526,10 +552,12 @@ strings:
   Pedal ConVerb, Pedal Resonator, Pedal Z-Plane, Pedal Folder, Pedal Shaper,
   Pedal HDist, Pedal MComp, Pedal S950.
 
-> **Pedal Chord caveat:** earlier attempts to use Pedal Chord (a *control*
-> machine) as an arpeggiator inside the song threw a NullReferenceException at
-> load. It was dropped from the Limani design; bass/lead/pad/comp are plain
-> generators.
+> **Pedal Chord (control machine) — works in-song; see §12.** An early attempt
+> threw a NullReferenceException at load and Pedal Chord was wrongly dropped from
+> the design. **Root cause was a *fabricated* Pedal Chord block** (the §6 cardinal
+> rule), not the machine. Using a **real** saved Pedal Chord block, it drives a
+> target generator with live chords/arps and loads cleanly. Limani now uses four
+> of them (one per synth). Full recipe in **§12**.
 
 ---
 
@@ -609,22 +637,42 @@ decoding. Always emit with the UTF-8 BOM (§1).
 
 - **Scale:** D Hijaz / Phrygian-dominant — D E♭ F♯ G A B♭ C
   (noteIdx D=2, E♭=3, F♯=6, G=7, A=9, B♭=10, C=0).
-- **Form:** 16 bars × 16 rows = 256 rows; per-bar root degrees
+- **Tempo / form:** 60 BPM, TPB 4 (16 rows/bar); 16 bars × 16 rows = 256 rows
+  ≈ 64 s. Per-bar root degrees
   `D D E♭ D G G A D  D E♭ B♭ A G E♭ A D`.
-- **Arrangement (build-up):**
-  - *Bass* (SH101, oct 2): root on rows 0 & 8 of every bar — plays throughout.
-  - *Pad* (invFFT, oct 4): root on row 0 of every bar — plays throughout.
-    (Intro bars 1–2 are bass + pad alone.)
+- **Harmony (diatonic D-Hijaz triad per root degree)** — used by every control
+  machine so the chords and arps share one progression:
+  D→Major, E♭→Major, G→Minor, A→Diminished, B♭→Augmented. As Pedal Chord
+  chord-indices (§12.3): D/E♭ = `0`, G = `1`, A = `5`, B♭ = `6`.
+- **Arrangement (build-up).** Drums play **directly** (their own editor blobs);
+  the four synths are each **driven by a Pedal Chord** (§12) and their own
+  patterns are empty:
+  - *Bass* (SH101, oct 2) ← **BassArp**: octave-bass *arp* (Mode Up, chord type
+    `50` = root+octave, Octaves 1, **Speed 8** so it bounces root@row0 /
+    octave@row8). Plays throughout.
+  - *Pad* (invFFT, oct 4) ← **PadChord**: block *chord* (Mode 0) on row 0 of
+    every bar. Plays throughout. (Intro bars 1–2 are bass + pad alone.)
   - *Kick* (Plaits): rows 0,8 — from bar 3.
-  - *HatClosed* (Plaits): straight 8ths (rows 0,2,4,6,8,10,12,14) — from bar 3.
+  - *HatClosed* (Plaits): straight 8ths (rows 0,2,…,14) — from bar 3.
   - *HatOpen* (Plaits): row 14 accent — from bar 3.
   - *Snare* (Plaits): rows 4,12 — from bar 5.
-  - *Lead* (Faze-R, oct 4–5): composed D-Hijaz phrase, bars 5–16, leaning on
-    F♯→G and B♭→A, with an E♭→F♯ augmented 2nd, resolving to D4 in bar 16.
-  - *Comp* (Juno106, oct 3): root on rows 4,12 — from bar 9.
+  - *Lead* (Faze-R, oct 4) ← **LeadArp**: *arp* Up (Mode 1, **Speed 2,
+    Octaves 2**, Arp-Reset@row0), the progression arpeggiated, bars 5–16.
+  - *Comp* (Juno106, oct 3) ← **CompChord**: block *chord* stabs on rows 4 & 12,
+    bars 9–16.
 - All drum hits trigger note value **65** (C-4); the kit's timbres come from each
   Plaits machine's own parameters (only the kick was tuned in the source song —
   snare/hats were default Plaits and may need parameter tweaks).
+- **Machine inventory (26):** Master + its editor `pe1`; 4 synths + their (now
+  empty) editors `pe2…pe5`; 4 Plaits drums + editors `pe6…pe9`; 4 Pedal Chords
+  (`PadChord`,`CompChord`,`LeadArp`,`BassArp`) + their editors `pe10…pe13`. The
+  Pedal Chord *generators* are **not** audio-connected; only their editors → Master
+  (§12.2).
+- **Earlier (direct-melody) version** — still valid, kept for reference: each
+  synth carried its own notes (Bass root on rows 0 & 8; Pad root on row 0; Lead a
+  composed D-Hijaz phrase leaning on F♯→G and B♭→A with an E♭→F♯ augmented 2nd,
+  resolving to D4 in bar 16; Comp root on rows 4,12). The conversion to §12
+  replaced these with control machines but changed none of the format facts.
 
 ---
 
@@ -632,7 +680,10 @@ decoding. Always emit with the UTF-8 BOM (§1).
 
 1. Root must be `<ReBuzzSong>` (the `[XmlRoot]` alias), not `<BMXMLSong>`.
 2. Build 1827 needs the UTF-8 BOM + correct top-level/Machine/Parameter order.
-3. Pedal Chord as a control machine ⇒ NRE on load ⇒ dropped.
+3. Pedal Chord as a control machine ⇒ NRE on load ⇒ *was* dropped. **Resolved:**
+   the NRE came from a **fabricated** Pedal Chord block, not the machine (same
+   root cause as #5). With a real saved block it loads and drives a target
+   cleanly — now the basis of the §12 control-machine layer.
 4. Patterns silent ⇒ PatternCore columns are ignored; editor machines + MPE
    blobs are authoritative.
 5. Synths "not editable / can't add tracks or patterns" ⇒ root cause was
@@ -651,3 +702,242 @@ decoding. Always emit with the UTF-8 BOM (§1).
 10. Multi-track (6-track) synths ⇒ set `<TrackCount>` and repeat each track
     column per track; the int32 after colIdx that looked like `reserved 0` is the
     **track index** (§4.6). SH101 is monophonic and won't honor it.
+11. Four Pedal Chord control machines loaded, played, and showed in the sequencer
+    but were **invisible in the machine view** ⇒ they were positioned at `X=1.6`,
+    off the right edge of the drawn canvas; moving them inside the populated
+    `X`/`Y` range fixed it (§2.4).
+
+---
+
+## 12. Driving a generator with a control machine (Pedal Chord) — chords & arps
+
+A **control machine** writes notes onto a *target* generator at playback time,
+instead of the target carrying its own notes. **Pedal Chord** (Library
+`Pedal Chord`) is the worked example: it reads a **root note + chord type** from
+its own pattern and plays either a **block chord** or an **arpeggio** on the
+target. Verified working in Limani against two real reference songs —
+`chordref.bmxml` (chord mode → 6-track Juno106) and `arpref.bmxml` (arp mode).
+
+> The Pedal Chord *machine internals* (timing, swing, build/deploy) are a
+> separate concern documented in `ReBuzz_ManagedMachine_Notes_PedalChord.md`;
+> that file's **§5 parameter table is the authoritative column order** reused
+> below. This section is purely about **using it inside a `.bmxml`**.
+
+### 12.1 Topology (what connects to what)
+
+```
+[Pedal Chord gen]  --(NO audio connection)              its editor (peN) --> Master
+        |  reads its own pattern (root + chord type + mode/speed/…)
+        |  writes notes live onto -->  [target generator] --> Master (normal audio)
+        |                                     ^ target's OWN pattern is EMPTY
+        + is itself SEQUENCED (Time 0, Span = song length, Pattern 00)
+```
+
+Key, non-obvious points (all verified):
+
+- The Pedal Chord is `Type` **Generator** in the file, but it has **no
+  `<MachineConnection>`** of its own — it makes no audio. **Only its editor**
+  (`_x0001_peN`) connects to Master, exactly like any editor (§3.1). Adding an
+  audio connection for the generator is wrong.
+- It **is sequenced** like any generator (one `<Sequence>` with
+  `<Machine>PedalChordName</Machine>`), so its pattern actually plays.
+- The **target generator is unchanged** structurally — still connected to Master,
+  still sequenced — but its **own editor pattern is empty** (no events); the
+  control machine injects the notes. Build the empty target pattern with
+  `build_blob_mt(target,'00',tcols,tracks,{})` (full columns, zero events).
+- One Pedal Chord drives **one** target (single-voice since v1.5). For N driven
+  voices, use **N** Pedal Chords (Limani uses 4).
+
+### 12.2 The machine block — reuse a real one, then retarget
+
+Per §6's cardinal rule, **do not fabricate** the Pedal Chord block (that is what
+caused the historical NRE, §11 #3). Take a real saved Pedal Chord `<Machine>`
+block and change four things per instance:
+
+1. `<Name>` → unique name (e.g. `LeadArp`).
+2. `<EditorMachine>` → its editor `_x0001_peN`.
+3. `<Data>` → a fresh **state blob** naming the target (§12.3).
+4. PatternCore → one empty `00` pattern at song length (§3); position `<X>/<Y>`
+   inside the visible canvas (§2.4).
+
+Its PatternCore `<Columns>` are empty (`<Columns />`), so the simple
+`<Patterns>…</Patterns>` and `<Data>…</Data>` regex replacements are safe (no
+nested-`<Machine>` issue, §6.1).
+
+### 12.3 State blob — how the target is named
+
+The Pedal Chord's managed `<Data>` is the standard wrapped state (§2.3:
+`[0x02][int32 size][XML]`), where the XML is a `PedalChordState` carrying the
+**target machine name** and **base track**:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<PedalChordState xmlns:xsi="..." xmlns:xsd="...">
+  <TargetMachine>Pedal Juno106</TargetMachine>   <!-- the target's Name -->
+  <BaseTrack>0</BaseTrack>
+</PedalChordState>
+```
+
+The XML payload begins with a **UTF-8 BOM** (`EF BB BF`) inside the size-counted
+bytes. `TargetMachine` is matched by **Name** (§2.1). Generator:
+
+```python
+import struct
+def build_pedalchord_state(target, basetrack=0):
+    xml = ('<?xml version="1.0" encoding="utf-8"?>\r\n<PedalChordState '
+           'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+           'xmlns:xsd="http://www.w3.org/2001/XMLSchema">\r\n'
+           '  <TargetMachine>%s</TargetMachine>\r\n  <BaseTrack>%d</BaseTrack>\r\n'
+           '</PedalChordState>') % (target, basetrack)
+    body = b'\xef\xbb\xbf' + xml.encode('utf-8')
+    return bytes([2]) + struct.pack('<i', len(body)) + body   # 0x02 ver, size, XML
+```
+
+### 12.4 The pattern — 14 columns, root + chord type + mode
+
+The Pedal Chord is **single-track itself**; its editor pattern has **14
+column-records = its 14 Track-group parameters**, in this order (from the dev
+addendum §5):
+
+| col | parameter | use when authoring |
+|----|-----------|--------------------|
+| 0  | **Note**     | **root note** (Core/§3.2 encoding), at the rows the harmony changes |
+| 1  | Velocity     | optional |
+| 2  | **Chord**    | **chord-type index 0–50** (table below) |
+| 3  | **Mode**     | **0 = block chord; 1 Up, 2 Down, 3 Up+Down, 4 Down+Up, 5 Random** (arps) |
+| 4  | Speed        | arp ticks per step (whole pattern ticks) |
+| 5  | Length       | note length in ticks; 0 = sustain to next |
+| 6  | Octaves      | arp octave span 1–4 |
+| 7  | Step         | chord tones advanced per arp step |
+| 8  | Oct Walk     | 0 off / 1 up / 2 ping-pong |
+| 9  | Swing        | 0–100 |
+| 10 | Swing On     | 0/1 |
+| 11 | Humanize     | 0–100 |
+| 12 | Hum. Vel     | 0–100 |
+| 13 | **Arp Reset**| write **1 at row 0** to restart the arp deterministically at song start |
+
+Authoring rules that matter:
+
+- Put **root** (col 0) + **chord type** (col 2) at the row of each harmonic
+  change (e.g. one per bar at `row = bar*16`). The machine builds the chord
+  tones from root+type internally — **you do not compute chord notes**; you only
+  give the root (in the §3.2 note encoding, at the octave you want) and the type
+  index.
+- **Block chord:** Mode `0` (the default). Only cols 0 & 2 are needed.
+- **Arpeggio:** set Mode/Speed/Octaves (and Arp Reset) as **events at row 0** of
+  the pattern — this is how `arpref.bmxml` stores them and it is what drives
+  playback. (The machine's stored *parameter* values can also hold them, but the
+  row-0 pattern events are sufficient and what we use.)
+- Build the pattern with the column-indexed generator (`build_blob_cols`, §8 /
+  §5): `build_blob_cols(pedalchord_name, '00', 14, {0:[...roots...], 2:[...types...], 3:[(0,mode)], ...})`.
+  Note the blob's **column name = the Pedal Chord generator's own Name**, not the
+  editor's (§4.3).
+
+**Chord-type index — common values** (full 0–50 list lives in `PedalChord.cs`
+`Intervals[]` and the dev addendum):
+`0`=Major `{0,4,7}` · `1`=Minor `{0,3,7}` · `2`=Dom7 · `3`=Min7 · `4`=Maj7 ·
+`5`=Diminished `{0,3,6}` · `6`=Augmented `{0,4,8}` · `7`=Sus4 · `8`=Sus2 ·
+`48`=Power `{0,7}` (root+5th) · `49`=Dim7 · `50`=Oct `{0,12}` (root+octave —
+handy for octave-bass arps).
+
+### 12.5 Polyphony — chord vs arp need different target tracks
+
+- **Chord mode** writes the chord's notes across **consecutive target tracks**
+  (BaseTrack, BaseTrack+1, …), one note per track, simultaneously. So a triad
+  needs the target to have **≥3 tracks** — raise the target's `<TrackCount>`
+  (§2.6/§4.6). Limani's chord targets (Pad, Comp) are 6-track. A target with
+  too few tracks simply drops the extra chord tones.
+- **Arp mode** plays **one note at a time on the single BaseTrack**, so the
+  target needs **only 1 track** — a monophonic generator (e.g. SH101) is a fine
+  arp target. (Limani's BassArp drives the monophonic SH101; LeadArp drives the
+  6-track Faze-R but uses only track 0.)
+
+### 12.6 Silence on load
+
+The Pedal Chord's own col-0 **Note** is a Track-group `Note` parameter, so the
+§2.5 held-note clear (`<Type>Note</Type>` current value → 0) applies to it too
+and stops it injecting a root the instant the file loads. Run that clear over
+the whole document as usual; it covers synths and Pedal Chords alike.
+
+### 12.7 Assembly delta (added to the §6 workflow)
+
+For each driven voice: (a) splice a real Pedal Chord block, retargeted (§12.2–3);
+(b) add its editor `_x0001_peN` with the §12.4 pattern blob; (c) **empty** the
+target's own editor blob; (d) add **one connection** `peN → Master` (the chord
+*generator* gets none); (e) add **one sequence** for the Pedal Chord generator;
+(f) position the generator on-canvas (§2.4). Keep the target's own connection and
+sequence as-is.
+
+### 12.8 Reference files
+
+`chordref.bmxml` — chord mode (`PdlChrd` → 6-track Juno106; roots col 0, types
+col 2, state targeting). `arpref.bmxml` — arp mode (Mode 1 Up, Speed 2,
+Octaves 2 at row 0; TPB 8). Both round-tripped; the generators in §12.3/§12.4
+reproduce their blobs byte-for-byte.
+
+---
+
+## 13. Generalized recipe — authoring a new song from a spec
+
+The standing goal: turn a request like *"a ~1-minute piece in style X, with
+instruments A/B/C, at tempo T"* into a loadable `.bmxml`. Everything above is the
+toolkit; this is the order of operations. (Limani is one instantiation of it.)
+
+**Inputs to pin down first:** genre/mood, key + scale, tempo (BPM, TPB),
+time-signature & length (→ rows), instrument roles, arrangement/build-up.
+
+1. **Scale & harmony → numbers.** Write the scale as a `noteIdx` set
+   (C=0…B=11). Choose per-section/per-bar **root degrees**. For chordal parts,
+   pick the **diatonic triad quality** on each degree (built from scale tones)
+   and map it to a Pedal Chord chord-index (§12.3): major→`0`, minor→`1`,
+   diminished→`5`, augmented→`6`, etc. (Limani's D-Hijaz gave D/E♭=0, G=1,
+   A=5, B♭=6.) Note value at a chosen octave = `octave*16 + noteIdx + 1` (§3.2).
+
+2. **Pick machines (the roster).** From §7 / `ReBuzz_ManagedMachine_Notes_Roster.md`
+   choose a generator per role (drums, bass, pad, lead, comp, …). For each,
+   record **polyphony** (mono vs multi-track) and whether it will be played
+   **directly** or **driven by a control machine** (§12). Crucially, obtain a
+   **real saved `<Machine>` block** for every machine type you use (§6 cardinal
+   rule) — save it once in ReBuzz if you don't already have one.
+
+3. **Tempo & length.** Rows/bar = `TPB × beats-per-bar` (4/4 + TPB 4 → 16).
+   Total rows = `bars × rows-per-bar`. Set the **Master-track tempo pattern**
+   (§8: col 1 = BPM, col 2 = TPB, literal, row 0), the PatternCore `<Length>`,
+   `LoopEnd`/`SongEnd`, and every sequence `Span` to the total rows.
+
+4. **Write the parts.**
+   - *Direct part:* notes go in the generator's editor blob (§4–§5); use
+     `build_blob_mt` with the per-track events for polyphony (§4.6).
+   - *Control-driven part (chords/arps):* one Pedal Chord per voice (§12) —
+     block chord (Mode 0) or arp (Mode 1–5); empty the target's own pattern;
+     give chord targets enough tracks (§12.5).
+   - Drums: trigger note (Plaits uses `65` = C-4); timbre from each drum
+     machine's own parameters.
+
+5. **Assemble** (§6 + §12.7). Real skeleton song → splice real blocks → renumber
+   editors so names don't collide (`pe1` = Master's editor, then one `_x0001_peN`
+   per generator editor, then one per control-machine editor) → PatternCore = one
+   empty `00` per generator → fill editor blobs → connections
+   (**every generator and every editor → Master; control-machine *generators*
+   get none**) → sequences (every generator + Master + each control machine) →
+   distinct on-canvas positions (§2.4) → clear held notes (§2.5) → set length
+   tails → write **with BOM** (§1).
+
+6. **Deliver** (§9): emit the PowerShell **gzip+base64** writer, with a
+   decode→compare **round-trip check** before shipping.
+
+7. **Self-verify before delivery (do this every build).** Re-parse the XML;
+   decode **every** editor blob and assert `offset == len(blob)`; confirm:
+   machine count; each control machine's state targets the intended generator;
+   driven targets have **no** note events; chord targets have enough tracks;
+   connections include each editor and **exclude** control-machine generators;
+   one sequence per generator + Master + each control machine; all positions in
+   range; no non-zero held `Note`. A clean parse + clean decode + these checks
+   is the bar for "ready to load."
+
+**What's reusable vs. per-song.** Reusable: the format facts (§§1–6, 8),
+the blob generators (§5, §8, §12.3), the assembly + verify pipeline (§6, §13.5–7),
+the machine roster (§7). Per-song: scale/roots/qualities, machine selection,
+tempo/length, and the part data. Adding a **new machine type** mainly means
+saving a real block of it once and recording its **note-column index / track
+params** (§4.4) in the roster.
