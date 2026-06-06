@@ -16,15 +16,17 @@ loader ignores (§8). The §8 tempo finding supersedes an earlier (wrong)
 encoding (§4.6) — `<TrackCount>` plus track-major repeated columns, with the
 per-record `track` field that earlier looked like a constant `reserved 0`.
 
-**Control-machine layer (new, §12).** The earlier "Pedal Chord throws an NRE,
+**Control-machine layer (§12).** The earlier "Pedal Chord throws an NRE,
 dropped" conclusion was **wrong** — the NRE came from a *fabricated* machine
-block (§6's cardinal rule), not from the machine. With a **real** Pedal Chord
-block, one control machine per voice drives a target generator with live
-chords or arpeggios; §12 is the full song-authoring recipe (state-targeting,
-the 14-column map, chord vs arp modes, polyphony rules), verified working in
-Limani against `chordref.bmxml` (chords) and `arpref.bmxml` (arps). **§13** then
-generalises the whole pipeline into a **spec → song** recipe — the standing goal
-of being able to ask for "a piece in style X, instruments Y/Z, tempo T."
+block (§6's cardinal rule), not the machine. §12 is now the **control-machine
+family**: the shared wiring pattern, then **Pedal Chord** (notes — chords/arps,
+incl. the row-0 **note-off entry rule** §12.9 for voices that enter after bar 1)
+and **Pedal Presetter** (in-pattern **preset automation** §12.10, incl. the
+Build-1827 **one-preset-fire-per-row** stagger rule). All verified byte-exact
+against real reference songs (`chordref`, `arpref`, `presetter_ref`) and working
+in Limani. **§13** generalises the whole pipeline into a **spec → song** recipe —
+the standing goal of being able to ask for "a piece in style X, instruments
+Y/Z, tempo T."
 
 This file documents the **XML song format** and the **Modern Pattern Editor
 (MPE) note-data blob** — i.e. how a `.bmxml` song is laid out on disk and how
@@ -32,12 +34,13 @@ playable note data is actually stored. It is a different concern from the
 `ReBuzz_ManagedMachine_Notes_*` files (which cover writing the machines
 themselves). Cross-references to those use `Core §N` etc.
 
-Worked example throughout: the song **"Limani"** (**26 machines**: a 4-piece
+Worked example throughout: the song **"Limani"** (**28 machines**: a 4-piece
 Plaits drum kit played directly, + bass/lead/pad/comp synths each **driven by
-its own Pedal Chord** control machine, ~64 s, D Hijaz). Its build script is the
-canonical implementation of everything here. (The original Limani drove the
-synths with hand-written melodies; it was later converted to the control-machine
-layer of §12 — both arrangements are valid and the format facts are identical.)
+its own Pedal Chord** control machine, + a **Pedal Presetter** setting timbres,
+~64 s, D Hijaz). Its build script is the canonical implementation of everything
+here. (The original Limani drove the synths with hand-written melodies; it was
+later converted to the control-machine layer of §12 — both arrangements are
+valid and the format facts are identical.)
 
 ---
 
@@ -657,17 +660,22 @@ decoding. Always emit with the UTF-8 BOM (§1).
   - *HatOpen* (Plaits): row 14 accent — from bar 3.
   - *Snare* (Plaits): rows 4,12 — from bar 5.
   - *Lead* (Faze-R, oct 4) ← **LeadArp**: *arp* Up (Mode 1, **Speed 2,
-    Octaves 2**, Arp-Reset@row0), the progression arpeggiated, bars 5–16.
+    Octaves 2**, Arp-Reset@row0), the progression arpeggiated, bars 5–16. Enters
+    via a row-0 note-off (§12.9).
   - *Comp* (Juno106, oct 3) ← **CompChord**: block *chord* stabs on rows 4 & 12,
-    bars 9–16.
+    bars 9–16. Enters via a row-0 note-off (§12.9).
 - All drum hits trigger note value **65** (C-4); the kit's timbres come from each
   Plaits machine's own parameters (only the kick was tuned in the source song —
   snare/hats were default Plaits and may need parameter tweaks).
-- **Machine inventory (26):** Master + its editor `pe1`; 4 synths + their (now
+- **Preset automation:** a **Pedal Presetter** (`Presets`, 3 tracks, editor
+  `pe14`) sets the non-bass synth timbres at song start (§12.10), fired on
+  **staggered rows 0/1/2**: Pad ← invFFT `46` (Pad - Soft Strings), Lead ←
+  Faze-R `58` (Pluck - Reso Tine), Comp ← Juno106 `17` (Classic — Polysynth).
+- **Machine inventory (28):** Master + its editor `pe1`; 4 synths + their (now
   empty) editors `pe2…pe5`; 4 Plaits drums + editors `pe6…pe9`; 4 Pedal Chords
-  (`PadChord`,`CompChord`,`LeadArp`,`BassArp`) + their editors `pe10…pe13`. The
-  Pedal Chord *generators* are **not** audio-connected; only their editors → Master
-  (§12.2).
+  (`PadChord`,`CompChord`,`LeadArp`,`BassArp`) + editors `pe10…pe13`; 1 Pedal
+  Presetter (`Presets`) + editor `pe14`. The Pedal Chord and Presetter
+  *generators* are **not** audio-connected; only their editors → Master (§12).
 - **Earlier (direct-melody) version** — still valid, kept for reference: each
   synth carried its own notes (Bass root on rows 0 & 8; Pad root on row 0; Lead a
   composed D-Hijaz phrase leaning on F♯→G and B♭→A with an E♭→F♯ augmented 2nd,
@@ -706,22 +714,52 @@ decoding. Always emit with the UTF-8 BOM (§1).
     but were **invisible in the machine view** ⇒ they were positioned at `X=1.6`,
     off the right edge of the drawn canvas; moving them inside the populated
     `X`/`Y` range fixed it (§2.4).
+12. Late-entering chord/arp voices (Lead, Comp) **sounded from tick 0** instead
+    of at their bar ⇒ a Pedal Chord with no row-0 root plays a stale/looped root;
+    write a row-0 **note-off (255)** to hold it silent until its first root
+    (§12.9).
+13. A Pedal Presetter firing **several targets on the same row** applied only the
+    **last** one ⇒ Build-1827 `parametersChanged` collision + broken pvalues
+    fallback; **stagger one preset per row** (§12.10).
 
 ---
 
-## 12. Driving a generator with a control machine (Pedal Chord) — chords & arps
+## 12. Control machines that drive other machines (Pedal Chord, Pedal Presetter)
 
-A **control machine** writes notes onto a *target* generator at playback time,
-instead of the target carrying its own notes. **Pedal Chord** (Library
-`Pedal Chord`) is the worked example: it reads a **root note + chord type** from
+A **control machine** is a `Type` Generator that produces **no audio of its own**
+and instead writes to a *target* machine at playback time, reading what to write
+from its own pattern. Two are documented here: **Pedal Chord** (writes notes —
+chords/arps, §12.1–§12.9) and **Pedal Presetter** (fires preset changes,
+§12.10). They share one wiring pattern, so learn it once:
+
+- The control machine is `Type` **Generator** but has **no `<MachineConnection>`**
+  (it makes no audio). **Only its editor** (`_x0001_peN`) connects to Master,
+  like any editor (§3.1).
+- It **is sequenced** (one `<Sequence>` on its own name) so its pattern plays.
+- Its **target generator is otherwise normal** — connected to Master, sequenced —
+  but its **own editor pattern is emptied** (the control machine injects live).
+  Build the empty target with `build_blob_mt(target,'00',tcols,tracks,{})`.
+- **Reuse a real saved `<Machine>` block** for the control machine and retarget
+  it (§6 cardinal rule). Fabricating one is what caused the historical Pedal
+  Chord NRE (§11 #3).
+- The target is named in the control machine's managed **`<Data>` state blob**
+  (§2.3 wrapper); each machine has its own little state schema (§12.3, §12.10).
+- **Init order is automatic:** control machines tick before audio machines, so a
+  row-0 write lands before the target renders that row.
+
+Everything below is about **using these inside a `.bmxml`**; each machine's
+internals live in its own `ReBuzz_ManagedMachine_Notes_*` file (whose parameter
+tables are the authoritative column order reused here).
+
+### 12.0 Pedal Chord — what it does
+
+**Pedal Chord** (Library `Pedal Chord`) reads a **root note + chord type** from
 its own pattern and plays either a **block chord** or an **arpeggio** on the
 target. Verified working in Limani against two real reference songs —
 `chordref.bmxml` (chord mode → 6-track Juno106) and `arpref.bmxml` (arp mode).
-
-> The Pedal Chord *machine internals* (timing, swing, build/deploy) are a
-> separate concern documented in `ReBuzz_ManagedMachine_Notes_PedalChord.md`;
-> that file's **§5 parameter table is the authoritative column order** reused
-> below. This section is purely about **using it inside a `.bmxml`**.
+Its internals (timing, swing, build/deploy) are in
+`ReBuzz_ManagedMachine_Notes_PedalChord.md`; that file's **§5 parameter table is
+the authoritative column order** reused below.
 
 ### 12.1 Topology (what connects to what)
 
@@ -875,6 +913,102 @@ col 2, state targeting). `arpref.bmxml` — arp mode (Mode 1 Up, Speed 2,
 Octaves 2 at row 0; TPB 8). Both round-tripped; the generators in §12.3/§12.4
 reproduce their blobs byte-for-byte.
 
+### 12.9 Entering on the timeline — the row-0 note-off rule
+
+A Pedal Chord with **no root event at row 0** does **not** stay silent at the
+start: at song start it sounds a stale/zero root, and on loop the previous
+root carries over across the loop point. So a chord/arp that is meant to enter
+*later* (Lead at bar 5, Comp at bar 9 in Limani) will instead sound from tick 0.
+
+**Fix — write a note-off at row 0** of the root column (col 0). The Pedal Chord's
+Note parameter documents **value `255` as "off" — it releases the voice**. So:
+
+> **Rule (general):** for every Pedal Chord whose root column has no event at
+> row 0, prepend a `(row 0, 255)` event to col 0. It holds the voice silent
+> until the first real root, so the machine enters on the timeline.
+
+Both Limani arps that enter late carry `(0,255)` in col 0; the two that play from
+bar 1 (Pad, Bass) already have a real root at row 0 and need no note-off. This is
+distinct from the §2.5 *held-note* clear (which zeroes the **stored parameter**
+so nothing sounds on load) — the note-off is a **sequenced pattern event** that
+governs the **looping playback** entry point. Use both.
+
+### 12.10 Pedal Presetter — preset automation
+
+**Pedal Presetter** (Library `Pedal Presetter`) is a **multi-track** control
+machine (up to **16 tracks**): each track is bound to one target machine, and a
+stateless per-track **`Preset`** index fires a preset change on that target when
+a value lands on a row. It's how you switch a synth's timbre from the timeline —
+ReBuzz otherwise has no in-pattern preset automation. Verified byte-exact against
+`presetter_ref.bmxml` and working in Limani (sets Lead/Pad/Comp timbres).
+Internals: `ReBuzz_ManagedMachine_Notes_PedalPresetter.md` (and the preset-API
+consumer side in `ReBuzz_ManagedMachine_Notes_Presets.md`).
+
+It follows the shared control-machine pattern (§12 intro): generator unconnected,
+editor → Master, sequenced; targets normal but their own patterns emptied.
+
+**State blob — the per-track targets.** The managed `<Data>` (§2.3 wrapper) holds
+a `PresetterState` whose `<Targets>` is **always exactly 16 `<string>` entries**,
+track-indexed: a machine **Name** where assigned, `<string xsi:nil="true" />`
+where not. (That inner `xsi:nil` is fine — the state blob is its own XML document,
+separate from the song body, §1.1.)
+
+```python
+def build_presetter_state(targets, max_tracks=16):           # verified byte-exact
+    t=(list(targets)+[None]*max_tracks)[:max_tracks]
+    lines=['<?xml version="1.0" encoding="utf-8"?>',
+           '<PresetterState xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+           'xmlns:xsd="http://www.w3.org/2001/XMLSchema">','  <Targets>']
+    for nm in t:
+        lines.append('    <string>%s</string>'%nm if nm is not None
+                     else '    <string xsi:nil="true" />')
+    lines+=['  </Targets>','</PresetterState>']
+    body=b'\xef\xbb\xbf'+'\r\n'.join(lines).encode('utf-8')
+    return bytes([2])+struct.pack('<i',len(body))+body        # 0x02 ver, size, XML
+```
+
+**Pattern — one `Preset` column per track.** Set `<TrackCount>` (Track group) to
+the number of targets. The only pattern parameter is `Preset` (Byte, range
+**0–253**, NoValue 255), so there are **no non-track columns** — `base = 0` and
+the Preset column repeats at **colIdx 0** per track, track-major (§4.6). Build it
+with the multi-track generator: `build_blob_mt('Presets','00',[0],N,events)` with
+`events[(track,0)] = [(row, preset_index)]`.
+
+- **Preset index = 0-based position in the target's bank** as ReBuzz loads it
+  (a `.prs.xml` `PresetDictionary`; the `Item Key`s in file order). Calibrated:
+  Juno106 index `1` = "Bass — Funky". So indices are **bank-order dependent** —
+  the target's bank must be present in ReBuzz or the index falls **out of range**
+  and fires the target's **default** preset (a reset), not nothing.
+- **Empty cell does nothing** (the param is `IsStateless`; each row is a one-shot
+  event, not held). Practical behaviour is "fire-and-hold" — the applied preset
+  persists until something else changes the target.
+- Neutralise load-time firing by setting the **stored** `Preset` value to NoValue
+  `255` for each track (analogous to §2.5), so only the sequenced events fire.
+
+> **Rule (Build 1827) — one preset fire per row.** Firing **multiple tracks on
+> the same row** hits a `parametersChanged` collision; the Presetter's
+> pvalues-polling fallback for that case is unreliable on 1827 (the Core §42
+> `pvalues` field-shape change), so only the **last** track lands. **Stagger
+> multi-target changes onto separate rows** (Limani fires Pad/Lead/Comp on rows
+> 0/1/2). This is the same class of 1827 reflection breakage noted for Pedal
+> Chord's old multi-track path (§7 / PedalChord §9.1).
+
+**Other caveats.** Targets with smoothed parameters (Plaits etc., per Core §32)
+**glide** ~30 ms on a change rather than switching instantly. Assignments survive
+save/load and target rename; a deleted target leaves a dangling assignment that
+silently fires nothing.
+
+**Assembly delta.** Like §12.7: splice a real Presetter block, set `<Name>`,
+`<EditorMachine>`, the state `<Data>`, `<TrackCount>`, position; add its editor
+`peN` with the staggered Preset pattern; add **one** connection `peN → Master`
+(the generator gets none) and **one** sequence on the Presetter. The targets are
+ordinary generators (here, already driven by their own Pedal Chords) — the
+Presetter only sets their timbre, independent of the notes.
+
+**Reference.** `presetter_ref.bmxml` — 1 track → `Pedal Juno106`, Preset `1` at
+row 0. `build_presetter_state` and `build_blob_mt('Presets','00',[0],…)`
+reproduce its state and pattern blobs byte-for-byte.
+
 ---
 
 ## 13. Generalized recipe — authoring a new song from a spec
@@ -910,7 +1044,12 @@ time-signature & length (→ rows), instrument roles, arrangement/build-up.
      `build_blob_mt` with the per-track events for polyphony (§4.6).
    - *Control-driven part (chords/arps):* one Pedal Chord per voice (§12) —
      block chord (Mode 0) or arp (Mode 1–5); empty the target's own pattern;
-     give chord targets enough tracks (§12.5).
+     give chord targets enough tracks (§12.5). For any voice that **enters
+     after bar 1**, write a row-0 **note-off (255)** so it stays silent until
+     its first root (§12.9).
+   - *Preset automation (optional):* a Pedal Presetter (§12.10) to set/switch
+     target timbres from the timeline — one track per target, preset index =
+     bank position, **staggered onto separate rows** (one fire per row, §12.10).
    - Drums: trigger note (Plaits uses `65` = C-4); timbre from each drum
      machine's own parameters.
 
@@ -930,6 +1069,8 @@ time-signature & length (→ rows), instrument roles, arrangement/build-up.
    decode **every** editor blob and assert `offset == len(blob)`; confirm:
    machine count; each control machine's state targets the intended generator;
    driven targets have **no** note events; chord targets have enough tracks;
+   late-entering chord/arp voices carry a row-0 note-off (§12.9); any Presetter
+   fires **one preset per row** (no two targets on the same row, §12.10);
    connections include each editor and **exclude** control-machine generators;
    one sequence per generator + Master + each control machine; all positions in
    range; no non-zero held `Note`. A clean parse + clean decode + these checks
