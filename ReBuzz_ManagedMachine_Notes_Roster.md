@@ -27,6 +27,11 @@ ReBuzz, this file plus the per-machine addenda lets you answer "which
 machines need touching?" by grepping for the relevant Core/Build
 `§N` reference.
 
+A second consumer is the **pedal-rebuzz-song-writer** project: its spec→song
+recipe needs per-machine **song-authoring facts** (note-column index, track
+count / polyphony, direct vs control-driven). Those live in their own section
+below, separate from the dev/impact-analysis roster.
+
 ---
 
 ## Conventions
@@ -191,6 +196,45 @@ out from each addendum as time allows.
 
 ---
 
+## Song-authoring facts (`.bmxml` generation)
+
+A separate consumer of this roster is the **pedal-rebuzz-song-writer** project,
+whose spec→song recipe (`ReBuzz_SongFormat_Notes_BMXML.md` §13) needs, for every
+machine type it emits: which pattern column carries the **Note**, how many
+**tracks** (voices) the machine supports, and whether it's played **directly** or
+driven by a **control machine**. These are easy to get wrong — the note column is
+**not always the last** (Faze-R's is col 67 of 69) and some "synths" are
+monophonic regardless of `<TrackCount>` — so the rule is **determine empirically**
+(enter one note, save, decode) and record the result here once a machine has been
+characterized.
+
+Conventions: note value = `octave*16 + noteIdx + 1`; note-off (where supported) =
+`255`. Everything below is verified byte-exact against real saves; the deeper
+mechanics are in `ReBuzz_SongFormat_Notes_BMXML.md` §4.4 (note-column table),
+§4.6 (multi-track layout) and §12 (control machines).
+
+### Generators (carry or receive notes)
+
+| Machine (Library) | role in Limani | play mode | total cols (1 trk) | note col | track-group params | polyphony | song-gen notes |
+|---|---|---|---|---|---|---|---|
+| Pedal Plaits  | drums (Kick/Snare/Hats) | direct | 14 | **12** | 2 (Note, Velocity) | one mono machine per drum | trigger note **65** (C-4); timbre from the machine's own params |
+| Pedal SH101   | Bass | direct *or* control-driven | 26 | **25** (last) | 1 (Note) | **monophonic** — `<TrackCount>` ignored | fine as a mono arp target; can't hold a chord |
+| Pedal invFFT  | Pad  | control-driven (chord) | 29 | **28** (last) | 1 (Note) | multi-track (raise `<TrackCount>`) | chord target ⇒ **≥3 tracks** (Limani uses 6) |
+| Pedal Juno106 | Comp | control-driven (chord) | 26 | **25** (last) | 1 (Note) | multi-track — **6-track verified** | chord target ⇒ **≥3 tracks** |
+| Pedal Faze-R  | Lead | control-driven (arp) | 69 | **67** (NOT last) | 2 (Note@67, Velocity@68) | 8-voice poly | note col is mid-pattern — always decode to confirm |
+
+### Control machines (no audio; only their editor → Master; sequenced; target named in state)
+
+| Machine (Library) | drives | own pattern | key columns | target tracks needed | song-gen notes |
+|---|---|---|---|---|---|
+| Pedal Chord    | one generator | 14 cols, single-track | col 0 = **Note** (root), col 2 = chord type, col 3 = mode (0 block / 1–5 arp) | chord mode spreads across the target's consecutive tracks ⇒ **≥3**; arp mode is one note ⇒ mono OK | note-off = **255** in col 0; a voice entering after bar 1 needs a **row-0 note-off** (§12.9) |
+| Pedal Presetter | up to **16** generators | `Preset` only, multi-track | `Preset` (Byte 0–253, NoValue 255) at colIdx **0** per track, `base`=0 | n/a (sets timbre, not notes) | preset index = 0-based **bank position**; **one fire per row** — stagger multi-target changes (§12.10) |
+
+As more machines get used in songs, add a row here (and grab a real `<Machine>`
+block of each into the song-writer's `refs/`).
+
+---
+
 ## Gaps and orphans
 
 - **29 machines have no dedicated addendum.** That's fine — most don't
@@ -224,6 +268,10 @@ is stale:
    `https://api.github.com/users/thepedal/repos?per_page=100` and
    reconcile against this file's roster (additions, deletions,
    description changes). Bump the "Last refreshed" date at the top.
+5. **Characterized a machine for song generation:** add a row to
+   **Song-authoring facts** with its note-column index, track-group
+   params, polyphony, and play mode. Get the note column empirically
+   (enter one note, save, decode) — it isn't always the last column.
 
 When asking Claude for impact analysis ("ReBuzz changed X in the new
 preview, what breaks?"), this file plus the per-machine addenda
