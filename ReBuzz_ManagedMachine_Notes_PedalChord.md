@@ -46,7 +46,10 @@ are all `Private=false`. Settings UI is built in code, not XAML (`<Page
 Remove>` / `<EmbeddedResource Remove>` strip all `.xaml`) to dodge BAML issues.
 
 Built/tested against **1827-preview** as of v1.5.4 (§9). Verified clean — no
-source changes were needed for the 1827 rebuild.
+source changes were needed for the 1827 rebuild. Current version **v1.6.0**:
+the step clock is now driven off the musical fraction `PosInTick/SamplesPerTick`
+(§11), which supersedes the v1.5.5 sub-tick-edge mechanism (§10) and fixes a
+tempo/sub-tick timing drift. v1.5.6 added the re-seed off-by-one guard (§10.5).
 
 ---
 
@@ -326,6 +329,11 @@ enabling SubTickTiming in engine settings.
 
 ## 10. Sub-tick swing — v1.5.5
 
+> **Superseded by §11 (v1.6.0).** The sub-tick-edge step clock described here was
+> replaced by a sample-fraction clock. It is kept for history and because the
+> root-cause analysis in §11 builds on it. The §10.5 re-seed reasoning still
+> applies in spirit (and the property is preserved by the §11 clock).
+
 Resolves the §3.1 low-Speed granularity limit by counting the arp step clock in
 **sub-ticks** instead of whole ticks when the host runs SubTickTiming. Pending
 on-hardware confirmation at time of writing; verified by simulation (§10.3).
@@ -403,8 +411,130 @@ reload self-corrects. Every NoteOn calls `Start()`→`StepArp`, which reloads in
 the current unit, so the window is only a sustained arp across a live setting
 change — rare. Not worth rescaling state to avoid; documented instead.
 
-### 10.5 Open follow-ons (unchanged from §7)
+### 10.5 Re-seed off-by-one fix (v1.5.6)
+
+**Symptom.** Re-seeding the arp mid-stream with a NoteOn (a fresh root every
+bar) made the first gap after each seed one (sub)tick short — `Speed − 1`
+instead of the `gap == Speed` that §10.3 guarantees at Swing 0. A *held* note
+that free-ran was always correct, so a single-chord spot check hid it; the
+fault only surfaced when NoteOns recurred mid-stream. Reported repro: Mode Up,
+Swing 0, Speed 8, root every 32 ticks → steps at 0,7,15,23 per bar instead of
+0,8,16,24.
+
+**Cause.** A re-seed routes NoteOn → `Start()` → `StepArp`, which fires the
+first step and reloads `ArpTicks = baseT`. If that seed and `Work()`'s per-step
+decrement (`--ArpTicks == 0`) both land on the same `newStep` edge, the
+freshly-loaded counter eats one decrement and the next fire comes one unit
+early. It is the §10.4 single-off-gap, but recurring on every re-seed instead
+of once.
+
+**Note on reproduction.** Static simulation of the exact v1.5.5 source did *not*
+reproduce it: the `HasNewNote` branch `return`s before the decrement, so on that
+model seed and decrement are already mutually exclusive and the gap is `Speed`.
+The fault is reproduced only if the seed `StepArp` and the decrement both
+execute for one edge — which can happen if the host delivers the seeding NoteOn
+on a `Work()` call other than the one carrying the `newStep` edge. The fix is
+therefore written to hold *regardless* of how the host schedules delivery,
+rather than relying on the early `return`.
+
+**Fix.** A per-edge guard `_firedThisStep`: reset to `false` at the top of every
+`newStep` edge (before any `StepArp` this call), set to `true` by `StepArp`, and
+checked by the decrement (`&& !_firedThisStep`). At most one step fires per
+`newStep`, and a re-seed and the countdown can never both consume the same edge.
+The early `return` in the `HasNewNote` branch is kept; the guard is the
+load-bearing invariant. The explicit **Arp Reset** path (`PendingReset` → sets
+`ArpTicks = 1`, fires via the same guarded decrement) is covered by the same
+guard and tested independently.
+
+**Invariant / acceptance.** A re-seeded arp (NoteOn or Arp Reset every N) and a
+free-running arp produce identical gap sequences — no `Speed − 1` gap at any
+seed boundary; the first step still lands on the seed tick; §10.3 (avg gap =
+Speed, `long + short == period`, tempo lock) and the §10.4 transient are
+unchanged; identical at R = 1 and R > 1. Verified across Speed ∈ {2,4,8},
+Swing ∈ {0,50}, R ∈ {1,8}, re-seed every {16,32} for both entry points by
+`tools/reseed_timing_test.py`, which also reproduces the pre-fix fault
+(0,7,15,23) as a control so the test provably bites. Per-step cost is one bool
+write/compare — negligible.
+
+### 10.6 Open follow-ons (unchanged from §7)
 
 Master-Groove sync (§4.1), a groove-pattern selector, and a per-step offset
 column remain open. Sub-tick now gives the *resolution*; groove sync would give
 the *source feel* — they compose (groove as base, Swing scaling on top).
+
+---
+
+## 11. Tempo-locked fraction step clock — v1.6.0
+
+### 11.1 Symptoms that drove it
+
+Two reports, one root cause: (a) arp triggers correct at default tempo but
+drifting after a tempo change (e.g. 126→90 BPM, from a clean restart); (b)
+toggling ReBuzz **Sub-Tick Timing** OFF threw the timing even at default tempo.
+Pure tick counting (§2) is tempo-independent by construction, so the coupling
+had to be in the sub-tick layer the v1.5.5 clock (§10) depended on.
+
+### 11.2 Root cause (1827 engine source)
+
+The machine's mode test was `R = SubTicksPerTick > 1 ? SubTicksPerTick : 1`, and
+it counted `CurrentSubTick` edges, assuming exactly `R` edges per tick. In
+`WorkManager.Generate`:
+
+- The sub-tick **clamp** that makes chunks end on sub-tick boundaries is gated on
+  `engineSettings.SubTickTiming` (`if (SubTickTiming && PosInSubTick+stp > SamplesPerSubTick) …`).
+- The sub-tick **advance** (`PosInSubTick += stp; if (>=SamplesPerSubTick){ PosInSubTick=0; CurrentSubTick++ }`)
+  is **not** gated — it runs regardless.
+- `subTickInfo.SubTicksPerTick` is computed in `UpdateMasterInfo` and is **not**
+  zeroed for managed machines when timing is off (the managed copy path,
+  `MachineManager.UpdateMasterAndSubTickInfo`, passes it through raw; only the
+  *native* `CopySubTickInfo` zeroes it).
+
+So with Sub-Tick Timing OFF the machine still saw `SubTicksPerTick > 1` and a
+`CurrentSubTick` that kept moving, but because chunks were no longer sub-tick
+aligned the number of edges per tick no longer equalled `R` — and the mismatch
+is tempo-dependent. Sample-accurate sim (`SubTickSize 260`, `SubTickResolution
+Lower = ÷2`): at 126 BPM the machine assumed `R=10` but the engine emitted 7
+edges/tick; at 90 BPM it assumed `R=14` but emitted 10–11 (irregular). The
+`Speed×R` countdown then produced ~11.4-tick gaps at 126 and ~10.8 at 90 instead
+of 8 — exactly the reported drift. With Sub-Tick Timing ON the clamp makes
+edges = `R` and it happened to be correct, which is why default "worked".
+`AudioBufferFillThread` and `SubTickResolution` are not causal (the former only
+moves *who* calls the fill; `ThreadReadSpeedAdjust` time-stretches only when the
+master **Speed** scrub ≠ 0).
+
+### 11.3 The fix
+
+Drop sub-tick-edge counting. Advance the step clock by the musical fraction
+elapsed since the last `Work()` call: `dTicks = (PosInTick − prevPosInTick) /
+SamplesPerTick` (with a single tick-wrap fixup; chunks never cross a tick
+boundary). Accumulate `dTicks`; fire a step when the accumulator reaches the
+current step length, carrying the remainder. Step length is computed directly in
+**fractional ticks**: `span = 2·Speed`, `long = span·ratio/(ratio+1)`,
+`short = span − long`, alternated by parity for swing; Humanize jitters it in
+ticks. No `SubTickInfo` read at all.
+
+Properties: tempo-locked by construction (a tick is a tick at any BPM);
+independent of the Sub-Tick Timing setting; placement resolution = the audio
+chunk (256 samples with timing off, the sub-tick size with it on), so swing is
+smooth at low Speed — the v1.5.5 goal, kept, without the edge dependency. A
+re-seed resets the accumulator and returns before accrual, so the §10.5 re-seed
+property holds structurally (a seed re-anchors phase to the exact NoteOn). Arp
+Reset sets `_stepAcc = _stepLen` to fire promptly. Note-offs stay on the tick
+clock (Length in ticks). `VoiceState.ArpTicks` is now vestigial.
+
+### 11.4 Verification
+
+`tools/timing_test.py` co-simulates the 1827 loop (sub-tick on and off) and
+asserts every fire stays within one placement chunk of the grid — i.e. no drift
+— across BPM ∈ {60,90,100,126,128,140,174}, TPB ∈ {4,8,16}, sub-tick on/off,
+with re-seed every bar, and swing spans summing to `2·Speed`. It also runs the
+old edge-counter against the sub-tick-OFF engine to reproduce the bug (gaps ~11.4
+at 126, ~10.8 at 90) as a control. The earlier `reseed_timing_test.py` is
+replaced by this.
+
+### 11.5 Caveat
+
+Diagnosed and fixed from the 1827 source + sample-accurate simulation; not yet
+confirmed on hardware at the time of writing. The fix removes the only
+tempo-coupled element in the path, so it should resolve both reports — to be
+verified in ReBuzz at 90 BPM with Sub-Tick Timing both on and off.
