@@ -598,3 +598,126 @@ iterations don't have to rediscover them.
   feedback says it clips downstream too easily, switch to option 2 in §8
   (fixed `0.25` scaling) — preset-compatible since presets store knob
   values, not internal levels.
+
+---
+
+## 11. ADSR range calibration and `DescribeValue`
+
+Two related lessons surfaced during preset bank authoring — both
+generalisable to any DSP machine with continuous time / frequency
+parameters.
+
+### 11.1 Calibrate so the perceptual midpoint of the knob is musical
+
+The v1.0 ADSR mapped 0–127 to log 1ms..10s for Decay/Release. Run the
+maths: param=64 (knob centre) lands at τ ≈ 105ms, audible decay ≈ 350ms.
+That's pluck-stab territory, not where a centred knob *should* feel. The
+musically useful range for tonal sounds (decay 200ms–2s) sat between
+param values 70 and 95 — about 20% of the knob. The bottom 60% was all
+percussion/click. Half the parameter resolution was wasted.
+
+The v1.2 ranges tighten to 2ms..8s (Attack) and 2ms..15s (Decay /
+Release):
+
+```
+Decay  50 → τ ≈ 39 ms,   perceived ~120 ms   (drum hit)
+Decay  64 → τ ≈ 70 ms,   perceived ~210 ms   (default)
+Decay  70 → τ ≈ 120 ms,  perceived ~360 ms   (stab / pluck)
+Decay  80 → τ ≈ 211 ms,  perceived ~635 ms   (short bass)
+Decay  90 → τ ≈ 370 ms,  perceived ~1.1 s    (long bass / sweep)
+Decay 100 → τ ≈ 650 ms,  perceived ~1.9 s    (pad / drone)
+```
+
+Knob centre (64) is now ~210ms perceived — a usable tonal value. Each
+musical category (drum / pluck / bass / pad / drone) gets a meaningful
+slice of the knob.
+
+The general rule when designing a log-mapped time/frequency parameter:
+work out what value lands at param 64, and ask "is this where I want
+the knob to feel centred?". If not, recompress the range. 1ms minimum
+is faster than any musical use, and 10s maximum is shorter than any
+modulation pad needs — both wasted endpoints.
+
+### 11.2 `DescribeValue` is mandatory for any non-linear parameter
+
+If a parameter maps non-linearly (log time, log freq, exp dB, signed
+offsets), the raw 0–127 byte tells the user nothing. Preset authors
+guess at values; live tweakers can't tell whether a tweak moved
+something by 5% or 500%. The fix is `DescribeValue` — a method
+reflected via `ManagedMachineHost.cs:255` that returns the human
+rendering of any parameter value:
+
+```csharp
+public string DescribeValue(IParameter param, int value)
+{
+    switch (param.Name)
+    {
+        case "Attack":  return FormatMs(LogTimeMs(value, 2f,  8000f));
+        case "Decay":   return FormatMs(LogTimeMs(value, 2f, 15000f));
+        case "Cutoff":  return FormatHz(20f * MathF.Pow(1000f, value / 127f));
+        case "Env Amt": // bipolar signed octaves
+        {
+            float oct = ((value - 64) / 64f) * 5f;
+            return oct.ToString("+0.00;-0.00;+0.00", InvCulture) + " oct";
+        }
+        // ...
+        default: return null;   // fall back to ValueDescriptions
+    }
+}
+```
+
+Three formatting helpers cover most cases:
+
+```csharp
+static string FormatMs(float ms)
+{
+    if (ms < 10f)    return ms.ToString("0.0", InvCulture) + " ms";
+    if (ms < 1000f)  return ((int)MathF.Round(ms)).ToString(InvCulture) + " ms";
+    return (ms / 1000f).ToString("0.00", InvCulture) + " s";
+}
+
+static string FormatHz(float hz)
+{
+    if (hz < 100f)   return hz.ToString("0.0", InvCulture) + " Hz";
+    if (hz < 1000f)  return ((int)MathF.Round(hz)).ToString(InvCulture) + " Hz";
+    return (hz / 1000f).ToString("0.00", InvCulture) + " kHz";
+}
+
+static string FormatPercent(int v)
+    => ((int)MathF.Round(v * 100f / 127f)).ToString(InvCulture) + "%";
+```
+
+`InvariantCulture` matters — without it, `0.5` formats as `0,5` on
+locales using comma decimals, which audio plugins should never do.
+
+**Categories that benefit:**
+
+| Parameter type | Output |
+|---|---|
+| log time | `123 ms`, `1.20 s` |
+| log frequency | `342 Hz`, `2.40 kHz` |
+| linear level | `47%` |
+| signed offset (octaves, cents) | `+2.50 oct`, `-12 ¢` |
+| modulation depth | `1.50 semi`, `4.0 oct` |
+
+`null` returns fall through to `ValueDescriptions`, so enum parameters
+already handled by the declaration (Range / Sub Type / Kbd Follow /
+VCA Mode / LFO Wave / PWM Source) need no entry in the switch.
+
+**Cost is zero.** `DescribeValue` is called only on cursor hover in
+the pattern editor — never on the audio thread. The formatting can be
+as expensive as it needs to be.
+
+### 11.3 Return-on-investment
+
+In hindsight, `DescribeValue` should have shipped with v1.0. The
+absence of it is what produced the v1.1 preset bank that the user
+correctly identified as drum-hits-rather-than-bass: I was picking
+parameter numbers by eyeballing the README description ranges rather
+than seeing actual times. With DescribeValue in place, the v1.2
+preset rewrite was trivial — every value's effect was visible while
+writing it.
+
+For any future machine with non-linear parameter mappings: write
+`DescribeValue` *first*, then design the preset bank against it. Not
+the other way round.
