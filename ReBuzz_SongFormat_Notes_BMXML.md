@@ -157,8 +157,18 @@ left everything at the origin), assign each visible generator a **distinct**
 `X`/`Y` so nothing overlaps on first load. Hidden `Modern Pattern Editor`
 machines can stay at `0,0` — they don't appear in the machine view.
 
-The position element appears once per machine, right after `<Type>Generator</Type>`:
+The position element appears once per machine, right after the machine `<Type>`:
 `<Type>Generator</Type><X>-1.2</X><Y>0.4</Y>` — target it there when editing.
+**`Effect` machines (e.g. Pedal Gain Multi, §15) carry the same `<X>`/`<Y>`** in
+the same place; `set_position` rewrites both `Generator` and `Effect` (an early
+version matched only `Generator`, so spliced effects silently kept the template's
+coordinate and stacked).
+
+> **Guard it in the build.** `assert_no_overlap(xml, eps=0.05)` scans every
+> visible machine (all but `Modern Pattern Editor`, which legitimately sit at
+> `0,0`) and raises if any two are within `eps`, listing the colliding pair and
+> coordinate. Call it right before `write_bmxml` so a stacked layout can never
+> ship. `machine_positions(xml)` returns the `(name, x, y)` list it checks.
 
 > **Visible range is bounded — off-canvas machines don't render *(empirical,
 > Limani §12 session).*** A machine loads, plays, and shows in the **sequencer**
@@ -933,6 +943,55 @@ distinct from the §2.5 *held-note* clear (which zeroes the **stored parameter**
 so nothing sounds on load) — the note-off is a **sequenced pattern event** that
 governs the **looping playback** entry point. Use both.
 
+#### 12.9.1 Releasing the target across silent sections and the loop
+
+The §12.9 note-off keeps a late-entering voice silent *within* the pattern it
+opens. It does nothing once the Pedal Chord stops being **sequenced**: in a
+sectioned song the chord is only placed during the sections where its target
+plays, so when the target falls silent (a following section, or the loop wrap)
+nothing tells it to stop, and the held note **drones** over the next section or
+the next pass's intro.
+
+Two things are needed at the start of every section where the target should be
+silent, because they fix different halves of the problem:
+
+1. **A note-off on the *target's own* pattern**, on every track. This releases
+   the voice that is **actually sounding**. It is the only thing that cuts a
+   patch with a **long release/sustain** — the control machine cannot shorten an
+   envelope it has already triggered.
+2. **A stop pattern on the *Pedal Chord*** — a single col-0 note-off, one row
+   long, sequenced at the same point. This halts any **further arpeggiation
+   triggers** so the arp doesn't keep firing into a section it shouldn't.
+
+> **Rule:** at the start of every silent section, give the target a row-0
+> note-off on every track **and** sequence a one-row stop pattern on its Pedal
+> Chord. A silent **first** section therefore gets both at song tick 0 — that is
+> what releases the target on the **loop**. A target that re-articulates at
+> tick 0 (Pad, Bass — their chord fires a root at bar 0) needs neither; **drums
+> are exempt** (one-shot Plaits can't drone).
+
+Mechanism 2 alone leaves a long tail ringing (the arp stops, but the last note
+decays for its full release); mechanism 1 alone re-triggers cleanly but lets the
+arp keep playing if the chord is still sequenced. Together they cover section
+entry, mid-song exit, and the loop wrap, and they never cut a voice that stays
+active across a boundary (a bridge running straight into a chorus), because that
+boundary is not a silent section.
+
+```python
+silent = [start*bar for name, start in arrangement if not plays_here(name)]
+# (1) target: note-off on every track at each silent-section start row
+synth_ev = {(t, notecol): [(r, NOTE_OFF) for r in silent] for t in range(ntracks)}
+# (2) chord: a one-row stop pattern, placed at each silent-section start
+STOP = '_stop'; pats.append((STOP, 1)); blobpats.append((STOP, ncols, {0: [(0, NOTE_OFF)]}))
+chord_placements = [(start*bar, sec_len, name) if plays_here(name)
+                    else (start*bar, 1, STOP) for name, start in arrangement]
+```
+
+This complements §12.9 (keep all three): §12.9 cleans section entries *within* a
+pass; the target note-off + chord stop guarantee a clean exit and loop. Validator
+check 8 (§16) enforces both at tick 0.
+
+
 ### 12.10 Pedal Presetter — preset automation
 
 **Pedal Presetter** (Library `Pedal Presetter`) is a **multi-track** control
@@ -1082,3 +1141,358 @@ the machine roster (§7). Per-song: scale/roots/qualities, machine selection,
 tempo/length, and the part data. Adding a **new machine type** mainly means
 saving a real block of it once and recording its **note-column index / track
 params** (§4.4) in the roster.
+
+---
+
+## 14. Multi-pattern arrangement (per-section patterns + sequence tiling)
+
+§3–§8 build each machine with **one** pattern spanning the whole song (one
+`<Pattern>`, one editor blob, one `PlayPattern` event at Time 0). That loads and
+plays, but a multi-minute song becomes one enormous pattern that's miserable to
+navigate. ReBuzz's native model is **named patterns placed on a timeline**, so a
+machine can carry several short patterns (per bar, or per section) that the
+sequencer drops at different times — and the same pattern can be **reused** at
+many times. Verified byte-exact against a real save (`refs/DrumTest.bmxml`),
+e.g. `Kick` carrying `KickLoop`+`EndKick` tiled by a 13-event sequence.
+
+### 14.1 The three things that change
+
+1. **PatternCore — multiple `<Pattern>` entries.** One per pattern, each with its
+   own `<Name>` and `<Length>`; `<Columns />` stays empty as always (real events
+   live in the editor blob; the sequence references patterns by name). See
+   `patterns_xml(specs)` where `specs = [(name, length_rows), ...]`.
+2. **Editor blob — `patternCount > 1`, positions PATTERN-RELATIVE.** The blob's
+   leading int32 pattern count becomes N; each pattern block (name + records) is
+   emitted in turn. **Event positions are rows *within that pattern* × 240**, not
+   absolute song rows. (In the single-pattern case the two coincide only because
+   the pattern length equals the whole song.) An empty pattern may be written as
+   0 records (real saves do this for `EndKick`); our builders instead emit full
+   columns with zero events, which also loads — both are valid.
+3. **Sequence — one `<Event>` per placement.** Each event is `Time` (absolute
+   start row), `Type` `PlayPattern`, `Span` (= the pattern's length), `Pattern`
+   (name). Repeat a name at several `Time`s to tile/reuse it.
+
+### 14.2 Library functions
+
+The single-pattern functions (§5, §6.2) are now thin wrappers over multi-pattern
+cores, so existing single-pattern songs build **byte-identical**:
+
+- `build_blob_cols_multi(mname, [(patname, ncols, colevents), ...])` — Pedal
+  Chord / Master style. `build_blob_cols(...)` calls it with one pattern.
+- `build_blob_mt_multi(mname, track_param_cols, trackcount, [(patname, events), ...])`
+  — multi-track synth style. `build_blob_mt(...)` calls it with one pattern.
+- `build_blob(mname, patterns)` was already a list — pass several pattern dicts
+  with pattern-relative `events`.
+- `patterns_xml(specs)` / `sequence_multi(machine, placements)` /
+  `sequences_xml_multi(seqs)` — `pattern_xml`, `sequence`, `sequences_xml` are the
+  single-entry wrappers.
+
+`placements = [(time, span, pattern), ...]`; `seqs = [(machine, placements), ...]`.
+
+### 14.3 What sectioning simplifies
+
+- **Reuse.** Identical sections (e.g. two verses, two choruses) are authored once
+  and placed at both `Time`s — fewer distinct patterns, edit-once-fix-both.
+- **The row-0 note-off (§12.9) mostly disappears.** A voice that enters late is
+  simply not sequenced until it enters, so there's no stale looped root to
+  silence. Keep a per-pattern note-off only where a pattern *itself* doesn't open
+  on a root at relative row 0 (e.g. a comp pattern that first hits on beat 2).
+- **Self-contained arp config.** Put the Pedal Chord arp params (Mode, Speed,
+  Octaves, Swing, Swing On) at **relative row 0 of every arp pattern**, not once
+  at song row 0, so each pattern (and each reuse) is independent of play order.
+
+### 14.4 Arp re-seed timing — Speed is literal (Pedal Chord ≥ v1.6.0)
+
+Boogie/comp patterns restate the chord root at the **top of every bar**, which
+re-seeds the arp (NoteOn → `Start()` → `StepArp`) each bar. A pre-v1.6.0 Pedal
+Chord lost one step-unit on every re-seed, so the arp ran a tick fast (you had to
+set Speed = N+1 to get an N-tick grid). A single held chord hid it — only a
+*re-seeding* pattern exposed it. **Pedal Chord v1.6.0 fixes the re-seed seam**, so
+arp `Speed` is once again literal (gap == Speed at Swing 0; §10.3 invariants
+hold). Generate arp `Speed` values directly; do not add a `+1`. If a future song
+plays arps a tick fast, suspect the loaded Pedal Chord DLL version before the
+generator.
+
+### 14.5 Proving "same piece" after sectioning
+
+To confirm a sectioned rebuild is musically identical to a flat one: decode every
+editor blob → for each sequence placement, offset the pattern's relative rows by
+its `Time` → the **absolute** event set. Compare to the flat version: drum hits
+must match exactly; Pedal Chord **roots (col 0, value ≠ 255) and chord types
+(col 2)** must match exactly. Note-offs (255) and repeated arp-config events are
+allowed to differ — they're functionally idempotent. `build_lastcall.py` (the
+per-section "Last Call") is the worked example; it reconstructs the flat version's
+612 drum hits and 228 chord roots/types exactly.
+
+---
+
+## 15. Effects & multi-input routing (submix bus — Pedal Gain Multi)
+
+§§1–14 only ever wired generators/editors straight to Master. An **effect** has
+audio **in and out**, so it sits *between* sources and Master: sources connect
+**into** it, and it connects **to** Master. A *multi-input* effect (e.g. **Pedal
+Gain Multi**) accepts several sources on separate input channels — a submix bus.
+Verified byte-exact against `refs/gainref.bmxml` (4 generators → one Gain → Master).
+
+### 15.1 The machine
+
+- `<Type>` is **`Effect`** (not `Generator`/`Master`) — the first non-generator
+  in this project.
+- It's a managed machine but its `<Data>` **state blob is empty** (`02 00000000`)
+  — routing is *not* stored in the machine; it lives entirely in the connections.
+  (Contrast Pedal Chord, whose state names its target.)
+- It carries its own pattern editor (an 8-column, event-free `00` pattern) and
+  gets a sequence entry like any managed machine. (An effect processes audio
+  continuously whenever it has input, so the pattern/sequence is only an
+  automation surface — an empty one is fine; we still sequence it Time 0,
+  Span = song length for consistency.)
+- Params: global `Pan`, `Gain` (Byte, default 100), `Mute`, and **`Solo 1`–`Solo 6`**
+  → it supports **up to 6 inputs**. `Amp` is a **per-track array** (one value per
+  input).
+
+### 15.2 Multi-in connection encoding
+
+Each source is an ordinary `<MachineConnection>` to the **same `<Destination>`**
+with an **incrementing `<DestinationChannel>`**:
+
+```
+Kick      -> DrumBus  SourceChannel 0  DestinationChannel 0
+Snare     -> DrumBus  SourceChannel 0  DestinationChannel 1
+HatClosed -> DrumBus  SourceChannel 0  DestinationChannel 2
+HatOpen   -> DrumBus  SourceChannel 0  DestinationChannel 3
+DrumBus   -> Master   SourceChannel 0  DestinationChannel 0
+```
+
+**Per-input gain is the connection `<Amp>`** (16384 = unity), and ReBuzz mirrors
+it into the machine's per-track `Amp` param. Set *both* to be safe:
+`set_param(block, 'Amp', 16384)` neutralises the param array;
+`connection(src, dst, amp, ...)` sets the wire. `<Pan>` per track defaults to
+16384 (centre).
+
+### 15.3 Building one
+
+1. Splice the real Gain block (`refs/gainref.bmxml`): `set_name` it (e.g.
+   `DrumBus`), `set_editor` to a fresh `peN`, `set_patterns(PAT)`, `set_position`,
+   and `set_param('Amp', 16384)` to start at unity.
+2. Build its editor as an empty 8-column blob **with the bus's own name** so the
+   embedded machine-name matches: `build_blob_cols('DrumBus', '00', 8, {})`.
+3. Reroute: the source **generators** connect to the bus on channels 0..n-1
+   (their pattern **editors** stay on Master — only audio reroutes); add one
+   `bus -> Master`; add `busEditor -> Master`.
+4. Sequence the bus (Time 0, Span = length, `00`).
+
+Library support: `connection(src, dst='Master', amp=16384, pan=16384, src_ch=0,
+dst_ch=0)`, `connections_xml_multi(conns)` (each entry a `'src'` string for
+→Master or a tuple of `connection` args), and `set_param(block, name, value)`.
+
+### 15.4 Roster note
+
+**Pedal Gain Multi** — `<Type>Effect`, Library `Pedal Gain Multi`, ≤ 6 inputs
+(Solo 1–6), per-track `Amp`/`Pan`, empty state blob, 8-column editor. Worked
+example: `build_lastcall.py` busses the four drums through one instance at unity
+before Master. To set a starting drum balance, give each drum's input connection
+(and the matching `Amp` track) a value below 16384.
+
+## 16. Validation (`rebuzz.validate`)
+
+`validate(xml)` runs a set of static checks over an **assembled** song and
+returns a `Report` (`.errors`, `.warnings`, `.ok`); `assert_valid(xml)` raises
+`ValidationError` on any error and returns the xml for chaining. Both builds call
+`assert_valid` just before `write_bmxml`, so a wiring or loop-safety mistake stops
+the build instead of surfacing as a glitch (or a hang) inside ReBuzz.
+
+The checks, and the section each enforces:
+
+| # | Check | Severity | Enforces |
+|---|-------|----------|----------|
+| 1 | Connection `Source`/`Destination` names a real machine | error | §11 |
+| 2 | Every sequenced `Pattern` exists in that machine's PatternCore | error | §14 |
+| 3 | Each placement's `Span` equals the pattern `Length` | error | §14.2 |
+| 4 | On a multi-channel destination, `DestinationChannel`s are unique | error | §15.2 |
+| 5 | Stored Track `Note` values are `0` (nothing droning on load) | warn | §2.5 |
+| 6 | A visible machine sits inside the machine-view canvas | warn | §10 |
+| 7 | No two visible machines share a position | error | §10 |
+| 8 | A Pedal-Chord-driven target not re-triggered at tick 0 carries a row-0 note-off on **every** track **and** has its chord sequenced at tick 0 with a stop | error | §12.9.1 |
+
+Check 8 is the loop-drone guard. It decodes each Pedal Chord's `TargetMachine`
+(from the state blob) and its tick-0 placement; if no driver fires a root at song
+row 0, the target must release every track at row 0 of the pattern it plays at
+tick 0. Master is exempt from check 4 (it sums all inputs on channel 0). Drums
+are never flagged by check 8 because they are not Pedal-Chord targets. Directly
+note-programmed held-note generators (a future hand-written lead) are *not* yet
+covered by check 8 — extend `driven` in `validate.py` when one is added.
+
+`decode_blob(raw)` (the FF01 reader used by the validator) is also exported for
+inspecting any editor blob: `-> {'mname', 'patterns': {name: {(track,col): [(row,val)]}}}`.
+
+Tests live in `tests/` (`python3 -m pytest tests/ -q`): both songs validate
+clean, every check fires on a deliberately broken song, and each build is
+byte-deterministic across runs.
+
+## 17. Composition DSL (`rebuzz.theory` + `rebuzz.dsl`)
+
+A higher-level authoring layer that compiles musical objects to a validated
+`.bmxml`. It writes nothing new to the format — the compiler assembles the same
+rig as `build_lastcall.py` (synthref synths driven by Pedal Chords, Plaits drums,
+two Pedal Gain Multi submix buses, optional Presetter) and emits bytes through
+the same builders. So everything in §§1–16 still holds; this section is just the
+front door.
+
+**`rebuzz.theory`** — `parse_note('Bb') -> 10`; `Scale(root, mode)` with
+`.degree_index(n)` / `.index_of(token)` / `.value(token, octave)`; the verified
+`CHORD_CODES` (maj 0, min 1, dom7 2, dim 5, aug 6, oct 50) and `ARP_MODES`
+(block 0, up 1, down 2, updown 3, random 5) tables via `chord_code` / `arp_mode`.
+Scales include major/minor and the modes plus hijaz, blues, and the pentatonics.
+
+**`rebuzz.dsl`** — the model and compiler:
+
+- **Synth slots** (fixed by synthref): `Bass`=SH101 (mono), `Lead`=Faze-R,
+  `Pad`=invFFT, `Comp`=Juno106. **Drum slots** (Plaits): `Kick`, `Snare`,
+  `HatClosed`, `HatOpen`. A voice picks a slot by name; unused slots are dropped.
+- **Step-strings** — one bar split into `len(s)` equal steps; any char but `.`/` `
+  is a hit. Length must divide the bar (`tpb*4` rows). `'x...x...x...x...'` on a
+  32-row bar → rows 0, 8, 16, 24.
+- **Voices** — `Chords(slot, octave, chord, rhythm='x', sections=None)` (block
+  chords struck on the rhythm; `rhythm` may be a per-section dict), `Arp(slot,
+  octave, chord, mode, speed, octaves, swing, sections)` (one root per bar + arp
+  config), `Drums({slot: stepstr | {section: stepstr}}, swing, subdivision)`, and
+  `Melody(slot, octave, phrases, grid, sections)` — a real monophonic line of
+  pitched note-ons/offs written straight into a synth (no Pedal Chord; §20).
+  `sections=` limits a voice to named sections.
+- **`Song`** — `section(name, roots)`, `add(voice)`, `synth(name, library,
+  note_col, tracks)` (register an extra synth from `MachineRef` to host a
+  `Melody`; §20), `arrange([names...])` (start bars + `LoopEnd`/`SongEnd` computed
+  for you), `mix(**dB)` (per-slot trim on the bus, dB→amp), `presets(**{slot:
+  index})`, `limiter(ceiling, isp)` (§19), then `compile()` → validated xml (or
+  `write(path)`).
+
+The compiler releases each control-driven target wherever it falls silent — a
+note-off on the target's own pattern plus a §12.9.1 stop pattern on its Pedal
+Chord (covering entry, exit, and the loop) — prepends the §12.9 entry note-off to
+each Pedal Chord pattern, and runs `assert_valid` before returning. Worked
+example: `src/build_dsl_demo.py` (a short A-blues — arp bass, block pad, comped
+stabs, a swung chorus-only lead, a per-section-keyed kit, a pad trim, staggered
+presets).
+
+Out of scope for now (planned): per-section *voicing* overrides for a chord
+voice, serial FX chains, polyphonic/velocity direct melodies, and a
+`compose(spec)` wrapper. Tests: `tests/test_dsl.py`.
+
+## 18. Measurement-driven mixing (`rebuzz.mix`)
+
+Closes the render→measure→trim loop in code. Render each instrument to its own
+**pre-fader** stem (its natural level, before the gain bus), then:
+
+```python
+from rebuzz.mix import measure_stems, recommend_gains, format_report
+m = measure_stems({'kick':'01_kick.wav', ..., 'pad':'07_pad.wav'})
+print(format_report(m, recommend_gains(m)))           # levels + solved bus gains
+```
+
+`measure(path)` reports peak, RMS, **active RMS** (gated to when the instrument
+plays — stable across sparse vs sustained material), **LUFS** (K-weighted,
+BS.1770; uses scipy if present), spectral centroid, and **clip %**.
+`recommend_gains(meas, targets, basis, avoid_boost)` solves the per-input bus
+gains to hit a target balance: `gain = target - measured`, then (with
+`avoid_boost`) the whole mix is normalised so the loudest-needed stem sits at
+unity and the rest attenuate — no gain added, no Master clipping, raise Master
+to taste. CLI: `python3 src/mix_report.py <stem_dir>`.
+
+Two things it caught on Last Call that ear-mixing missed:
+1. **The pad clips at the source** (51% of samples at full scale) — so its
+   measured level is only a *lower bound*, and no downstream trim truly fixes the
+   overload. The proper fix is to reduce the synth (lower the invFFT preset
+   Volume); the bus trim (now −28 dB) is the stop-gap. `clip_pct > 1%` is
+   surfaced as a `SOURCE CLIPPING` note in the report.
+2. **Basis matters.** A sparse transient (the snare) reads quiet on any
+   integrated measure and can become the no-boost ceiling, skewing the absolute
+   recommendation. `basis=` (active_rms / lufs / peak / rms) and per-role
+   `targets=` are exposed so the balance can be tuned to the material; the
+   *relative* diagnosis (pad ~17 dB hot) is robust regardless.
+
+`rebuzz.mix` needs numpy (scipy optional for LUFS) and is deliberately not
+imported by `rebuzz/__init__`, so the core song-building package stays
+dependency-free. Tests: `tests/test_mix.py` (synthetic signals).
+
+## 19. Master safety limiter (Pedal Limit)
+
+`Pedal Limit` is a managed Effect (look-ahead brickwall maximizer) spliced from
+`refs/limitref.bmxml`. Same archetype as Pedal Gain Multi: empty state blob
+(`02 00000000`), its own Modern Pattern Editor backend (a **3-column** empty
+pattern) plus a sequence entry, and it sums its inputs at channel 0 like Master.
+
+Parameters (all global, stored as a single Track-0 value, so `set_param` works):
+
+| Param | Type | Range | Meaning |
+|-------|------|-------|---------|
+| Amp | Word | 0–65534 (16384 = unity) | input gain |
+| Pan | Word | 0–32768 | pan |
+| Threshold | Byte | 0–200 @ **−0.1 dB/step** (0 = 0 dBFS) | brickwall ceiling; lower = drive harder |
+| Output Level | Byte | 0–200 @ −0.1 dB/step | final ceiling; makeup = Output/Threshold |
+| ISP | Byte | 0/1 | 4× cubic inter-sample (true-peak) detection |
+
+(The `Output Level` parameter name escapes to `Output_x0020_Level` in the XML.)
+Makeup gain is `Output/Threshold`, so **Threshold == Output gives no makeup** —
+a transparent safety ceiling that only caps peaks, leaving level and dynamics
+untouched. Use it as the final machine before Master.
+
+**Last Call** uses it as a true-peak safety net for modern listening: the two
+gain buses sum into `Limit` (ch 0), `Limit → Master`, set to **Threshold =
+Output = −1.0 dBFS (value 10), ISP on** — guaranteeing ≤ −1 dBTP into Master to
+avoid lossy-codec overshoot, without loudness maximisation. The `limiter()`
+helper in `build_lastcall.py` and the `dest=` argument added to `gain_bus()`
+make the bus → limiter → Master chain reusable. For more loudness/glue, lower
+Threshold below Output for `Output−Threshold` dB of makeup (e.g. Threshold −3,
+Output −1 → +2 dB).
+
+## 20. A real melodic lead — direct notes + an extra synth (`Melody`, `Song.synth`)
+
+Every voice up to here drives a synth indirectly: a **Pedal Chord** reads root
+notes and plays the chord/arp, while the synth's own editor stays empty (just
+the §12.9 release note-offs). A *real* melodic line is the opposite — pitched
+note-ons and note-offs written **straight into the synth's pattern**, no control
+machine. Two pieces make this work in the DSL.
+
+**1. An extra synth, spliced from `MachineRef`.** The four DSL slots (Bass/Lead/
+Pad/Comp) are fixed by `synthref`, so a *fifth* synth has to come from somewhere.
+`Song.synth(name, library, note_col, tracks=1)` registers one; the compiler
+splices it from `refs/MachineRef.bmxml` by Library (the cardinal rule still holds
+— never fabricate a `<Machine>`), renames it, attaches a fresh Modern Pattern
+Editor, positions it, sequences it whole-song, routes it to the **SynthBus**, and
+makes it eligible for `mix()` and `presets()` like any built-in slot. `note_col`
+is the machine's note column from the catalog (Pedal FM = 42, Faze-R = 67, …).
+
+**2. A `Melody` voice.** `Melody(slot, octave, phrases, grid=16, sections=None)`
+holds, per section, a list of `(step, note, length)` in grid units (16th notes by
+default → 16 steps/bar). `note` is a token: `'A5'`, `'C#6'`, `'Eb5'`, or bare
+`'A'` (uses the voice's `octave`). `column_events()` resolves the phrases over
+the **arrangement** into `(row, value)` events — so a phrase written once plays at
+every placement of that section (the Last Call verse line lands at both verses
+automatically).
+
+**Monophonic note-offs.** On a mono synth a fresh note-on cuts the previous note,
+so note-offs are emitted **only** where they're actually needed: a rest after a
+note, a phrase end, or the start of a section where the lead is silent. Any
+note-off that would collide with the next note-on is dropped (the retrigger
+handles it) and offs past song-end are clamped — giving clean legato runs and a
+loop-safe line (it never drones, even though `Melody` isn't a Pedal-Chord target
+and so isn't covered by validation check 8, §12.9.1). Because the lead writes its
+own releases, the only loop-safety obligation is that the last note releases
+before song-end and silent sections open with a note-off — both automatic.
+
+**Buses size to their inputs.** A `Pedal Gain Multi`'s per-connection faders live
+in its `<Type>Input</Type>` group, with one `<Value><Track>k</Track>…` per channel
+and a group `<TrackCount>`. The spliced template was saved with 4 inputs, so a
+5th synth channel needs the group **grown**: `blocks.set_input_tracks(block, n)`
+rebuilds the Input group to exactly `n` tracks (existing fader values kept, new
+ones filled from `<DefValue>` = unity) and sets `<TrackCount> = n`. `gain_bus()`/
+the DSL `_bus()` now call it with `len(inputs)`, so the bus always matches its
+connection count — for any number of inputs, not just four.
+
+**Last Call's Lead2** is a Pedal FM (note col 42, mono) on preset *Lead Bright*
+(FM bank index 15), routed to SynthBus channel 4. It plays an A-blues line —
+palette A C D E♭ E G with chord-tone colour (F♯ over D7, G♯ over E7, B in the
+bridge) and the ♭3/♭5 blue notes up high — that **carries the verses** (where the
+arp lead rests), **climbs into the bridge** alongside the arp for a two-lead
+climax, and **resolves in the outro**, sitting out the choruses so the two leads
+never crowd each other. See `Melody`/`Song.synth` in `src/build_lastcall.py`.
