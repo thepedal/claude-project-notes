@@ -1611,10 +1611,22 @@ dry to keep the low end tight and centred):
 | Synth | Effect | Why | Key settings |
 |-------|--------|-----|--------------|
 | Pad (invFFT) | **Pedal Chorus** | slow, wide ensemble drift thickens the sustained bed | Rate 18, Depth 40, Spread 90, Mix 40 |
-| Comp (Juno106) | **Pedal Plate** | short bright plate ambience/tail on the EP stabs, kept low so they stay punchy | Mix 22, Decay 45, Size 80, PreDelayMs 10, Damping 55, LowCut 15 |
+| Comp (Juno106) | **Pedal Filter (HP) → Pedal Plate** | a serial chain: high-pass first to clear the sub the octave-3 stabs share with the bass, then a short bright plate ambience/tail, kept low so they stay punchy | Filter Mode 1 (HP), Cutoff 110, Resonance 0; Plate Mix 22, Decay 45, Size 80, PreDelayMs 10, Damping 55, LowCut 15 |
 | Lead (Faze-R arp) | **Pedal Hallverb** | a medium hall glues the busy arp and adds air — reverb, not delay, so it adds no note clutter to an already-dense part | Pre Delay 25, Decay Time 1800, Room Size 70, Damping 45, Wet Level 35 |
 | Lead2 (FM) | **Pedal Dly PCM41** | a ~130 ms slapback fills space around the sparse, singing lead — the bluesy echo idiom, low feedback for 1–2 taps | Time Mode 0, Delay 130, Feedback 18, Mix 24, HF Damp 35 |
 
 These are deductions from each part's role, not auditioned — exact wet amounts and
 times want the human ear (and the per-synth stems will show how each effect sits).
 Built straight from `LASTCALL_SPEC`'s `fx` block in `src/build_lastcall.py`.
+
+**Balance pass (from the stems).** With the post-gain stems in hand, integrated
+loudness (K-weighted) put the parts ~17 dB apart — Lead2 at -8 LUFS was ~14 dB
+over the bass and dominating, Lead ran hot from its hall, and the Comp's octave-3
+voicing piled sub energy onto the bass. The fix was levels plus one filter:
+`mix` trims of Pad +2 / Comp -2 / Lead -4 / Lead2 -9 (Bass left at unity — it is
+already the foundation and `mix` only attenuates), and the Comp high-pass above.
+Predicted result ~6 dB spread (Lead2/Lead ≈ -17.4, Comp ≈ -19.3, Bass -22,
+Pad -23.7), which a re-render of the stems can confirm. The Filter `Mode` enum is
+undocumented; Mode 1 is taken to be high-pass by the usual convention (default
+0 = low-pass) — if the Comp renders darker rather than thinner, that value is the
+thing to change.
