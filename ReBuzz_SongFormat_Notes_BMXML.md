@@ -1405,8 +1405,9 @@ stabs, a swung chorus-only lead, a per-section-keyed kit, a pad trim, staggered
 presets).
 
 Out of scope for now (planned): per-section *voicing* overrides for a chord
-voice, serial FX chains, and polyphonic/velocity direct melodies. The one-call
-`compose(spec)` entry point is now implemented (§21). Tests: `tests/test_dsl.py`.
+voice, and polyphonic/velocity direct melodies. The one-call `compose(spec)` entry
+point (§21) and per-synth serial FX (§22) are now implemented. Tests:
+`tests/test_dsl.py`.
 
 ## 18. Measurement-driven mixing (`rebuzz.mix`)
 
@@ -1581,3 +1582,39 @@ mix, presets, limiter) is one `LASTCALL_SPEC` dict, round-tripped through
 call. It compiles **byte-identically** to the earlier hand-written DSL build, so
 the declarative form is a faithful front end on a real, complete arrangement —
 "swap a few fields to commission a different song" against a whole song, not a toy.
+
+## 22. Per-synth effects (serial FX before the gain)
+
+An effect can sit **between a synth and its gain**: `synth → FX → Gain → limiter`.
+Because each synth already has its own gain (§15.5), inserting per-instrument
+processing is just one more inline machine on that synth's path — and since the
+gains are separate, each synth's wet signal is still its own recordable stem.
+
+**API.** `Song.fx(slot, library, params=None)` splices an effect (by Library, from
+`MachineRef`) into a slot's chain; call it again on the same slot for a **serial
+chain** (`synth → fx1 → fx2 → gain`). In a `compose(spec)` dict it's the `fx`
+field: `{slot: {'library': ..., 'params': {...}} | [ ... ]}`. Parameter names are
+the effect's Global params; **spaces are allowed** and auto-escaped to the XML
+form (`'Decay Time'` → `Decay_x0020_Time`).
+
+**Mechanics.** Effects are managed machines exactly like the gains: empty state
+blob, their own Modern Pattern Editor (an empty pattern with one column per Global
+param) plus a sequence entry, and a `<Type>Input</Type>` group whose single track
+is sized with `set_input_tracks(block, 1)` (§20) — these effects ship unconnected,
+so their Input `Amp` is the self-closing `<Values />` that needs populating. The
+synth→effect wire is unity; the slot's `mix()` trim stays on the gain at the end
+of the chain, so the effect always sees the synth at full level.
+
+**Last Call's choices** (one distinct effect per instrument, by role — Bass stays
+dry to keep the low end tight and centred):
+
+| Synth | Effect | Why | Key settings |
+|-------|--------|-----|--------------|
+| Pad (invFFT) | **Pedal Chorus** | slow, wide ensemble drift thickens the sustained bed | Rate 18, Depth 40, Spread 90, Mix 40 |
+| Comp (Juno106) | **Pedal Plate** | short bright plate ambience/tail on the EP stabs, kept low so they stay punchy | Mix 22, Decay 45, Size 80, PreDelayMs 10, Damping 55, LowCut 15 |
+| Lead (Faze-R arp) | **Pedal Hallverb** | a medium hall glues the busy arp and adds air — reverb, not delay, so it adds no note clutter to an already-dense part | Pre Delay 25, Decay Time 1800, Room Size 70, Damping 45, Wet Level 35 |
+| Lead2 (FM) | **Pedal Dly PCM41** | a ~130 ms slapback fills space around the sparse, singing lead — the bluesy echo idiom, low feedback for 1–2 taps | Time Mode 0, Delay 130, Feedback 18, Mix 24, HF Damp 35 |
+
+These are deductions from each part's role, not auditioned — exact wet amounts and
+times want the human ear (and the per-synth stems will show how each effect sits).
+Built straight from `LASTCALL_SPEC`'s `fx` block in `src/build_lastcall.py`.

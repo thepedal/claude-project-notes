@@ -17,7 +17,7 @@ the machines themselves) are `ReBuzz_ManagedMachine_Notes_*`, cross-referenced a
 Worked examples throughout: **Limani** (D-Hijaz, single-pattern, 28 machines —
 the same song that anchors the BMXML notes) and **Last Call** (A-blues, sectioned
 arrangement, a drum bus + per-synth gains + master limiter, and a real direct-note
-FM lead on top of a Pedal-Chord arp) — Last Call is authored as a single
+FM lead on top of a Pedal-Chord arp, each synth through its own effect) — Last Call is authored as a single
 declarative `compose(spec)` dict (§2). **DslDemo** is a short piece in the fluent
 DSL, showing the imperative form of the same model.
 
@@ -63,7 +63,7 @@ primitives, the upper two are what a human actually drives.
 | **control** | Pedal Chord / Pedal Presetter state + patterns — the control-machine layer (BMXML §12) |
 | **song** | connections, sequences, splice, tempo (BMXML §8), loop / song-end, held-note clear, file write |
 | **theory** | note parsing, scales / modes, chord & arp-mode code tables |
-| **dsl** | `Song / Section / Chords / Arp / Drums / Melody` → `compile()`; `Song.synth()` adds an extra synth for a `Melody`; `compose(spec)` builds a whole song from one declarative dict — the musical front end |
+| **dsl** | `Song / Section / Chords / Arp / Drums / Melody` → `compile()`; `Song.synth()` adds an extra synth for a `Melody`; `Song.fx()` inserts an effect before a synth gain; `compose(spec)` builds a whole song from one declarative dict — the musical front end |
 | **validate** | structural + loop-safety checks; runs as `assert_valid` before every write |
 | **mix** | measure pre-fader stems (peak / RMS / LUFS / clip), solve bus gains — an **offline** tool (needs numpy), not part of the byte-exact core |
 
@@ -161,10 +161,11 @@ chain (drum bus + per-synth gains → limiter → Master); a catalog of ~35 spli
 machines; a **real melodic lead** — a direct-note `Melody` voice on a synth spliced
 in via `Song.synth()` (e.g. Pedal FM), each synth on its own recordable gain (Last
 Call's "Lead2"; BMXML §20); and a one-call **`compose(spec)`** entry point that
-builds a whole song from a single JSON-serialisable dict (BMXML §21).
+builds a whole song from a single JSON-serialisable dict (BMXML §21); and
+**per-synth serial FX** — an effect (or chain) inserted between a synth and its
+gain, e.g. Last Call's Chorus/Plate/Hallverb/slapback per instrument (BMXML §22).
 
 **Open (roughly in leverage order):**
-- **Serial FX** chains now that reverbs / delays / EQ / compressors are catalogued.
 - **Per-section voicing** overrides for the chord / arp voices.
 - Add the machines still missing from the machine reference (**M1, PeerCtrl, LFO, Muter**).
 - **Polyphonic / multi-track direct melodies** (chords or harmony lines) and
@@ -191,11 +192,11 @@ docs/              ReBuzz_SongFormat_Notes_BMXML.md (the deep format/technique r
 | Need | Where |
 |------|-------|
 | Install, quickstart, package surface | `README.md` |
-| Byte layout, recipes, control machines, effects, DSL, mixing, limiter, direct-note lead, compose(spec) | `ReBuzz_SongFormat_Notes_BMXML.md` (**BMXML §§1–21**) |
+| Byte layout, recipes, control machines, effects, DSL, mixing, limiter, direct-note lead, compose(spec), per-synth FX | `ReBuzz_SongFormat_Notes_BMXML.md` (**BMXML §§1–22**) |
 | Per-machine params / note columns / ranges | `refs/MACHINES.md` |
 | Writing the machines themselves | `ReBuzz_ManagedMachine_Notes_*` (**Core / Build / Roster**) |
 
 Format-notes quick index: BMXML §§1–9 format & assembly · §10 Limani design ·
 §11 error chronology · §12 control machines · §13 spec→song recipe · §14
 multi-pattern · §15 effects/buses · §16 validation · §17 DSL · §18
-measurement-driven mixing · §19 master limiter · §20 direct-note melodic lead · §21 compose(spec).
+measurement-driven mixing · §19 master limiter · §20 direct-note melodic lead · §21 compose(spec) · §22 per-synth FX.
