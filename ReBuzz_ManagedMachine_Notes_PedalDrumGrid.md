@@ -1,7 +1,7 @@
 # ReBuzz Managed Machine Development — Pedal DrumGrid Addendum
 
 Source: ReBuzz current preview (June 2026; exact build unstamped — see Roster
-`ReBuzz vs = ?`) + Pedal DrumGrid v1.1 build. A managed C# generator: a 16-lane
+`ReBuzz vs = ?`) + Pedal DrumGrid v1.3 build. A managed C# generator: a 16-lane
 multi-out drum sampler. The trigger grid is the ReBuzz pattern editor itself
 (16 global switch columns); each lane has its own audio output; samples come
 from the wavetable (assigned in the GUI) or a self-contained `.pdrumgrid.xml`
@@ -351,6 +351,84 @@ param layout, so a v1.0.x song's per-track Pitch data won't map onto v1.1 — an
 intentional major-version change. Base per-lane tuning still round-trips via the
 kit file (`_basePitch`, added under any `05` command); there's no longer a column
 or dial to edit it live (a candidate for a future GUI control).
+
+## 10. Steering an in-flight retrigger from later rows (v1.2)
+
+Retriggers are generated *inside* the voice between pattern rows, so by default a
+roll re-fires with the pitch captured on its trigger row. v1.2 lets the rows the
+roll *passes over* modulate it: while a lane has an active retrigger, each row's
+Pitch command (`05`) is applied to the next re-fire.
+
+**Where the per-row read has to happen — the §2 trap, again.** The first cut did
+this in `Work`/`ApplyPendingTriggers` on the `newRow` edge, reading the row's
+command pvalues. It silently did nothing. Per-row track data isn't dependable
+once `Work` runs (the same reason §2's velocity capture reads at trigger time,
+not in `Work`). The fix is to capture during **setter delivery**: the rows a roll
+passes over *do* carry Pitch cells, so ReBuzz calls those lanes' `Command`/
+`Argument` setters — and the value handed to the setter is authoritative for that
+row. So the modulation lives in the setters:
+
+```csharp
+public void SetCmd2(int v, int t) { if ((uint)t < LANES) { _cmd2[t] = v; ModulateRetrig(t); } }
+// …same for Cmd1/Arg1/Arg2…
+
+void ModulateRetrig(int lane)
+{
+    if (!_voices[lane].RetrigActive) return;     // false on the trigger row itself
+    int semis = 0; bool found = false;
+    if (_cmd1[lane] == CMD_PITCH) { semis = SignedByte(_arg1[lane]); found = true; }
+    if (_cmd2[lane] == CMD_PITCH) { semis = SignedByte(_arg2[lane]); found = true; } // slot 2 wins
+    if (found) _voices[lane].SetRetrigPitch(_basePitch[lane] + semis);
+}
+```
+
+Both setters (command + argument) call `ModulateRetrig`; whichever lands last has
+both slot values in place, so the applied pitch is correct. **Hold-on-empty falls
+out for free**: an empty Pitch cell delivers no setter, so nothing is recompiled
+and the voice keeps its last `_retrigInc`. And **no double-apply on the trigger
+row**: `RetrigActive` is still false there (the roll starts in `Work`, after
+setter delivery), so the initial pitch comes solely from the trigger's `TrigSpec`.
+
+**Voice side.** `RetrigActive` exposes the in-flight state; `SetRetrigPitch(semis)`
+writes a separate `_retrigInc` that `Restart()` copies into `_inc` on each
+re-fire — so the change is **discrete** (lands on the next retrigger boundary, not
+a mid-note bend). Keeping `_inc` untouched until `Restart` is the whole trick.
+
+The lesson generalises: **anything that needs a pattern cell's value mid-stream
+should be read in the setter, never re-read in `Work`.** Design choices: Pitch
+only (other commands act on trigger rows alone); either command slot; per-row
+granularity (several retriggers in one tick share that row's pitch — finer
+sequencing would need the voice to carry a pitch *schedule*, not one live value).
+
+### v1.3 — Offset / Reverse / Cut, and the hold-vs-one-shot split
+
+v1.3 extends the same path to more commands, which sorts them into two kinds:
+
+- **"Per-re-fire character" — hold values.** Pitch, **Offset** (`03`) and
+  **Reverse** (`04`) are single values the voice re-reads at each `Restart()`:
+  `_retrigInc`, `_startPos`, `_retrigDir`. Offset is the easiest — `_startPos` is
+  only read at (re)start, so writing it live is automatically discrete; Reverse
+  needs a separate `_retrigDir` (like pitch) because `_dir` is read every sample,
+  so a live write would reverse mid-note. These *hold*: the voice keeps the last
+  value, so re-applying is harmless.
+- **"Timer" — one-shot.** **Cut** (`06`) arms the existing whole-voice cut
+  countdown, ending the roll. It is *not* a hold value.
+
+That split forces a change to how the modulation is dispatched. v1.2 scanned both
+slots on every setter; that's fine for hold values (idempotent) but **wrong for a
+one-shot**: a held Cut in one slot would be re-armed every time the *other* slot's
+setter landed, so the countdown would keep resetting and the roll would never end.
+The fix is to apply **only the slot whose setter fired** (`ModulateRetrig(lane,
+slot)`), so a Cut arms exactly once, on its own row, and held values still hold
+because an empty cell sends no setter at all. The cost is that "slot 2 wins" for
+same-type conflicts becomes setter-order-dependent — a non-issue in practice,
+since the two slots are normally used for *different* commands that combine.
+
+Delay (`01`) / Retrigger (`02`) remain trigger-row-only — as phase/scheduling
+operations they have no sensible "modulate the running roll" reading. A *gated*
+roll (Cut shortening each individual re-fire rather than ending the roll) is a
+genuinely different behaviour and is left for its own command + a per-re-fire cut
+timer in the voice.
 
 ## Depends on
 
