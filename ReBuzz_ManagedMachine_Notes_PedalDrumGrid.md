@@ -45,8 +45,8 @@ triggers* entirely (it still applies to the shared Velocity/Pitch track params �
 see §2). Net: the §14 sibling-poll recovery is **not** needed for triggering.
 
 **Caveat.** The 16 trigger columns are always present (globals), but the per-lane
-Velocity/Pitch columns only appear for tracks that exist — set the machine's
-`TrackCount` to 16 to expose them all.
+Velocity/Pitch columns only appear for tracks that exist. The machine
+auto-initialises to 16 tracks (§8) so they're all there out of the box.
 
 ---
 
@@ -73,19 +73,49 @@ load → those lanes triggered at zero gain → **silent**. Only the directly-se
 lane (skipped as `firedTrack`) survived. The debug trace was unambiguous:
 `fire lane=2 vel=0 snap=26385smp` — trigger fine, sample fine, velocity zero.
 
-**Two mitigations:**
-1. **Guard the poll on playback:** `if (!Buzz.Playing) return;` (and bound the
-   loop to the real `TrackCount`). During playback the array is `NoValue`-filled
-   for untouched tracks, so the guard works as intended. This keeps the recovery.
-2. **Drop the recovery for held/sparse values.** DrumGrid took this: Velocity and
-   Pitch are *held* per lane, sparsely edited; a same-row multi-lane velocity
-   *change* collision just leaves the non-last lane on its previous held value —
-   imperceptible. Removing the poll removed the clobber **and** the fragile
-   reflection. A lane is now silent only if its velocity is explicitly `0`.
+**Two mitigations, and the right one:**
+1. **Guard the poll on playback:** `if (!Buzz.Playing) return;` (and read only
+   the relevant track). During playback the array is `NoValue`-filled for
+   untouched tracks, so the guard works as intended.
+2. **Never poll *sibling* lanes.** The original recovery clobbered because it
+   walked every sibling track at load. Reading only the **firing lane's own**
+   value is both safe and sufficient (see below).
 
-**Rule of thumb:** the §14 sibling-poll is only valid mid-playback. If your setter
-also fires at load/track-create (they all do, via `DefValue`), an unguarded poll
-is a clobber waiting to happen.
+**The follow-on, and why own-lane reads are actually required.** Removing the
+poll entirely (an interim v1.0 choice) then exposed a second bug: **pattern-cell
+velocity didn't affect the hit, but the column's header dial did.** Because the
+trigger is a *global* param consumed in `Work` (§1) while Velocity is a *track*
+param delivered through its own setter, on a row with both, the hit was read
+before that row's `SetVelocity` had refreshed `_pendVel` — so cells appeared
+inert while the dial (a live, held set) worked. The fix is to read the firing
+lane's **own** Velocity/Pitch pvalue at trigger time, inside `SetTrig`:
+
+```
+on SetTrig(lane, true):
+    if not Buzz.Playing:      return        # never read the array at load
+    if lane >= TrackCount:    return        # no real track -> slot is uninit 0
+    if velPvalue(lane) != NoValue:  _pendVel[lane]   = velPvalue(lane)
+    if pitPvalue(lane) != NoValue:  _pendPitch[lane] = pitPvalue(lane) - 48
+```
+
+This works because the sequencer fills **every** pvalue for a row before **any**
+setter runs — so when `SetTrig` fires, the same-row Velocity/Pitch pvalue is
+already there, independent of setter ordering or whether `SetVelocity` is invoked
+at all. The two guards are load-bearing: `Buzz.Playing` keeps it off the
+all-`0` array at load, and **`lane < TrackCount`** keeps it off the slots beyond
+the real track count (also still `0`, not `NoValue`) — without that bound, a
+machine with `TrackCount = 1` but triggers on lanes 2+ pins those lanes' held
+velocity to 0 and only lane 0 sounds (the exact regression that caught this).
+Own-lane + hits-only means it can't clobber siblings, and same-row multi-lane
+hits each read their own value, so the Core §14 collision is a non-issue without
+any sibling walk.
+
+**Rule of thumb:** when a trigger and its modifiers (velocity, pitch) live in
+*different* parameters — especially global trigger + track modifier — don't rely
+on the modifier's setter having run first. Read the modifier's pvalue at the
+instant the trigger fires. And the §14 sibling-poll is only ever valid
+mid-playback; an unguarded poll that also runs at load (they all do, via
+`DefValue`) is a clobber waiting to happen.
 
 ---
 
@@ -209,16 +239,77 @@ Confirmed against this build (the enumeration path the notes hadn't pinned down)
 
 ---
 
+## 8. Auto-initialising the machine's own `TrackCount`
+
+A machine with a fixed lane count wants those tracks present without the user
+manually adding them — and present **immediately on insertion**, not only once
+playback starts. There's **no declarative hook** — `MachineDecl` has `MaxTracks`
+(an upper bound) but no `MinTracks`/initial-count. So set it imperatively via
+`IMachine.TrackCount`, with these constraints:
+
+- **UI thread only.** The setter triggers `CMI_SetNumTracks` (Core §19, §21);
+  calling it on the audio thread risks the IPC deadlock §21 warns about. Marshal
+  with `System.Windows.Application.Current.Dispatcher.BeginInvoke(...)`.
+- **Drive it from the constructor, but deferred + retrying.** `host.Machine` is
+  null that early (Core §16.1), so you can't set it inline. But a `BeginInvoke`
+  scheduled from the constructor runs *after* construction unwinds, by which
+  point `host.Machine` is populated — so the tracks appear as soon as the machine
+  is added, before any `Work`. The catch is you must **retry**, not mark-done on
+  first attempt: if the dispatched call still finds `host.Machine == null`, leave
+  the "done" flag clear so a later attempt can fix it. A first-`Work` call is the
+  safety net (it reschedules if needed, and `BeginInvoke` is safe to *queue* from
+  the audio thread even though the setter must *run* on the UI thread).
+- **Bump-up-only.** `if (m.TrackCount < n) m.TrackCount = n;` — never truncate.
+  Old songs saved at a smaller count get padded to 16 (lossless: existing track
+  data is preserved, empty tracks added); songs already at 16 are a no-op. Only
+  raised **once** (the `_tracksInit` latch), so a user who later reduces the count
+  by hand isn't fought.
+
+```csharp
+bool _tracksInit, _tracksScheduled;
+
+void ScheduleEnsureTracks()        // from ctor AND first Work (both idempotent)
+{
+    if (_tracksInit || _tracksScheduled) return;
+    _tracksScheduled = true;
+    var disp = System.Windows.Application.Current?.Dispatcher;
+    if (disp != null) disp.BeginInvoke((Action)EnsureInitialTracks);
+    else { _tracksScheduled = false; EnsureInitialTracks(); }
+}
+void EnsureInitialTracks()         // runs on the UI thread
+{
+    _tracksScheduled = false;
+    if (_tracksInit) return;
+    var m = host?.Machine;
+    if (m == null) return;         // not ready — a later ScheduleEnsureTracks retries
+    if (m.TrackCount < LANES) m.TrackCount = LANES;   // public setter (still {get;set;} @1827)
+    _tracksInit = true;
+}
+```
+
+**Why not Work-only (the earlier cut).** Triggering solely from the first `Work`
+means the tracks don't appear until the user presses play — add the machine, open
+the pattern stopped, and you still see one track. Worse, latching "done" on the
+first attempt regardless of success means a null `host.Machine` permanently skips
+it. The constructor-scheduled + retry form fixes both.
+
+Bonus: when ReBuzz creates the new tracks it pushes each track param's `DefValue`
+through the setters, so the new lanes' `Velocity`/`Pitch` initialise to 127/0
+(`_pendVel`/`_pendPitch`) — no extra wiring. (This is also why the §2 capture's
+`lane < TrackCount` guard now permits all 16 lanes.)
+
 ## Depends on
 
 - **Build** §1.2 (csproj — fully compliant: `net10.0-windows`, `UseWPF`, no
   pdb/deps, `NoWarn MSB3277`), §1.3 (deploy → `Gear\Generators`), §2 (`.NET`
   AssemblyName suffix), §1.1 / §6.1 (reference only `BuzzGUI.Interfaces` +
   `BuzzGUI.Common`; **not** `ReBuzz.exe` — §7).
-- **Core** §9 (`bool` → Switch — §1), §25 (`IsStateless` hides from rack / pattern
-  re-fire — §1), §14 + §42 (multi-track `parametersChanged` collision and the
-  `int[256]` `pvalues` shape — §2), §26.7 (GUI base class — §6), §38 (Buzz sample
-  scale — §3), §39 (`MachineState` framing + versioning — §6).
+- **Core** §9 (`bool` → Switch — §1), §16.1 (lazy `host.Machine` — §8), §19/§21
+  (`TrackCount` setter, UI thread / `CMI_SetNumTracks` IPC — §8), §25 (`IsStateless`
+  hides from rack / pattern re-fire — §1), §14 + §42 (multi-track
+  `parametersChanged` collision and the `int[256]` `pvalues` shape — §2), §26.7
+  (GUI base class — §6), §38 (Buzz sample scale — §3), §39 (`MachineState`
+  framing + versioning — §6).
 - **Tracker** §12.1–§12.3 (multi-out contract, static `OutputCount` — §3), §16.3
   (shape-tolerant `pvalues` reader — §2), §4.2 (deferred re-trigger fade — §3),
   §7.1 (`GetDataAsFloat` — §7), §7.7 (sub-tick note delay — §4), §2.3
