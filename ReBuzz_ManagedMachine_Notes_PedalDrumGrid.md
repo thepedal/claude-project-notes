@@ -1,7 +1,7 @@
 # ReBuzz Managed Machine Development — Pedal DrumGrid Addendum
 
 Source: ReBuzz current preview (June 2026; exact build unstamped — see Roster
-`ReBuzz vs = ?`) + Pedal DrumGrid v1.0 build. A managed C# generator: a 16-lane
+`ReBuzz vs = ?`) + Pedal DrumGrid v1.1 build. A managed C# generator: a 16-lane
 multi-out drum sampler. The trigger grid is the ReBuzz pattern editor itself
 (16 global switch columns); each lane has its own audio output; samples come
 from the wavetable (assigned in the GUI) or a self-contained `.pdrumgrid.xml`
@@ -294,9 +294,63 @@ first attempt regardless of success means a null `host.Machine` permanently skip
 it. The constructor-scheduled + retry form fixes both.
 
 Bonus: when ReBuzz creates the new tracks it pushes each track param's `DefValue`
-through the setters, so the new lanes' `Velocity`/`Pitch` initialise to 127/0
-(`_pendVel`/`_pendPitch`) — no extra wiring. (This is also why the §2 capture's
-`lane < TrackCount` guard now permits all 16 lanes.)
+through the setters, so the new lanes' Velocity/Command/Argument initialise to
+their defaults (127 / None / 0) — no extra wiring. (This is also why the §2
+capture's `lane < TrackCount` guard now permits all 16 lanes.)
+
+## 9. Tracker-style effect command columns (v1.1)
+
+v1.1 adds **two `Command`/`Argument` track-param slots per lane** (a tracker
+effect column) and **removes the dedicated Pitch column** (pitch is now command
+`05`). Commands: `01` Delay, `02` Retrigger, `03` Offset, `04` Reverse+offset,
+`05` Pitch, `06` Cut. Several findings worth keeping:
+
+**`ValueDescriptions` gives the Command column a named menu.** Setting
+`ValueDescriptions = new[] { "00 None", "01 Delay", … }` makes the pattern editor
+show the names and **auto-sets `MinValue`/`MaxValue` to `0..length-1`** (Core §9),
+so you omit Min/Max entirely. The array must be an **inline array-creation
+expression** in the attribute — a reference to a `static readonly string[]`
+field is *not* a legal attribute argument and won't compile, so the two Command
+slots each repeat the literal.
+
+**The byte `NoValue=255` ceiling shapes the Argument.** A `Byte` param reserves
+255 as the "no event this tick" sentinel, so the Argument can only be declared
+`MaxValue = 254` and the value `FF` is **un-enterable** (Core §9). The user-facing
+"`00`=start … `FF`=end" model is preserved by mapping `arg / 255f` for
+Offset/Reverse, so the math still reads `FF`=end while the enterable max `FE`
+lands at ~99.6 %. Using a `Word` arg would allow a true 255 but widens the
+pattern column to 4 hex digits — not worth it for a tracker arg.
+
+**Held vs momentary capture.** §2's own-lane pvalue read is extended to the four
+command params, but with a key difference from Velocity: **Velocity is held**
+(keep the previous value on `NoValue`), **commands are momentary** (reset to None
+each hit, only set when the row's cell carries a value). So a `06 Cut` on one row
+doesn't haunt every later hit on that lane. The capture clears the command arrays
+*first*, then overwrites from pvalues — so even when the read is skipped (stopped,
+or `lane ≥ TrackCount`) the hit gets None, not a stale command.
+
+**A fixed sub-tick grid, deliberately *not* the engine's.** Delay / Retrigger
+interval / Cut are specified in "subticks". Rather than read `SubTickInfo`
+(Chord §11), DrumGrid uses a **fixed `SUBTICKS_PER_TICK = 12`** subdivision
+(`subSamples = SamplesPerTick / 12`), so an argument means the same thing whether
+the engine's Sub-Tick-Timing is on or off — predictability beats matching the
+engine's internal resolution for a per-row effect arg. The voice schedules the
+resulting sample counts itself, so it stays sample-accurate and tempo-agnostic;
+Retrigger *length* is `lengthTicks × SamplesPerTick`, fixed at trigger time.
+
+**Voice additions.** `Voice` gained: a start position from the offset arg; a
+reverse direction (`_dir = ±1`, end-test flips to `_pos ≤ 0`); a scheduled-cut
+countdown that fades and disables retrigger; and **sample-accurate retrigger**
+that re-fires from the start position every interval and keeps the voice alive
+through silent gaps when the sample is shorter than the interval (so the
+per-sample loop runs the cut/retrigger counters *before* the `!_active` early-out).
+Two commands combine into one `TrigSpec`; slot 2 wins on conflicting fields.
+
+**Breaking change.** Removing Pitch and inserting four params shifts the track
+param layout, so a v1.0.x song's per-track Pitch data won't map onto v1.1 — an
+intentional major-version change. Base per-lane tuning still round-trips via the
+kit file (`_basePitch`, added under any `05` command); there's no longer a column
+or dial to edit it live (a candidate for a future GUI control).
 
 ## Depends on
 
@@ -304,7 +358,9 @@ through the setters, so the new lanes' `Velocity`/`Pitch` initialise to 127/0
   pdb/deps, `NoWarn MSB3277`), §1.3 (deploy → `Gear\Generators`), §2 (`.NET`
   AssemblyName suffix), §1.1 / §6.1 (reference only `BuzzGUI.Interfaces` +
   `BuzzGUI.Common`; **not** `ReBuzz.exe` — §7).
-- **Core** §9 (`bool` → Switch — §1), §16.1 (lazy `host.Machine` — §8), §19/§21
+- **Core** §9 (`bool` → Switch — §1; `ValueDescriptions` named menu + auto-range
+  and the byte `NoValue=255` `MaxValue` ceiling — §9), §16.1 (lazy `host.Machine`
+  — §8), §19/§21
   (`TrackCount` setter, UI thread / `CMI_SetNumTracks` IPC — §8), §25 (`IsStateless`
   hides from rack / pattern re-fire — §1), §14 + §42 (multi-track
   `parametersChanged` collision and the `int[256]` `pvalues` shape — §2), §26.7
@@ -314,7 +370,8 @@ through the setters, so the new lanes' `Velocity`/`Pitch` initialise to 127/0
   (shape-tolerant `pvalues` reader — §2), §4.2 (deferred re-trigger fade — §3),
   §7.1 (`GetDataAsFloat` — §7), §7.7 (sub-tick note delay — §4), §2.3
   (`Song.PlayPosition` — §4).
-- **Chord** §3, §11 (swing ratio / tempo-locked split, recast as delay — §4).
+- **Chord** §3, §11 (swing ratio / tempo-locked split, recast as delay — §4;
+  the engine `SubTickInfo` model that §9's fixed grid deliberately sidesteps).
 - **M1** §2 (wavetable snapshot off the audio thread — §5), §2.1 (`BuzzByteToMidi`
   root-note form — §7).
 - **PedalTracker** §13.1 (don't duplicate param values into `MachineState` — §6).
