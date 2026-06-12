@@ -22,6 +22,13 @@ v1.x commits explicitly target the ReBuzz 1827 "pvalues field" multi-track
 fix, so they were demonstrably built/tested against 1827. Source: the
 commit messages, not the Core log.
 
+**Manual add (2026-06-12):** added **pedal-drumgrid** (v1.0, new) with a
+dedicated addendum (`ReBuzz_ManagedMachine_Notes_PedalDrumGrid.md`, `Addendum=Y`).
+Single-machine edit, not a full GitHub pull — `Last refreshed` above is unchanged.
+`ReBuzz vs` left `?` pending the user's stamp (the machine doesn't pin to the 1827
+pvalues fix — its trigger grid is global switches, which don't collide — so
+there's no hard version dependency; stamp what it was built/tested on).
+
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
 machines need touching?" by grepping for the relevant Core/Build
@@ -57,7 +64,7 @@ below, separate from the dev/impact-analysis roster.
 
 ---
 
-## Roster (38 machines)
+## Roster (39 machines)
 
 | Repo                    | Type       | Last pushed | ReBuzz vs     | Addendum | Description                                                |
 |-------------------------|------------|-------------|---------------|----------|------------------------------------------------------------|
@@ -68,6 +75,7 @@ below, separate from the dev/impact-analysis roster.
 | pedal-converb           | effect     | 2026-05-07  | ?             |          | Convolution reverb (SIMD, wavefile IRs)                    |
 | pedal-dly-PCM41         | effect     | 2026-05-05  | 1819-preview  |          | PCM41-style tape delay                                     |
 | pedal-do-nuttin         | template   | 2026-05-12  | ?             |          | "Do nothing" machine — minimal scaffold                    |
+| pedal-drumgrid          | generator  | 2026-06-12  | ?             | Y        | Multi-out drum sampler — 16-lane trigger grid, embedded kits|
 | pedal-eq                | effect     | 2026-05-17  | 1819-preview  |          | EQ effect (Core §33 source: v1.3 WM_NOIO handling)         |
 | pedal-Faze-R            | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
 | pedal-fft               | effect     | 2026-05-02  | ?             |          | FFT distortion with harmonics                              |
@@ -112,7 +120,7 @@ time, not evidence the machines are stale.
 
 ## Machines with detailed addenda
 
-Nine machines have their own notes file, listed in table order. To support
+Ten machines have their own notes file, listed in table order. To support
 impact analysis, each should grow a `## Depends on` section listing the
 Core/Build §-references it relies on. The lists below are seeds — flesh
 out from each addendum as time allows.
@@ -131,6 +139,23 @@ out from each addendum as time allows.
 - Depends on: Core (foundational — most sections trace back here),
   Build §1.2 (csproj properties), §1.3 (post-build deploy), §2
   (AssemblyName).
+
+### pedal-drumgrid — `ReBuzz_ManagedMachine_Notes_PedalDrumGrid.md`
+- 16-lane multi-out drum sampler. Trigger grid = 16 global switch columns in the
+  pattern editor; per-lane Velocity/Pitch track columns; per-lane audio outputs;
+  GUI wave assignment; self-contained `.pdrumgrid.xml` kits with embedded audio.
+  The reusable findings are the trigger-grid layout technique (§1) and the
+  load-time `pvalues` clobber that silences lanes (§2) — both apply to any
+  multi-track managed machine.
+- Depends on: Build §1.2 (csproj — fully compliant), §1.3 (deploy →
+  `Gear\Generators`), §2 (`.NET` AssemblyName), §1.1/§6.1 (reference only
+  `BuzzGUI.Interfaces` + `BuzzGUI.Common`, **not** `ReBuzz.exe`); Core §9
+  (`bool`→Switch), §25 (`IsStateless`), §14 + §42 (multi-track collision /
+  `int[256]` pvalues), §26.7 (GUI base class), §38 (sample scale), §39
+  (`MachineState`); Tracker §§12.1–12.3 (multi-out), §16.3 (pvalues reader), §4.2,
+  §7.1, §7.7, §2.3; Chord §3, §11 (swing); M1 §2, §2.1; PedalTracker §13.1.
+  Not pinned to 1827 (global triggers don't collide; the pvalues recovery was
+  removed) — stamp the actual build.
 
 ### pedal-Faze-R — `ReBuzz_ManagedMachine_Notes_PedalFazeR.md`
 - 8-voice polyphonic phase-distortion synth (Casio CZ lineage): two PD
@@ -242,7 +267,7 @@ block of each into the song-writer's `refs/`).
   findings worth recording, or when its setup deviates from Core/Build
   conventions in a way future-you will need to remember. (Newest without
   one: **pedal-juno106**.)
-- **23 machines have an unknown ReBuzz version.** Not necessarily a
+- **24 machines have an unknown ReBuzz version.** Not necessarily a
   problem, but when ReBuzz changes in a way that might affect them,
   the answer to "is this still good?" is "build it and find out."
   Stamping the version in each machine's `README.md` would close this
