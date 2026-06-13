@@ -1,7 +1,7 @@
 # ReBuzz Managed Machine Development — Pedal DrumGrid Addendum
 
 Source: ReBuzz current preview (June 2026; exact build unstamped — see Roster
-`ReBuzz vs = ?`) + Pedal DrumGrid v1.5 build. A managed C# generator: a 16-lane
+`ReBuzz vs = ?`) + Pedal DrumGrid v1.5.1 build. A managed C# generator: a 16-lane
 multi-out drum sampler. The trigger grid is the ReBuzz pattern editor itself
 (16 global switch columns); each lane is routed to one of the multi-out group
 buses; samples come from the wavetable (assigned in the GUI) or a self-contained
@@ -187,14 +187,26 @@ the beat grid, not to the raw step index.
 wavetable slots needed to share/reload it.
 
 - Per lane: `<Sample kind="embedded" rootNote="…">BASE64</Sample>` where the
-  payload is a **16-bit PCM WAV** (`WavWriter`, snapshot float ±1 → 16-bit). Save
-  bakes audio from each lane's in-memory snapshot **regardless of original
-  source** (wavetable / file / already-embedded). `WavReader` gained `Stream` and
-  `byte[]` overloads to decode it back.
-- `<Defaults velocity pitch chokeGroup>` round-trip per-lane velocity/pitch
-  (captured from the held `_pendVel`/`_pendPitch` on save, re-applied on load) and
-  choke group. A `name` attribute per `<Lane>` carries the sample/lane label
-  (captured from `IWave.Name` on assignment, editable in the GUI).
+  payload is a **PCM/float WAV at the source's native bit depth and sample rate**
+  (`WavWriter`). **v1.5.1:** the embed preserves 16/24/32-bit int or 32-bit float
+  instead of flattening everything to 16-bit, so a high-resolution source isn't
+  degraded. The snapshot carries the format (`SourceBits`/`SourceFloat`):
+  `WavReader` records what it decoded, and wavetable lanes read the layer's
+  `WaveFormat` (Tracker §7.3) **by reflection**, falling back to 32-bit float
+  (lossless vs `GetDataAsFloat`) if the member isn't present on the running
+  preview. Writer scaling now mirrors the reader (÷2^(bits−1)) so 16/24-bit int
+  and float round-trip **exactly** — the old `*32767` vs `/32768` mismatch was a
+  one-sample-off asymmetry even at 16-bit. The one lossy case is 32-bit *int*: the
+  intermediate float32 snapshot has a 24-bit mantissa (rare in practice). Save
+  bakes from each lane's in-memory snapshot **regardless of original source**
+  (wavetable / file / already-embedded). `WavReader` has `Stream` and `byte[]`
+  overloads to decode it back.
+- `<Defaults velocity pitch chokeGroup out>` round-trips per-lane velocity / base
+  tuning (captured from the held `_pendVel`/`_basePitch` on save, re-applied on
+  load), choke group, and the per-lane **output bus** (`out`, see §11 — pre-v1.5
+  files without it leave routing untouched). A `name` attribute per `<Lane>`
+  carries the sample/lane label (captured from `IWave.Name` on assignment,
+  editable in the GUI).
 - Loader kinds understood: `embedded` (base64 WAV), `file` (wav on disk), and
   `wavetable` (1-based slot). `embedded` is what Save writes.
 - `PrebuildAll()` runs on the UI thread after any load so the first hit never
@@ -228,6 +240,15 @@ as a load-time default.
 
 GUI is built in code (no XAML/BAML — Chord §1), `UserControl` since it's control-
 composed (Core §26.7 — `FrameworkElement` only if an `OnRender` surface is added).
+
+**v1.5.1 GUI readout:** each lane row shows a concise native-format tag to the
+right of the status — `DrumKit.LaneFormat(lane)` → `RateTag(SampleRate)`/bits
+(e.g. `44.1k/24`, `48k/16`, `44.1k/32f`; empty for an unassigned lane), read from
+the cached snapshot so it reflects the source's real format (§5). It's refreshed
+both in `RefreshWaveLists` and right after a wave is assigned. To keep the param
+window compact, the lanes `ScrollViewer` is bounded (`MaxWidth = 560`) with
+`HorizontalScrollBarVisibility = Auto`, so the format column (and any long status)
+is reached by scrolling right rather than by widening the window.
 
 ---
 
