@@ -29,6 +29,12 @@ Single-machine edit, not a full GitHub pull — `Last refreshed` above is unchan
 pvalues fix — its trigger grid is global switches, which don't collide — so
 there's no hard version dependency; stamp what it was built/tested on).
 
+**Manual update (2026-06-13):** pedal-drumgrid taken to **v1.5** — per-lane output
+routing (group buses, saved in `MachineState` and the kit file), per-track
+`Humanize Vel`, all-hits timing `Humanize`, a CPU pass (active-lane-only mixing,
+faded-voice stop), and a finalised parameter layout. v1.5 is the intended last
+release with breaking parameter changes. `ReBuzz vs` still `?` — stamp the build.
+
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
 machines need touching?" by grepping for the relevant Core/Build
@@ -75,7 +81,7 @@ below, separate from the dev/impact-analysis roster.
 | pedal-converb           | effect     | 2026-05-07  | ?             |          | Convolution reverb (SIMD, wavefile IRs)                    |
 | pedal-dly-PCM41         | effect     | 2026-05-05  | 1819-preview  |          | PCM41-style tape delay                                     |
 | pedal-do-nuttin         | template   | 2026-05-12  | ?             |          | "Do nothing" machine — minimal scaffold                    |
-| pedal-drumgrid          | generator  | 2026-06-12  | ?             | Y        | Multi-out drum sampler — 16-lane trigger grid, embedded kits|
+| pedal-drumgrid          | generator  | 2026-06-13  | ?             | Y        | Multi-out 16-lane drum sampler — routable buses, swing/humanize, embedded kits|
 | pedal-eq                | effect     | 2026-05-17  | 1819-preview  |          | EQ effect (Core §33 source: v1.3 WM_NOIO handling)         |
 | pedal-Faze-R            | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
 | pedal-fft               | effect     | 2026-05-02  | ?             |          | FFT distortion with harmonics                              |
@@ -142,11 +148,12 @@ out from each addendum as time allows.
 
 ### pedal-drumgrid — `ReBuzz_ManagedMachine_Notes_PedalDrumGrid.md`
 - 16-lane multi-out drum sampler. Trigger grid = 16 global switch columns in the
-  pattern editor; per-lane Velocity/Pitch track columns; per-lane audio outputs;
-  GUI wave assignment; self-contained `.pdrumgrid.xml` kits with embedded audio.
-  The reusable findings are the trigger-grid layout technique (§1) and the
-  load-time `pvalues` clobber that silences lanes (§2) — both apply to any
-  multi-track managed machine.
+  pattern editor; per-lane Velocity + Humanize Vel + two Command/Argument effect
+  columns; lanes routed to shareable multi-out group buses; GUI wave assignment
+  and routing; self-contained `.pdrumgrid.xml` kits with embedded audio + routing.
+  The reusable findings are the trigger-grid layout technique (§1), the load-time
+  `pvalues` clobber that silences lanes (§2), and the parameter-list-vs-song-load
+  constraint (§12) — all apply to any multi-track managed machine.
 - Depends on: Build §1.2 (csproj — fully compliant), §1.3 (deploy →
   `Gear\Generators`), §2 (`.NET` AssemblyName), §1.1/§6.1 (reference only
   `BuzzGUI.Interfaces` + `BuzzGUI.Common`, **not** `ReBuzz.exe`); Core §9

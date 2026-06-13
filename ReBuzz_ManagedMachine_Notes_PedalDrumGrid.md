@@ -1,11 +1,11 @@
 # ReBuzz Managed Machine Development — Pedal DrumGrid Addendum
 
 Source: ReBuzz current preview (June 2026; exact build unstamped — see Roster
-`ReBuzz vs = ?`) + Pedal DrumGrid v1.3 build. A managed C# generator: a 16-lane
+`ReBuzz vs = ?`) + Pedal DrumGrid v1.5 build. A managed C# generator: a 16-lane
 multi-out drum sampler. The trigger grid is the ReBuzz pattern editor itself
-(16 global switch columns); each lane has its own audio output; samples come
-from the wavetable (assigned in the GUI) or a self-contained `.pdrumgrid.xml`
-kit with embedded audio.
+(16 global switch columns); each lane is routed to one of the multi-out group
+buses; samples come from the wavetable (assigned in the GUI) or a self-contained
+`.pdrumgrid.xml` kit with embedded audio.
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`; `Tracker §N`, `Chord §N`, `M1 §N`,
@@ -13,8 +13,8 @@ Sections numbered locally. References to `Core §N` point to
 cross-references use plain `§N`.
 
 Most findings here are *not* drum-specific — the trigger-grid layout technique
-(§1) and the load-time pvalue clobber (§2) apply to any multi-track managed
-machine.
+(§1), the load-time pvalue clobber (§2), and the parameter-list-vs-song-load
+constraint (§12) apply to any multi-track managed machine.
 
 ---
 
@@ -152,18 +152,32 @@ DrumGrid doesn't own a step clock — triggers arrive from pattern rows — so t
 same ratio is recast as a **delay on the off-beat step**:
 
 ```
-ratio       = 1 + Swing/100                 // 1.0 .. 2.0
-longTicks   = 2·ratio / (ratio + 1)         // 1.0 .. 1.333 (per step pair)
-delayTicks  = longTicks − 1                 // 0 .. 1/3 tick on the off-beat
-delaySamples = delayTicks · SamplesPerTick
+ratio        = 1 + Swing/100                // 1.0 .. 2.0
+frac         = 2·ratio/(ratio+1) − 1        // 0 .. 1/3 of one swing unit
+delaySamples = frac · rowsPerStep · SamplesPerTick
 ```
 
-Off-beat parity comes from `Song.PlayPosition` (Tracker §2.3); a `Swing Phase`
-switch flips which step of the pair is delayed (Chord's `SwingPhaseVal`). The
-delay is realised with the sub-tick note-delay countdown in the voice (Tracker
-§7.7). Because it's a per-trigger delay rather than a step clock, it's
-tempo-locked and **Sub-Tick-Timing-independent by construction** — no
-`SubTickInfo` read at all (cf. Chord §11.3).
+**Swing on a beat-grid unit, NOT raw row parity (v1.4 fix).** The first cut keyed
+the off-beat off raw pattern-row parity (`songPos & 1`). That fails silently for a
+very common case: a beat whose hits all sit on the *same* parity — e.g. eighth-
+note content landing on even 16th-rows — gets a uniform shift with no opposite-
+parity neighbour to displace against, so it reads as no swing at all (verified by
+onset analysis of a rendered loop: dead-even spacing at max swing). Fix: swing
+operates on a **swing unit** taken off the beat grid via `MasterInfo.TicksPerBeat`
+(rows-per-beat), not on rows. `Swing Unit` = 1/8 → `rowsPerStep = TPB/2`, 1/16 →
+`TPB/4`. Each pair of units is one on-step + one off-step; the off-step's hits are
+delayed by `frac · rowsPerStep` ticks (a 2:1 triplet at Swing 100). This makes 1/8
+shuffle the eighths and 1/16 the sixteenths regardless of the pattern's row
+resolution. The default also now delays the *off*-beat (the old default delayed
+the down-beat); `Swing Phase = 1` flips it to a drag.
+
+Off-step selection comes from `Song.PlayPosition` (Tracker §2.3). The delay is
+realised with the sub-tick note-delay countdown in the voice (Tracker §7.7).
+Because it's a per-trigger delay rather than a step clock, it's tempo-locked and
+**Sub-Tick-Timing-independent by construction** — no `SubTickInfo` read (cf. Chord
+§11.3). General lesson: "swing by delaying alternate steps" only works if the
+content lands on both sides of the chosen subdivision — anchor the subdivision to
+the beat grid, not to the raw step index.
 
 ---
 
@@ -430,6 +444,98 @@ roll (Cut shortening each individual re-fire rather than ending the roll) is a
 genuinely different behaviour and is left for its own command + a per-re-fire cut
 timer in the voice.
 
+---
+
+## 11. Per-lane output routing (group buses)
+
+The multi-out array (§3) started as a fixed 1:1 map (lane *i* → out *i*+1). v1.5
+makes it a configurable map: each lane carries a 1-based bus index (`_laneOut[i]`,
+default *i*+1) and several lanes can target the same bus (four hats → out 3). Out
+0 stays the full mix. The mix is **additive**: zero out 0 and the connected buses
+once, then each active lane adds its dry signal to out 0 (×Master Gain) and to its
+bus in one pass. Nothing constrains the map — unused buses just stay silent, and
+`OutputCount` is unchanged (still static, §3), so reload-safety is untouched.
+
+Routing is GUI-set (a per-lane bus picker), not a parameter — same reasoning as
+wave assignment (§6): it's configuration, not per-step automation. It persists in
+two complementary places: `MachineState` (so a song restores it independently of
+any kit) **and** the `.pdrumgrid.xml` kit, round-tripped through the per-lane
+`Defaults` `out` attribute exactly like velocity/tuning (§5). On kit load a lane's
+routing is overridden only when the kit specifies `out` (≥1); a pre-routing kit
+(no attribute) leaves the current map alone, so loading an old kit never silently
+re-wires you.
+
+## 12. Parameter-list stability is a hard song-load constraint
+
+The sharpest lesson of v1.5. **Growing or reordering a machine's parameter list
+breaks loading of any song saved by the older build**, with a bare
+`ArgumentOutOfRangeException` ("Index was out of range … less than the size of the
+collection") at load — no machine name, no hint. ReBuzz restores a machine's saved
+parameter block **positionally**, reading the current declared count against the
+stored values, so adding even one global (or one track column) runs the read off
+the end of the older song's data.
+
+Build §3.3's "append-only is safe" rule is about **presets**; the **song** loader
+is stricter and this does not save you. The practical consequences:
+
+- Anything that genuinely needs per-step automation has to be a parameter and
+  therefore freezes the layout. Everything else — wave assignment, output routing,
+  the velocity-humanize *amount* before it became per-track — belongs in
+  `MachineState`, whose own reader is version-tolerant (read what you know, ignore
+  trailing bytes) and so survives version drift without an index error.
+- When you *do* have to change the parameter list (as v1.5 did — regrouped globals
+  and a new `Humanize Vel` track column), accept it as a breaking release, bump it
+  deliberately, and tell the user old songs won't load. v1.5 is declared the last
+  such release for this machine.
+
+`MachineState` framing is the safe channel precisely because we control the
+reader: magic + version + length-prefixed, accept `v ≤ current`, default missing
+fields. DrumGrid's `MachineState` went v3→v4 (routing) →v5 (a short-lived master
+humanize byte) →v6 (kit + sources + names + routing; the v5 byte is ignored if
+present). None of those bumps can throw at load — unlike a parameter-count change.
+
+## 13. Humanize: global timing, per-track velocity
+
+Two independent randomisers, both recomputed per hit so neither accumulates
+(no tempo/level drift):
+
+- **`Humanize`** (global, late-only timing). First version computed the jitter
+  *inside* `SwingDelaySamples`, after its early-outs — so it did nothing unless
+  Swing > 0 and only scattered the swung off-beats. Lesson: don't bury a generally-
+  applicable effect inside a feature's guard clause. Moved to its own
+  `HumanizeDelaySamples`, added to **every** hit's delay alongside any swing/Delay-
+  command offset.
+- **`Humanize Vel`** (per-track, held). A quieter-only, proportional velocity drop
+  (≤ half at 100), so a lane's accents stay accents and a hit never fully mutes.
+  Made it a **per-track held column** (like Velocity, captured at trigger time from
+  the firing lane's own pvalue — §2) rather than a global, so you can loosen one
+  snare or hat while the rest stay machine-exact. "Quieter-only" mirrors the late-
+  only timing: one-sided humanise can't be undone by an opposite-sign sibling, so
+  the centre of the groove stays put.
+
+## 14. Cheap CPU: mix only what's sounding, and stop silent voices
+
+Two wins that matter for a 16-lane machine where most lanes are idle most of the
+time:
+
+- **Active-lane-only render/mix.** `Work` checks `Voice.Active`
+  (`_active || _pendStaged || _delaySamples>0 || _retrigInterval>0`) and skips idle
+  lanes entirely — no render, no buffer clear, no contribution to the sum. The old
+  path rendered all 16 and ran two full 16-lane passes (master sum + bus sum) every
+  block regardless. Output is identical (idle lanes contributed silence anyway);
+  only the wasted work is gone, and it scales with how sparse the kit is.
+- **Stop rendering a faded-out voice.** A choked/cut voice used to keep reading its
+  sample silently until the sample's natural end (a long open-hat choked by a
+  closed hat = thousands of silent samples). Now, once it has ramped to ~0 with
+  nothing staged and no retrigger pending, it deactivates immediately (~1.3 ms) and
+  drops out of the active set next block.
+
+Minor cuts in the same pass: removing a dead `WaveSnapshot` argument from `Render`
+eliminated a per-block `GetSnapshot` ×16; `EngineRate()` is read once per block
+instead of per lane; and the per-sample `SampleRate/EngineRate` divide became a
+multiply by a precomputed reciprocal, with a branchless `_dir` position step. No
+SIMD or unsafe code — not worth the risk on a sampler this light.
+
 ## Depends on
 
 - **Build** §1.2 (csproj — fully compliant: `net10.0-windows`, `UseWPF`, no
@@ -443,7 +549,8 @@ timer in the voice.
   hides from rack / pattern re-fire — §1), §14 + §42 (multi-track
   `parametersChanged` collision and the `int[256]` `pvalues` shape — §2), §26.7
   (GUI base class — §6), §38 (Buzz sample scale — §3), §39 (`MachineState`
-  framing + versioning — §6).
+  framing + versioning — §6, §11, §12), §29 (`MasterInfo` runtime-variable;
+  `TicksPerBeat`/`SamplesPerTick` for the swing grid — §4).
 - **Tracker** §12.1–§12.3 (multi-out contract, static `OutputCount` — §3), §16.3
   (shape-tolerant `pvalues` reader — §2), §4.2 (deferred re-trigger fade — §3),
   §7.1 (`GetDataAsFloat` — §7), §7.7 (sub-tick note delay — §4), §2.3
