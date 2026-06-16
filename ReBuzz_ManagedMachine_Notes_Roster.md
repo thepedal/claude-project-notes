@@ -35,6 +35,15 @@ routing (group buses, saved in `MachineState` and the kit file), per-track
 faded-voice stop), and a finalised parameter layout. v1.5 is the intended last
 release with breaking parameter changes. `ReBuzz vs` still `?` — stamp the build.
 
+**Manual add (2026-06-16):** added **pedal-bench** (v1.0, new) — an A/B benchmark
+control machine that mechanises `ReBuzz_AB_Comparison_Protocol.md`: Start run sets
+the transport playing, stops it at exactly Run Secs (default 300), excludes the
+warmup window, and emits a matrix-ready row. Reuses PP2's measurement definitions
+(§§3,4,6,7) without the inspector; per-machine engine perf via fail-closed reflection
+on `performanceDataCurrent` (Core §40). README only, no dedicated addendum. `ReBuzz vs`
+stamped 1827-preview (the build it was tested on). Single-machine edit, not a full
+GitHub pull — `Last refreshed` above is unchanged.
+
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
 machines need touching?" by grepping for the relevant Core/Build
@@ -113,6 +122,7 @@ below, separate from the dev/impact-analysis roster.
 | pedal-shaper            | effect     | 2026-05-16  | ?             |          | Waveshaper distortion                                      |
 | pedal-tracker           | tracker    | 2026-05-22  | 1827-preview  | Y        | Tracker machine — Matilde-compatible                       |
 | pedal-zplane            | effect     | 2026-05-07  | ?             |          | Z-Plane filter (4-corner morph)                            |
+| pedal-bench             | diagnostic | 2026-06-16  | 1827-preview  |          | A/B benchmark harness — runs the song 5 min, emits a matrix row |
 
 ReBuzz versions in this table come from the "Updated with findings
 from …" log at the top of `ReBuzz_ManagedMachine_Notes_Core.md`, from
