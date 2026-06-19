@@ -44,6 +44,20 @@ on `performanceDataCurrent` (Core §40). README only, no dedicated addendum. `Re
 stamped 1827-preview (the build it was tested on). Single-machine edit, not a full
 GitHub pull — `Last refreshed` above is unchanged.
 
+**Manual add (2026-06-20):** added **pedal-drummatrix** (v1.3, new) — a
+drum-centric 6-slot serial multi-effect built around a BCR2000, with a
+dedicated handoff (`drum_matrix_HANDOFF.md`, `Addendum=Y`). Ten effects per
+slot (Bitcrush/Drive/Filter/RingMod/Comb/Stutter/Delay/Reverb/Gate/Resonator),
+click-free Mode crossfades, a global feedback loop, an envelope follower + a
+tempo-synced LFO routed per-slot to Char, a tuned Resonator slot type with
+global Key/Scale, and a live-anchored scene morph. Ships a 30-preset bank
+(`Pedal Drum Matrix.prs.xml`). Single-machine edit, not a full GitHub pull —
+`Last refreshed` above is unchanged. **Repo slug `pedal-drummatrix` assumed by
+analogy to `pedal-drumgrid` — confirm against the actual push and correct if
+needed.** `ReBuzz vs` left `?` (no hard version pin — all params are appended,
+no multi-track pvalues collision; stamp the build it was tested on). Perf was
+measured (PP2 ENGINE ~3% flat; the DSP is free next to the host floor).
+
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
 machines need touching?" by grepping for the relevant Core/Build
@@ -79,7 +93,7 @@ below, separate from the dev/impact-analysis roster.
 
 ---
 
-## Roster (39 machines)
+## Roster (41 machines)
 
 | Repo                    | Type       | Last pushed | ReBuzz vs     | Addendum | Description                                                |
 |-------------------------|------------|-------------|---------------|----------|------------------------------------------------------------|
@@ -91,6 +105,7 @@ below, separate from the dev/impact-analysis roster.
 | pedal-dly-PCM41         | effect     | 2026-05-05  | 1819-preview  |          | PCM41-style tape delay                                     |
 | pedal-do-nuttin         | template   | 2026-05-12  | ?             |          | "Do nothing" machine — minimal scaffold                    |
 | pedal-drumgrid          | generator  | 2026-06-13  | ?             | Y        | Multi-out 16-lane drum sampler — routable buses, swing/humanize, embedded kits|
+| pedal-drummatrix        | effect     | 2026-06-20  | ?             | Y        | 6-slot drum multi-fx — feedback loop, env/LFO mod, tuned resonator, scene morph|
 | pedal-eq                | effect     | 2026-05-17  | 1819-preview  |          | EQ effect (Core §33 source: v1.3 WM_NOIO handling)         |
 | pedal-Faze-R            | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
 | pedal-fft               | effect     | 2026-05-02  | ?             |          | FFT distortion with harmonics                              |
@@ -136,7 +151,7 @@ time, not evidence the machines are stale.
 
 ## Machines with detailed addenda
 
-Ten machines have their own notes file, listed in table order. To support
+Eleven machines have their own notes file, listed in table order. To support
 impact analysis, each should grow a `## Depends on` section listing the
 Core/Build §-references it relies on. The lists below are seeds — flesh
 out from each addendum as time allows.
@@ -173,6 +188,33 @@ out from each addendum as time allows.
   §7.1, §7.7, §2.3; Chord §3, §11 (swing); M1 §2, §2.1; PedalTracker §13.1.
   Not pinned to 1827 (global triggers don't collide; the pvalues recovery was
   removed) — stamp the actual build.
+
+### pedal-drummatrix — `drum_matrix_HANDOFF.md`
+- Drum-centric 6-slot serial multi-effect (one stereo `Work`). Each slot runs
+  one of ten effects (Bitcrush/Drive/Filter/RingMod/Comb/Stutter/Delay/Reverb/
+  Gate/Resonator) with Amount/Char/Mode macros; Mode is a click-free crossfade
+  between the two modes, not a hard switch. A global feedback loop, an envelope
+  follower and a tempo-synced LFO route per-slot into Char (the slot is
+  source-agnostic — the machine hands it one combined offset). The tuned
+  Resonator slot turns hits melodic in a global Key/Scale; the LFO can sequence
+  its pitch. A live-anchored scene morph (scene A = live params, Store captures a
+  target, Morph blends) persists its target in `MachineState`. Ships a 30-preset
+  `.prs.xml`. The reusable findings are the source-agnostic per-slot modulation
+  bus, the self-limiting (in-loop tanh + DC-blocker) global feedback, the
+  default-interface-method musical-context hook for the Resonator, and the
+  reflection-based name-keyed scene snapshot.
+- Depends on: Build §1.2 (csproj — fully compliant, six properties), §1.3
+  (deploy → `Gear\Effects`; also ships a preset bundle), §2 (`.NET`
+  AssemblyName), §3 (`.prs.xml` preset format + auto-load naming); Core §2
+  (effect `Work` classification), §33 (WM_NOIO tail handling — tail-aware sleep
+  ORs every slot with the feedback loop), §38 (±32768 sample scale), §39
+  (`MachineState` framed `byte[]`, name-keyed); PedalComp §1 (±32768 range), §5
+  (fast curve approx — evaluated, not needed per the perf verdict); Presets §3
+  (`Preset.Apply` / `.prs.xml`); PedalProfiler2 §2 + Core §§34–35 (ENGINE vs
+  SOLO — perf measured ~3% flat, host-floor dominated); PedalTracker §13.1
+  (direct-property-write trap — avoided; the morph reads params and snapshots to
+  `MachineState`). net10.0-windows; not pinned to a ReBuzz preview — stamp the
+  build it was tested on.
 
 ### pedal-Faze-R — `ReBuzz_ManagedMachine_Notes_PedalFazeR.md`
 - 8-voice polyphonic phase-distortion synth (Casio CZ lineage): two PD
@@ -279,12 +321,12 @@ block of each into the song-writer's `refs/`).
 
 ## Gaps and orphans
 
-- **29 machines have no dedicated addendum.** That's fine — most don't
+- **30 machines have no dedicated addendum.** That's fine — most don't
   need one. Add an addendum only when a machine surfaces non-obvious
   findings worth recording, or when its setup deviates from Core/Build
   conventions in a way future-you will need to remember. (Newest without
-  one: **pedal-juno106**.)
-- **24 machines have an unknown ReBuzz version.** Not necessarily a
+  one: **pedal-bench**.)
+- **25 machines have an unknown ReBuzz version.** Not necessarily a
   problem, but when ReBuzz changes in a way that might affect them,
   the answer to "is this still good?" is "build it and find out."
   Stamping the version in each machine's `README.md` would close this
