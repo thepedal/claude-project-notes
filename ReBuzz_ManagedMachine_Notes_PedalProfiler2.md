@@ -5,6 +5,11 @@ Updated through Pedal Profiler2 v1.7.7 on ReBuzz 1827-preview (§§3, 5, 6,
 8 and the §13 case study — MasterTap GUI-thread event, SubTickResolution
 and AudioBufferFillThread, the spike-cooldown statistics gotcha, and a
 two-build comparison).
+Updated again at v1.8 / v1.9–v1.9.2 on ReBuzz 1833-preview (§9, §14 —
+file+clipboard delivery, v2 dump format with self-describing run
+context, per-chunk OtherMs percentiles, bimodal-distribution finding
+under the fill thread, the `(idle)` perfData gap that turns
+`Engine Total` into a lower bound on multi-machine songs).
 
 Pedal Profiler2 is a single-machine inspector — a follow-on to Pedal
 Profiler v1 (the global CPU dashboard). It coexists with v1 and adds
@@ -480,24 +485,145 @@ audio reality.
 
 ## 9. Reflection-dump diagnostic
 
-The "Dump Internals (DC)" button walks `IBuzz`, `Song`, the selected
-`IMachine`, a parameter, and the snapshot via reflection, and writes
-the entire structure to ReBuzz's Debug Console. Two phases:
+The **Dump → File + Clipboard** button writes a single, self-describing,
+markdown-fenced diagnostic to a timestamped file under
+`Documents\ReBuzz PP2 Dumps\` and also copies it to the system clipboard.
+A status line next to the button shows path + size (green on success,
+amber on partial failure, red if both paths failed). The Debug Console
+receives one summary line — no longer the firehose.
 
-- **Phase 1** — top-level walk at depth 1: every property and field
-  of the root objects, formatted as `name : type : value`, with
-  collection counts and brief previews
-- **Phase 2** — drill into specific objects of interest
-  (`BuzzPerformanceData`, `AudioEngine`, `EngineSettings`,
-  `MachinePerformanceData`)
+This is the **v2 dump format** introduced in v1.9 (per the spec in
+`ReBuzz_PP2_DumpSpec.md`). The earlier v1 format wrote the entire
+reflection walk to the Debug Console; it survives as **verbose mode** but
+is opt-in via a checkbox next to the dump button. The default dump is the
+signal — designed to be pasted into a chat or issue and read top-to-bottom
+without external context.
 
-The dump output is the primary tool for discovering new ReBuzz APIs.
-The chunking finding, the engine-perf finding, and the MasterTap
-subscription path all started with reflection dumps that surfaced
-fields not previously known to be reachable. Run it against a
-specific machine in a specific state, paste the output, iterate.
+### 9.1 What the default dump contains
 
-### 9.1 Output format
+Eight blocks, in trustworthy-first order:
+
+```
+═══ PP2 DUMP  2026-06-29 00:53:25 │ PP2 v1.9.2 │ ReBuzz Build 1833 ═══
+
+PP2 v1 | t=19.8 | chunk=3.99 | other_p50=0.20 p90=0.57 p99=41.26 max=43.64 |
+drop=8.73% wdrop=6 ovr=21.4/s peak=TRANSIENT | g2=8 g2age=na |
+eng=0.6% unacc=99.4% | play=1 bpm=126 |
+mach=24(a24 m0 b0 s0 c1 n1) | asio=288 chunk_smp=191 ratio=1.51 |
+qpc=10000000
+
+── RUN CONTEXT ─── (transport, song, BPM, ASIO buffer, settings, graph)
+── PER-CHUNK TIMING ─── (OtherMs p50/p90/p99/max from the ring + peak class)
+── DROPOUTS / OVERRUNS ─── (WindowDropouts, Total%, overruns/s)
+── COST DECOMPOSITION ─── (Engine Total / Unaccounted with verdict band)
+── PER-MACHINE COST ─── (sorted table from the running EMA)
+── GC ─── (Gen0/1/2 counts + rates, heap MB, last-G2 age)
+── SPIKES ─── (recorded ring, full ActiveMachines, cooldown caveat inline)
+── LEGEND ─── (trust-vs-artifact reminders at the foot of every dump)
+```
+
+The single line under the header is **machine-readable** (versioned with
+the `PP2 v1` token, pipe-delimited groups, `key=value` within). It exists
+so a sequence of dumps from an A/B optimisation session can be diffed or
+plotted by script. Bump the version token (`v1`→`v2`) on any field
+change.
+
+### 9.2 The per-chunk OtherMs ring
+
+The machine maintains a fixed-size (4096-slot) circular ring of every
+chunk's `otherTicks` value, written from `Work()` on the audio (fill)
+thread. At dump time the GUI snapshots it via `CopyRecentOtherMs`. At
+typical chunk cadence (~250/s) the ring holds ~16 s of recent history,
+enough for stable percentiles in an A/B window. Aligned 64-bit writes on
+x64 are atomic — no locks, and a one-sample torn read on the boundary is
+noise for percentiles over thousands of samples.
+
+The four percentiles (p50, p90, p99, max) are computed at dump time by
+sorting a copy and indexing (nearest-rank). `n` and approximate window
+seconds are printed alongside so a short observation window can't
+masquerade as a precise one.
+
+### 9.3 Trustworthy-first ordering and the legend
+
+The dump deliberately demotes `AvgOtherMs` and `CpuPct`. They're
+buffer-cycle **utilisation** metrics, ≈100% both when healthy and when
+saturated, and have caused the wrong call on multiple investigations.
+They're still emitted (some downstream habits read them) but tagged
+inline as "NOT cpu". The same labelling applies to `TotalDropouts%` and
+`max OtherMs` when `driver:chunk ratio > 3` (cadence-inflated; Core
+§34.1). The foot of every dump carries a TRUST/LABEL/NOTE legend so a
+fresh reader can't misread `CpuPct 99.99%` as "no headroom".
+
+### 9.4 ASIO buffer — registry read, not inference
+
+The driver buffer size is read from
+`HKCU\Software\ReBuzz\{ASIO|WASAPI}\BufferSize` (where ReBuzz itself
+stores it; AudioEngine.cs:99). Never inferred from `Work()` timing —
+that inference broke under the fill thread (Core §34.5 / §41.2). When
+the registry entry is absent the dump prints `unknown` and omits the
+driver:chunk ratio. The driver name comes from `buzz.SelectedAudioDriver`
+(starts-with "ASIO" or contains "WASAPI").
+
+### 9.5 The driver:chunk ratio artifact flag
+
+`asio_smp / chunk_smp`. When `> 3`, the dump tags `TotalDropouts%` and
+`max OtherMs` as cadence-inflated. The reasoning: a large ASIO buffer
+holding many chunks means a stall recorded by PP2 may span multiple
+chunks of inactivity that aren't really "lost work" — they're just one
+event spread across the chunk cadence. This makes the §6.4 cooldown
+skepticism explicit for the dropout%/peak rather than hidden as tribal
+knowledge.
+
+### 9.6 The peak class — TRANSIENT vs SUSTAINED
+
+A rare large `max` doesn't mean a recurring cost; a frequent large `max`
+does. The dump counts ring samples exceeding 2×p99 against a 0.5%-of-window
+sparsity threshold:
+
+- Few sparse hits → `TRANSIENT  (max exceeded 2×p99 on N/M chunks ≈ 1 / X s)`
+- Many → `SUSTAINED  (N/M chunks exceeded 2×p99 — recurring cost)`
+- Zero → `TRANSIENT  (max ≤ 2×p99 — no extremes)`
+
+This generalises the §6.4 cooldown skepticism (about spike *rate*) to the
+peak: never let a max imply a recurring cost without a sparsity check.
+
+### 9.7 Per-machine cost: `(idle)` vs `(warming up)` vs `n/a (native)`
+
+The per-machine table reads the existing 1-second EMA-smoothed values
+from `MachinePerformanceData` (no blocking pause at dump time — the
+running UI tick has been polling all non-control machines continuously).
+Each row falls into one of four states:
+
+- **real %** — `UpdateEngineCost` returned a valid smoothed value
+- **`(idle)`** — entry has been seeded across many UI ticks but every
+  read returned `deltaSamp == 0`. The machine's `SampleCount` counter
+  never advances. Likely a sample player or generator that ReBuzz's
+  engine doesn't update `MachinePerformanceData` for in every buffer.
+- **`(warming up)`** — no usable read yet (genuinely too early)
+- **`n/a (native)`** — native (e.g. `Master`); counters stay at zero
+  forever (Core §35.3)
+
+The distinction between `(idle)` and `(warming up)` matters because the
+former is a *durable* signal about that machine class on this ReBuzz
+build — see §14 for what it implies for `Engine Total`.
+
+### 9.8 Verbose mode (the old firehose)
+
+A checkbox next to the Dump button toggles **verbose**. When on, the
+default dump is followed by a Phase 2 reflection walk: every property
+and field of `IBuzz`, `Song`, the selected `IMachine`, one of its
+parameters, the v2 snapshot, and the perf/engine objects (`AudioEngine`,
+`engineSettings`, both `MachinePerformanceData` instances, one
+`Spike2Record`).
+
+This is how new ReBuzz APIs get discovered. The chunking finding, the
+engine-perf finding, the MasterTap-event change, and `AudioBufferFillThread`
+all began with verbose dumps that surfaced fields not previously known to
+be reachable. Pattern: ship a build with a new `DumpObject(GetProp(buzz,
+"X"), label, Line, 1)` line, run, paste, iterate. Most new ReBuzz findings
+in Core §§34–41 came from 2–4 such cycles.
+
+### 9.9 Output format (Phase 2 / verbose)
 
 ```
 ── IMachine 'MComp' ──
@@ -516,15 +642,6 @@ specific machine in a specific state, paste the output, iterate.
 Collection counts and short previews keep the output compact. Complex
 objects show as `TypeName` with a brief ToString preview. Field/property
 counts in the header help spot when a build adds new surface.
-
-### 9.2 Adding to the dump
-
-When investigating a new question, add another
-`DumpObject(GetProp(buzz, "X"), label, Line, 1)` line to the Phase 2
-section, ship a build, run, paste the dump back. The pattern works
-well: each round narrows the search space by a level of nesting. Most
-new ReBuzz findings in §§34–40 (Core) emerged from 2–4 dump-iteration
-cycles.
 
 ---
 
@@ -687,3 +804,124 @@ now with a stronger evidence package: a one-Juno song (0.3% engine cost)
 shows 99.7% unaccounted per chunk and SOLO pinned at 100%; `Low` +
 `AudioBufferFillThread` help ~18% relative; the floor is host overhead,
 not machine work, not buffer cushioning, not any user-reachable setting.
+
+---
+
+## 14. The 1833 follow-up — what percentiles revealed, and what they don't say
+
+The v1.9 dump format (§9) was built to capture every metric needed for
+host-overhead diagnosis in a single self-describing artifact (per
+`ReBuzz_PP2_DumpSpec.md`). Validating it on ReBuzz 1833 surfaced two
+findings that refine — but don't overturn — the May 2026 conclusion.
+
+### 14.1 OtherMs is bimodal under AudioBufferFillThread
+
+The first 1833 dumps came from a 24-machine song (SH101 + 20 sample
+players + a gain stage + Master). The per-chunk distribution:
+
+```
+other_p50=0.20  p90=0.57  p99=41.26  max=43.64   (n=4096 chunks)
+```
+
+That is a strongly bimodal distribution: **median chunk costs 0.2 ms,
+90% of chunks cost under 0.6 ms, but the worst 1% are pinned at ~40 ms**
+— ten times the budget. The earlier 1826/1827 single-Juno sessions
+showed `Unaccounted ≈ 5 ms` flat across measurements, and we interpreted
+that as a constant per-chunk host floor. With the percentile shape
+visible, that interpretation needs sharpening.
+
+Under `AudioBufferFillThread` (Core §41), the fill thread is decoupled
+from the ASIO callback by a ring buffer:
+
+- **When the ring is empty** the fill thread bursts back-to-back chunks
+  as fast as it can — `Work()`-to-`Work()` gaps are microseconds.
+- **When the ring is full** the fill thread sleeps on its 1 ms
+  multimedia timer — `Work()`-to-`Work()` gaps grow to ~10 ms or more
+  depending on how the ring drains.
+
+PP2's `OtherMs` is measured between consecutive `Work()` calls, so under
+the fill thread it is **the fill-thread schedule**, not the per-chunk
+processing cost. The 1826/1827 ~5 ms flat reading was an *averaged*
+artifact: under heavy load the fill thread couldn't get ahead, so chunks
+arrived at the chunk cadence and `OtherMs` ≈ budget every time. Under
+the light 1833 load (24 machines, ENGINE total <1%) the fill thread
+races ahead and rests, so the median chunk-gap collapses to ~0 and a
+small fraction of gaps balloon to ~40 ms while the fill thread sleeps.
+
+The 40 ms gaps are **not** 40 ms of chunk work. They're 40 ms of
+*nothing happening* (from `Work()`'s perspective) while the ring drains.
+Real audible dropouts still occur — they happen when something stalls
+the fill thread long enough for the ring to underflow before the timer
+wakes it — but the 40 ms reading is the symptom (time since last
+`Work()`), not the cost.
+
+### 14.2 What that means for reading these dumps
+
+- **`OtherMs p50/p90`** under the fill thread reflect chunk processing
+  cost when the fill thread is keeping pace, and *light load* otherwise
+  (back-to-back filling). Useful for diff/plot across an A/B sequence
+  on the same song.
+- **`OtherMs p99/max`** under the fill thread reflect how often the
+  fill thread sleeps and for how long. *Cadence-influenced* in the same
+  sense that `TotalDropouts%` is when `driver:chunk > 3` — these are
+  symptom metrics, not cost metrics.
+- **`Unaccounted%`** is still a valid ceiling on host overhead — what
+  fraction of budget is not attributed to any tracked machine — but it
+  bundles "real host work" with "fill-thread idle gap" under the fill
+  thread.
+- **Per-machine `ENGINE%`** is the cleanest true-CPU measurement: it
+  reads `MachinePerformanceData.PerformanceCount` / `SampleCount`
+  deltas (QPC ticks per audio sample) and is fill-thread-independent.
+  This is the column to lead with for cost decisions.
+- **The Buffer Sweep** (§5.4) remains valid only with the fill thread
+  OFF — that's the way to see true per-chunk overhead across ASIO buffer
+  sizes.
+
+### 14.3 The `(idle)` perfData gap — `Engine Total` is a lower bound
+
+In the 1833 dumps, the 20 sample-player DoNuts consistently report
+`(idle)` in the per-machine table (§9.7): PP2 polls them every UI tick
+across many seconds but their `MachinePerformanceData.SampleCount` never
+advances. SH101 and PGainMul advance fine. Two plausible explanations:
+
+1. ReBuzz only updates per-machine perfData for machines that executed
+   non-trivial work in a given buffer (silent sample players are
+   skipped from accounting even when not muted).
+2. Certain machine kinds aren't tracked at all for perfData.
+
+Either way, the consequence for the dump is the same: **`Engine Total`
+is a lower bound on real engine work, not a complete sum**. On a
+single-Juno session every managed machine reports, so `Engine Total`
+was airtight. On a 24-machine sample-heavy session 22 out of 22 managed
+machines but only 2 advance counters, so the headline 0.6% understates
+the true machine cost — and conversely the 99.4% `Unaccounted` bundles
+"host overhead" with "untracked machine work".
+
+The dump tags `(idle)` rows explicitly so the reader can see when this
+applies. A future refinement worth shipping: when one or more `(idle)`
+rows are present, append a one-line caveat under `Engine Total`:
+
+```
+Engine Total  0.024 ms (0.6%)  n=2 managed (+20 idle, +1 native)
+                                ^ lower bound — 20 machines reported (idle)
+```
+
+### 14.4 The standing recommendation, refined
+
+The May 2026 finding stands: per-chunk host overhead is the binding
+constraint, and the 1827 optimisations help ~18% relative but don't
+move the floor. What the 1833 dumps refine:
+
+1. The percentile shape under the fill thread is bimodal, and `p99/max`
+   are fill-thread-schedule artifacts on light-load songs. For an A/B
+   optimisation series, **compare percentiles dump-to-dump on the same
+   song**; don't read them as absolute per-chunk costs.
+2. `Engine Total` is the most trustworthy machine-side cost, but on
+   sample-heavy songs it's a lower bound until ReBuzz tracks perfData
+   for all kinds of machines (or until PP2 finds another path — the
+   stereo/Sample-array side channels haven't been explored).
+3. The cleanest upstream evidence remains a **single-machine song with
+   the fill thread off**: chunk cost is meaningful in absolute terms,
+   `Engine Total` is complete, and the Buffer Sweep maps ASIO buffer
+   size → per-chunk overhead unambiguously. Multi-machine sessions are
+   good for stress-testing the host but less good for a clean number.
