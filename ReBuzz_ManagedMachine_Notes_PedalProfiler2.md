@@ -10,6 +10,12 @@ file+clipboard delivery, v2 dump format with self-describing run
 context, per-chunk OtherMs percentiles, bimodal-distribution finding
 under the fill thread, the `(idle)` perfData gap that turns
 `Engine Total` into a lower bound on multi-machine songs).
+Updated at v1.9.3 on ReBuzz 1834-preview (§§9.3–9.5, §9.10, §15 — the
+cadence-inflation flag extended to the whole dropout family per perf
+handoff 2026-07-04e §10, trust map rewritten with `WindowDropouts` and
+`OtherMs p99/max` moved out of TRUST, machine-readable line bumped
+`PP2 v1` → `PP2 v2` with `ci=` and `athreads=` fields, `UseCachedWorkOrder`
+and `AudioThreads` surfaced in Run Context).
 
 Pedal Profiler2 is a single-machine inspector — a follow-on to Pedal
 Profiler v1 (the global CPU dashboard). It coexists with v1 and adds
@@ -504,17 +510,18 @@ without external context.
 Eight blocks, in trustworthy-first order:
 
 ```
-═══ PP2 DUMP  2026-06-29 00:53:25 │ PP2 v1.9.2 │ ReBuzz Build 1833 ═══
+═══ PP2 DUMP  2026-07-04 21:41:39 │ PP2 v1.9.3 │ ReBuzz Build 1834 ═══
 
-PP2 v1 | t=19.8 | chunk=3.99 | other_p50=0.20 p90=0.57 p99=41.26 max=43.64 |
-drop=8.73% wdrop=6 ovr=21.4/s peak=TRANSIENT | g2=8 g2age=na |
-eng=0.6% unacc=99.4% | play=1 bpm=126 |
-mach=24(a24 m0 b0 s0 c1 n1) | asio=288 chunk_smp=191 ratio=1.51 |
+PP2 v2 | t=45.5 | chunk=2.80 | other_p50=0.44 p90=0.79 p99=37.38 max=42.76 |
+drop=9.97% wdrop=7 ovr=33.2/s peak=TRANSIENT ci=1 | g2=11 g2age=21 |
+eng=33.6% unacc=66.4% | play=1 bpm=126 |
+mach=35(a35 m0 b0 s0 c1 n1) | asio=3968 chunk_smp=134 ratio=29.61 athreads=8 |
 qpc=10000000
 
-── RUN CONTEXT ─── (transport, song, BPM, ASIO buffer, settings, graph)
-── PER-CHUNK TIMING ─── (OtherMs p50/p90/p99/max from the ring + peak class)
-── DROPOUTS / OVERRUNS ─── (WindowDropouts, Total%, overruns/s)
+── RUN CONTEXT ─── (transport, song, BPM, ASIO buffer, chunk period, driver:chunk ratio,
+                    AudioThreads, engine settings incl. UseCachedWorkOrder, graph counts)
+── PER-CHUNK TIMING ─── (OtherMs p50/p90/p99/max + regime-aware p99/max caveat + peak class)
+── DROPOUTS / OVERRUNS ─── (WindowDropouts, Total%, overruns/s — all flagged when ratio > 3)
 ── COST DECOMPOSITION ─── (Engine Total / Unaccounted with verdict band)
 ── PER-MACHINE COST ─── (sorted table from the running EMA)
 ── GC ─── (Gen0/1/2 counts + rates, heap MB, last-G2 age)
@@ -523,10 +530,10 @@ qpc=10000000
 ```
 
 The single line under the header is **machine-readable** (versioned with
-the `PP2 v1` token, pipe-delimited groups, `key=value` within). It exists
+the `PP2 v2` token, pipe-delimited groups, `key=value` within). It exists
 so a sequence of dumps from an A/B optimisation session can be diffed or
-plotted by script. Bump the version token (`v1`→`v2`) on any field
-change.
+plotted by script. Bump the version token on any field change — see
+§9.10 for the current schema and the v1 → v2 evolution.
 
 ### 9.2 The per-chunk OtherMs ring
 
@@ -543,36 +550,82 @@ sorting a copy and indexing (nearest-rank). `n` and approximate window
 seconds are printed alongside so a short observation window can't
 masquerade as a precise one.
 
-### 9.3 Trustworthy-first ordering and the legend
+### 9.3 Trust map and the legend (revised v1.9.3, perf handoff §10)
 
-The dump deliberately demotes `AvgOtherMs` and `CpuPct`. They're
+The dump deliberately demotes `AvgOtherMs` and `CpuPct` — they're
 buffer-cycle **utilisation** metrics, ≈100% both when healthy and when
 saturated, and have caused the wrong call on multiple investigations.
-They're still emitted (some downstream habits read them) but tagged
-inline as "NOT cpu". The same labelling applies to `TotalDropouts%` and
-`max OtherMs` when `driver:chunk ratio > 3` (cadence-inflated; Core
-§34.1). The foot of every dump carries a TRUST/LABEL/NOTE legend so a
-fresh reader can't misread `CpuPct 99.99%` as "no headroom".
 
-### 9.4 ASIO buffer — registry read, not inference
+**Cadence inflation moves more than those two.** At `driver:chunk > 3`
+the whole dropout family is referenced to the *internal chunk budget*,
+not the *ASIO deadline*, and every field cadence-inflates together. The
+episode that forced this was perf handoff §6.1 (July 2026): a ~10%
+`TotalDropouts%` and ~35 ms `PeakOtherMs` on `det_grid_hv_08x04` looked
+catastrophic; audio was audibly clean; the audibility was the ground
+truth. `WindowDropouts` had been in TRUST and was the specific field
+that made the false alarm look real.
 
-The driver buffer size is read from
-`HKCU\Software\ReBuzz\{ASIO|WASAPI}\BufferSize` (where ReBuzz itself
-stores it; AudioEngine.cs:99). Never inferred from `Work()` timing —
-that inference broke under the fill thread (Core §34.5 / §41.2). When
-the registry entry is absent the dump prints `unknown` and omits the
-driver:chunk ratio. The driver name comes from `buzz.SelectedAudioDriver`
-(starts-with "ASIO" or contains "WASAPI").
+Trust map as of v1.9.3, matching the dump's own legend:
 
-### 9.5 The driver:chunk ratio artifact flag
+- **TRUST**: `ears · OtherMs p50/p90 · per-machine ENGINE% · GC last-G2 age · Unaccounted%`
+- **DISTRUST as audible-dropout proxies** (all cadence-inflate together
+  at `driver:chunk > 3`): `TotalDropouts%, WindowDropouts, overruns/s,
+  OtherMs p99/max, PeakOtherMs`
+- **LABEL**: `AvgOtherMs / CpuPct` = buffer-cycle utilisation (≈100%
+  healthy AND saturated) — not CPU
+- **LABEL**: `p99 / max` under `FillThread=ON` reflect fill-thread sleep
+  gaps, not chunk cost (§14.2). At `ratio > 3` AND `FillThread=ON`, both
+  regimes are active — treat as symptom only.
+- **NOTE**: `Overrun rate / SpikeRawTotal` = per-cycle **tally**, not
+  distinct large events
 
-`asio_smp / chunk_smp`. When `> 3`, the dump tags `TotalDropouts%` and
-`max OtherMs` as cadence-inflated. The reasoning: a large ASIO buffer
-holding many chunks means a stall recorded by PP2 may span multiple
-chunks of inactivity that aren't really "lost work" — they're just one
-event spread across the chunk cadence. This makes the §6.4 cooldown
-skepticism explicit for the dropout%/peak rather than hidden as tribal
-knowledge.
+The dump enforces this row-by-row: every dropout-family row carries
+`[cadence-inflated; ratio>3]` when applicable, and the PER-CHUNK TIMING
+section has an indented `↳ p99/max caveat` row naming the active
+regime(s) so the reader can't miss it. Ears remain ground truth.
+
+### 9.4 ASIO buffer and AudioThreads — registry reads, not inference
+
+Two registry values are read at dump time, both under
+`HKCU\Software\ReBuzz\`:
+
+- **`{ASIO|WASAPI}\BufferSize`** — where ReBuzz stores the user's
+  driver buffer choice (`AudioEngine.cs:99/174`). Never inferred from
+  `Work()` timing — that inference broke under the fill thread
+  (Core §34.5 / §41.2). When absent, the dump prints `unknown` and
+  omits the driver:chunk ratio. Driver selection comes from
+  `buzz.SelectedAudioDriver` (starts-with "ASIO" or contains "WASAPI").
+- **`Settings\AudioThreads`** — worker-thread count for the
+  multi-thread audio dispatch (default 4; the perf handoff rig runs 8).
+  Directly affects barrier / straggler behaviour on wide songs, so
+  surfaced per-dump for reproducibility. Not a live property on
+  `ReBuzzCore` — the registry is the only source. When absent, the
+  dump prints `unknown [no registry entry — default 4]`.
+
+Added in v1.9.3 (perf handoff 2026-07-04e §1 / §6.2 context).
+
+### 9.5 The driver:chunk ratio artifact flag — extended to the whole family
+
+`asio_smp / chunk_smp`. When `> 3`, the dump tags **every** dropout-family
+row as cadence-inflated:
+
+- `TotalDropouts%`
+- `WindowDropouts`  *(added in v1.9.3; had been in TRUST before)*
+- `Overrun rate` / `overruns/s`  *(added in v1.9.3)*
+- `OtherMs p99` and `max`  *(added in v1.9.3, as an indented caveat row
+  under `PER-CHUNK TIMING`)*
+- `PeakOtherMs` (implicit; carries the p99/max caveat)
+
+The reasoning: a large ASIO buffer holding many chunks means a stall
+recorded by PP2 may span multiple chunks of "over-internal-budget"
+tally that never miss the real driver deadline. On the perf handoff
+song at `ratio = 29.61`, ~29 internal chunks fit in one ASIO callback —
+so the raw counters are literally ~29× overstated relative to what the
+driver sees. All of that is now labelled at the row level, not just in
+the legend.
+
+`v1.9.3` also introduces `ci=0|1` in the machine-readable line (§9.10)
+so a diffing script can gate on a single boolean.
 
 ### 9.6 The peak class — TRANSIENT vs SUSTAINED
 
@@ -642,6 +695,49 @@ in Core §§34–41 came from 2–4 such cycles.
 Collection counts and short previews keep the output compact. Complex
 objects show as `TypeName` with a brief ToString preview. Field/property
 counts in the header help spot when a build adds new surface.
+
+### 9.10 Machine-readable line schema (versioned)
+
+Under the header, the dump emits a single pipe-delimited line designed
+for scripted diff/plot across a dump sequence. The first token is the
+schema version; bump it on any field change so a parser can pin.
+
+**Current: `PP2 v2`** (v1.9.3 onwards):
+
+```
+PP2 v2 | t=<sec> | chunk=<ms> |
+other_p50=<ms> p90=<ms> p99=<ms> max=<ms> |
+drop=<pct>% wdrop=<int> ovr=<per-sec> peak=<TRANSIENT|SUSTAINED|UNKNOWN> ci=<0|1> |
+g2=<count> g2age=<sec|na> |
+eng=<pct>% unacc=<pct>% |
+play=<0|1> bpm=<int> |
+mach=<total>(a<active> m<muted> b<bypassed> s<soloed> c<control> n<native>) |
+asio=<smp|unknown> chunk_smp=<int> ratio=<float|na> athreads=<int|na> |
+qpc=<hz>
+```
+
+Field notes:
+- `ci=1` — the whole dropout family (`drop`, `wdrop`, `ovr`, `p99`,
+  `max`) is cadence-inflated at this song's `driver:chunk > 3`. A
+  diffing script should suppress those five columns from comparison
+  when `ci=1`.
+- `athreads=<N>` — from `HKCU\Software\ReBuzz\Settings\AudioThreads`
+  (default 4). Directly affects barrier / straggler behaviour.
+- `g2age=na` — Gen 2 collections have happened but PP2's tracker
+  hasn't observed a transition since load (the count was already > 0
+  at first poll).
+
+**Evolution:**
+
+- **v1** (PP2 v1.9 – v1.9.2): no `ci=` or `athreads=` fields; every
+  other field present and order-stable.
+- **v2** (PP2 v1.9.3+): added `ci=` in the dropout group and
+  `athreads=` in the ASIO group. All v1 fields present and order-stable
+  before/after the additions.
+
+A v1-pinned parser will still read v2 dumps correctly for the v1 fields
+it knows about; it just won't see `ci=` or `athreads=`. Prefer pinning
+to v2 for anything reading dumps from v1.9.3 onwards.
 
 ---
 
@@ -925,3 +1021,99 @@ move the floor. What the 1833 dumps refine:
    `Engine Total` is complete, and the Buffer Sweep maps ASIO buffer
    size → per-chunk overhead unambiguously. Multi-machine sessions are
    good for stress-testing the host but less good for a clean number.
+
+---
+
+## 15. The 1834 follow-up — cadence inflation, and PP2 as a diagnostic partner
+
+The ReBuzz perf handoff (`ReBuzz_Perf_Handoff_2026-07-04e.md`) documents
+a July 2026 investigation that traced a perceived `~10% dropouts` /
+`~35 ms` peaks / `~35/s` overruns finding on `det_grid_hv_08x04` (35
+machines: 32 Pedal Hallverbs + Bass + Master + PP2) to a **PP2
+measurement artifact**, not an audio defect. Audio was audibly clean in
+both `AudioBufferFillThread` ON and OFF modes. Root cause: the whole
+dropout family is referenced to the *internal chunk budget*, not the
+*ASIO deadline*, and at this song's `driver:chunk ratio = 29.61` the
+counters over-report by roughly the ratio (§9.3, §9.5). PP2 v1.9.3
+implements the fix requested in the handoff's §10.
+
+### 15.1 What v1.9.3 changed (perf handoff §10)
+
+Two categories of change, both pure labelling — no measurement or
+audio-path impact:
+
+**Cadence-inflation flag extended to the whole family.** Prior versions
+tagged `TotalDropouts%` and mentioned `max` only in the legend.
+`WindowDropouts` sat in TRUST and was specifically what made
+handoff §6.1 look like a real audio fault. v1.9.3:
+
+- `WindowDropouts` row: inline `[cadence-inflated; ratio>3]` when applicable
+- `Overrun rate` row: same
+- `OtherMs p99/max`: new indented `↳ p99/max caveat` row naming which
+  regime is active (`fill-thread-schedule` under `FillThread=ON`,
+  `cadence-inflated` at `ratio > 3`, or both)
+- PER-CHUNK TIMING section retitled `p50/p90 trust; p99/max symptom, see caveats`
+- Legend rewritten (§9.3): `WindowDropouts` and `OtherMs p99/max` moved
+  from TRUST to DISTRUST, whole family named explicitly
+
+**Two new engine-surface signals.** Both matter for the barrier work
+the handoff §6.2 identifies as the live lever:
+
+- `UseCachedWorkOrder` — new `EngineSettings` property in ReBuzz 1834
+  (PR #111). Reflection-read with a `HasUseCachedWorkOrder` flag so
+  older builds where the property doesn't exist show nothing rather
+  than a stale `OFF`. Rendered as `CachedWorkOrder=ON|OFF` in the engine
+  settings block.
+- `AudioThreads` — worker-thread count for the multi-thread audio
+  dispatch (default 4; handoff rig runs 8). Not a live property on
+  `ReBuzzCore` — read directly from `HKCU\Software\ReBuzz\Settings\
+  AudioThreads`. New Run Context row plus `athreads=N` in the
+  machine-readable line.
+
+Machine-readable line bumped v1 → v2 (§9.10): `ci=0|1` (whole-family
+cadence-inflated flag; diffing scripts should gate on it) and
+`athreads=N` added.
+
+### 15.2 The perf handoff dropout-counter finding, in one paragraph
+
+On `det_grid_hv_08x04`, three trunk dumps (fill ON ×2, fill OFF ×1) all
+showed ~10% `TotalDropouts%`, ~35/s `overruns`, ~35 ms `PeakOtherMs` —
+and all three were **audibly clean**. `LowLatencyGC = True`; GC ruled
+out on rate (~35/s far exceeds any plausible G2 rate; a single G2
+cannot cause continuous dropouts, §7.2). Median headroom is large:
+`OtherMs p50 ~0.4 ms` against a `~2.8 ms` chunk budget — the engine
+keeps pace easily; the tally is a budget-reference artifact, not
+saturation. Fill-ON vs fill-OFF barely moved the tally, ruling out the
+§14.1 fill-thread-sleep hypothesis as the source. The source is the
+`driver:chunk > 3` cadence inflation, present in both modes. Ears were
+ground truth; every counter would have led wrong.
+
+### 15.3 What this reinforces
+
+- **Never let a dropout counter substitute for listening** on a
+  `ratio > 3` song. The v1.9.3 labelling makes this immediate rather
+  than tribal.
+- **`Engine Total` and per-machine `ENGINE%` remain the cleanest cost
+  metrics** across every regime tested to date. On the perf handoff
+  song `Engine Total = 33.6%` (33 Hallverbs × ~1% each), the first
+  session where machine work is a nontrivial fraction of budget — a
+  strong measurement vehicle for barrier-timing work.
+- **PP2's own metrics can mislead an investigation**, and the mitigation
+  is inline labelling at the row (not just in the legend) so a fresh
+  reader can't miss what's cost vs symptom. §9.3 documents the standing
+  trust map so the next iteration doesn't repeat the drift.
+
+### 15.4 Deferred — Option 2 (deadline-referenced dropout counter)
+
+The handoff §10 also proposes a substantive change: a **deadline-referenced**
+counter that increments only when a run of chunks actually misses the
+ASIO buffer period (not the internal chunk budget). PP2 already has the
+ingredients (registry-read ASIO buffer + computed ratio). The one caveat
+is that with `FillThread=ON`, the true deadline is *ring underflow*, not
+the ASIO buffer period per se (§14.1 / §7.2 — real audible dropouts
+happen only when the ring underflows before the 1 ms timer wakes). So a
+deadline-referenced counter is clean with fill-thread OFF and needs an
+underflow-aware definition with it ON.
+
+Handoff recommendation followed: ship the labelling (v1.9.3), scope
+Option 2 against the fill-thread underflow semantics separately.
