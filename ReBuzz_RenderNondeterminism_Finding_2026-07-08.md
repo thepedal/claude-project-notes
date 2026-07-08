@@ -72,3 +72,57 @@ render match (anomaly-free renders must equal `fe9b9252…`), not by a single pa
 3. If trio: bisect #121 vs #123 (fresh-launch renders on each parent commit).
 4. Inspect #121's diff and the `resSamples`/output-scale path for the unscaled-buffer and
    priming-dropout races.
+
+---
+
+## Code-level analysis (2026-07-08, cont.) — trio fully exonerated, mechanisms localized
+
+### Entire trio cleared by inspection (garbage is PRE-EXISTING)
+- **#121** (`13b97d1`): only adds `Interlocked.Increment(ref DriverResets)` inside the
+  ASIO `DriverResetRequest` / WASAPI `PlaybackStopped` fault handlers, plus a static
+  counter + accessors. Touches no sample buffer / no render path. Cannot corrupt output.
+- **#122** (`cc52f7a`): read-only GUI meter tap (`MasterTapSamples`), already cleared.
+- **#123** (`7b227fb`): deterministic single-threaded output scale; bit-exact.
+- The "355deba only, not cd77415" evidence was never valid (cd77415 was only warm
+  3-in-session; garbage rate is low enough that 0/N there proves nothing). Treat the
+  nondeterminism as pre-existing, surfaced by rigorous byte-comparison.
+
+### Effect 1 — silent lead-in: mechanism found
+`WorkManager.MainAudioFillBuffer`: at a tick/subtick boundary, if `samplesToProcess`
+computes negative, the method does `return 0` **mid-fill, before the post-loop scale
+pass** (lines ~173–174 and ~183–184). A transient tick-counter inconsistency during
+warm-up yields a short/zero buffer → silent lead-in. Return value 0 (not `count`) likely
+read by the render as silence for that region.
+
+### Effect 2 — native-scale garbage: localized to the MT work-dispatch join
+- `MainAudioFillBuffer` fills native-scale sub-chunks in a `while` loop, then applies ONE
+  `*= 1/32768` pass over `[offset, offset+count)` AFTER the loop (WorkManager.cs ~246–261).
+- `ReadWork` writes output from `master.GetStereoSamples()` (lines 636–642) — correct only
+  if all worker writes are joined first.
+- Non-cached / groups-cached paths join with `Task.WaitAll`. The **algorithm-2 cached**
+  path (`HandleWorkAlgorithm2Cached`, ~963) instead uses a custom barrier in
+  `WorkThreadEngine`: `AddWork` (counter++, list.Add, allDoneHandle.Reset) →
+  `AllJobsAdded()` (workWaitHandle.Set) → `AllDoneEvent().WaitOne()`; workers drain via
+  `GetWorkItem`, run `TickAndWork`, then `WorkDone` (counter--, Set allDoneHandle at 0).
+- **Hazard:** `workWaitHandle` (start gate, a `ManualResetEvent`) is only reset inside
+  `GetWorkItem` when the list is found empty (line 139). When jobs ≈ workers, that reset
+  can lag past the *next* wave's `AllJobsAdded()`, letting a worker pick up next-wave jobs
+  early and thrashing the counter to 0 transiently mid-dispatch. workLock serialization
+  keeps the common case from hanging, but this is the classic barrier shape where a worker
+  can still be inside `TickAndWork` when `WaitOne()` releases → `GetStereoSamples` mixes a
+  half-written native-scale machine buffer → one sub-chunk of ≈(value×32768) garbage.
+  Matches: one sub-chunk wide, native scale, wandering, intermittent, MT-only.
+- This is the §6.2 / #107 barrier — the `dev-barrier-instr` stash already instruments it.
+
+### Decisive cheap experiment (do first)
+Toggle **Multithreading OFF** (or force single-thread work order) on the current
+`355deba` build and repeat the 8× fresh-launch `det_grid_08x04` renders. Garbage (and
+ideally the lead-in) vanishing ⟹ MT work-dispatch barrier confirmed as the source.
+Persisting ⟹ look elsewhere.
+
+### Needed to finish
+- Live engine settings: `Multithreading`, work `algorithm` (0/1/2), `UseCachedWorkOrder`
+  — determines which dispatch/join path is live (custom barrier vs `Task.WaitAll`).
+- If barrier-confirmed: add an assert/log in `ReadWork` right before `GetStereoSamples`
+  that `workEngine` reports zero in-flight (counter==0 AND no worker inside `TickAndWork`);
+  the `dev-barrier-instr` probes are the vehicle.
