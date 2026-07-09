@@ -321,3 +321,56 @@ vs at-MAFB-return probe.
    runnable across waves) as the concurrency source, now that order is proven correct.
 
 ### WORKAROUND (stands): UseCachedWorkOrder Off — proven 8/8 clean.
+
+---
+
+## ROOT CAUSE FOUND + FIX (2026-07-09): #122 buffer reuse vs HD recorder async queue
+
+### The recording path (what I'd missed)
+The HD recorder's `RenderAudio(buffer,256,...)` buffer is a **throwaway** — the drive task
+just pumps the engine. The recorded audio is captured via the **`MasterTap` event**
+(`Buzz_MasterTap`), NOT `MainAudioFillBuffer`'s output buffer. That's why the scale-probe
+(on the drive/MAFB buffer) found nothing while the wav had garbage — wrong buffer.
+
+### The bug
+`Buzz_MasterTap` does `bufferQueue.Add(samples)` — storing the **reference** to the
+MasterTap buffer and returning. `saveTask` (a background Task) `Take()`s from the queue and
+writes to disk **asynchronously**. But `MasterTapSamples` (#122, `cc52f7a`) releases the
+reuse buffer's in-flight flag in the `BeginInvoke` `finally`, i.e. as soon as the handler
+RETURNS (queued), not after `saveTask` has written it. With only 2 reuse buffers, at high
+throughput the audio thread laps the disk-bound `saveTask`, re-claims A/B, and OVERWRITES a
+chunk still sitting in the queue unwritten → torn/overwritten samples in the wav = the
+"garbage".
+
+### Why #122 is the regression
+Before #122, `MasterTapSamples` did `float[] samples = new float[count]` — a FRESH
+allocation per call, so every queued reference was unique and safe to retain. #122 replaced
+that with the 2-buffer reuse pool to drop the allocation → broke the recorder's async
+retention. (Earlier I exonerated #122 because it's read-only w.r.t. `resSamples` — true, but
+I missed the reuse-vs-async-consumer hazard.)
+
+### Every symptom explained
+- One-sub-chunk-wide (256 samples = 128 frames) = exactly one reuse buffer. Matches every
+  measured garbage window.
+- Wandering / intermittent = which buffer gets lapped depends on timing.
+- **cached+MT only = THROUGHPUT**: fast engine ⇒ saveTask lags ⇒ overwrite. MT-off or
+  cached-off ⇒ slow enough that saveTask keeps up ⇒ clean. (Not a logic difference — a
+  producer/consumer race that only manifests above a throughput threshold.)
+- Probe-sensitive (timing).
+- Also explains the silent lead-in class as the same family (buffer timing at start).
+
+### FIX (recorder-side, one line, both queue sites)
+`HDRecorderWindow.xaml.cs` `Buzz_MasterTap`:
+`bufferQueue.Add(samples);` -> `bufferQueue.Add((float[])samples.Clone());`
+The async consumer owns its data; the reuse buffer can be safely recycled. Keeps #122's
+zero-alloc win for the synchronous meter/scope consumers. Cost: one 256-float copy per
+sub-chunk on the record path (negligible vs disk I/O). File is UTF-8 BOM + LF; +2/-2.
+
+Alternatives (inferior): revert #122 (loses the perf win) or deepen the pool (any fixed
+depth can still be lapped on a disk stall). Follow-up: document the MasterTap contract
+("buffer valid only during the synchronous callback") and audit any other async subscribers.
+
+### Validate
+Apply fix, build, render `det_grid_08x04` with algorithm 2 "Threads" + UseCachedWorkOrder
+ON + MT ON, ~16x fresh. Expect 0 garbage (and no lead-in). That confirms the fix and closes
+the item; UseCachedWorkOrder can go back ON.
