@@ -267,3 +267,57 @@ renders all clean.
 ### Workaround available now
 `UseCachedWorkOrder = Off` — proven 8/8 clean; reliable renders + valid byte-gates today,
 at the cost of the cached-order perf gain.
+
+---
+
+## Probe results (2026-07-09): scale-skip RULED OUT; it's a post-scale/late write
+
+### dep-probe (dependency order) — NEGATIVE
+Instrumented the cached audio-waves dispatch to check every machine's inputs are
+`workDone` before dispatch (the `CollectMachinesThatCanWork` invariant). One render, no
+`C:\temp\dep_probe.txt` produced ⇒ **cached wave order does NOT violate dependency order.**
+Kahn-misplacement hypothesis is out.
+
+### KEY REFRAME: garbage = UNSCALED output, not corruption
+Garbage value ≈ correct × 32768 (e.g. 7.864e6 = 240 × 32768). The affected sub-chunk holds
+NATIVE-domain values that skipped the `1/32768` output scale — not random corruption.
+(Consequence: magnitude-based probes in `GetStereoSamples`/native domain are useless there,
+since native values are ~1e6–1e7 normally.)
+
+### scale-probe (after the scale pass) — NEGATIVE, and decisive
+Added a scan of `buffer[offset..offset+count)` immediately after the scale pass (still
+under `AudioLock`), logging any survivor > 1e4. 12 fresh renders: **11/12 had garbage in
+the wav, but `scale_probe.txt` was NEVER written.** ⇒ at the moment the scale pass finishes,
+the buffer is fully scaled/clean; the native values appear in the wav **afterward**. So it
+is a **late/post-scale write to the output buffer**, NOT a missed scale.
+
+Bonus signal: the probe's own overhead raised the garbage rate ~1/8 → **11/12** ⇒ a tight,
+timing-sensitive race (longer buffer-hold window ⇒ far more corruption).
+
+### Structural facts established
+- `MainAudioFillBuffer` runs entirely under `lock (ReBuzzCore.AudioLock)` (WorkManager.cs
+  133); scale pass + probe are inside it. So two `MainAudioFillBuffer` calls cannot overlap
+  in the fill — rules out two-MAFB-racing-in-the-fill.
+- Render path = `ReBuzzCore.RenderAudio` → `ap.ReadOverride` → (ASIO: AudioWaveProvider →
+  AudioSampleProvider, thin delegators) → `MainAudioFillBuffer`. Confirmed render goes
+  through MAFB (the wav is scaled ~305, and that scale exists only there).
+- Nothing writes `buffer` between the scale pass and `return` (only counter bookkeeping).
+
+### Where that leaves it (honest)
+The native write lands AFTER `MainAudioFillBuffer` returns/releases `AudioLock`, on a writer
+that doesn't hold the lock, and only with cached-order + MT. But MT-off is clean AND
+cached-off is clean, so the race lives in the **cached multithreaded work dispatch** and its
+result reaches the output buffer post-scale. Exact write-point NOT yet pinned — needs the
+render capture loop (who calls `RenderAudio`, whether the buffer is reused/pipelined, whether
+the live ASIO stream runs concurrently during offline render) and/or a checksum-at-capture
+vs at-MAFB-return probe.
+
+### Next steps
+1. Find/inspect the `RenderAudio` caller (export loop): buffer reuse/pipelining; is live
+   playback concurrent during offline render?
+2. Checksum probe: hash `buffer[offset..count)` at MAFB return, and again where the render
+   captures it to the wav; a mismatch localizes the late writer.
+3. Reconsider the cached-path n==1 inline dispatch + the `workWaitHandle` spin (workers left
+   runnable across waves) as the concurrency source, now that order is proven correct.
+
+### WORKAROUND (stands): UseCachedWorkOrder Off — proven 8/8 clean.
