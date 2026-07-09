@@ -126,3 +126,144 @@ Persisting ⟹ look elsewhere.
 - If barrier-confirmed: add an assert/log in `ReadWork` right before `GetStereoSamples`
   that `workEngine` reports zero in-flight (counter==0 AND no worker inside `TickAndWork`);
   the `dev-barrier-instr` probes are the vehicle.
+
+---
+
+## CONFIRMED: both effects are multithreading-only (2026-07-08)
+
+MT-off control: 8 fresh-launch `det_grid_08x04` renders on `355deba` with **Multithreading
+OFF** → **all 8 byte-identical**, md5 `fe9b9252…` (== the clean MT reference), **zero
+garbage, zero silent lead-ins**.
+
+Conclusions:
+- Effect 1 (silent lead-in) and Effect 2 (native-scale garbage) are **both MT-only**.
+  Single-threaded, the engine renders `det_grid_08x04` deterministically and correctly.
+- MT-off output equals the MT *clean* output exactly ⟹ MT is not computing different
+  audio, only intermittently corrupting it ⟹ a **synchronization defect**, not a logic
+  difference. Confirms the work-dispatch join hypothesis (worker still in `TickAndWork`
+  when the barrier releases → `master.GetStereoSamples` mixes a half-written native-scale
+  buffer).
+
+Methodology escape hatch: **render bit-exact gates with Multithreading OFF** — fully
+reproducible, so byte-comparison is valid again for future bit-exact PRs.
+
+Still open: which MT path is live (custom `WorkThreadEngine` barrier on algorithm-2 cached
+vs `Task.WaitAll` on the group paths). Need engine settings: `algorithm` (0/1/2) and
+`UseCachedWorkOrder`. Tie-breaker: MT on + `UseCachedWorkOrder` OFF ×8; garbage returning
+only with cached-order ON pins it to the cached-barrier path.
+
+---
+
+## Live path CONFIRMED: algorithm 2 ("Threads") + UseCachedWorkOrder On (2026-07-08)
+
+User settings: work algorithm dropdown = **"Threads"** (index 2), UseCachedWorkOrder =
+**On**. cbAlgorithms order (PreferencesWindow.xaml.cs ~152-164): 0 "Recursive Task
+Groups", 1 "Recursive Tasks", 2 "Threads". So the live dispatch is
+**`HandleWorkAlgorithm2Cached`** → the custom `WorkThreadEngine` barrier
+(`AddWork`/`AllJobsAdded`/`AllDoneEvent().WaitOne()`), NOT `Task.WaitAll`. Matches the
+prime suspect; MT-off elimination confirms the join is the fault site.
+
+### Real defect found (worth fixing regardless)
+Start gate `workWaitHandle` is reset by **workers** (`GetWorkItem`, line 139), not the
+dispatcher → cross-wave set/reset race: a lagging worker's `Reset()` can clobber the next
+wave's `AllJobsAdded()` `Set()`, and workers can pick up jobs mid-dispatch.
+
+### Honest caveat on mechanism
+Static analysis of the **counter** logic (workLock-guarded; AddWork Resets allDone,
+WorkDone-to-0 Sets it) suggests `WaitOne()` returning does imply `counter==0` implies all
+`TickAndWork` returned — i.e. the counter itself looks robust. So the garbage is more
+likely a **skipped/stale wave** (gate clobber → a machine never runs → its buffer left
+stale/uninitialized, a better fit for native-scale garbage than a half-write) or a
+buffer-ownership issue in the cached order. Exact interleaving NOT provable from source
+alone — needs runtime instrumentation.
+
+### Decisive next step (instrument, don't theorize)
+1. Fresh branch off `355deba`; apply barrier instrumentation from `dev-barrier-instr`
+   stash (`stash@{0}` / backup patch `wip_stash_backup.patch`).
+2. Add an "active workers" `Interlocked` count (inc before `TickAndWork`, dec after) and
+   assert, at the top of `ReadWork`'s mix (before `master.GetStereoSamples()`), that both
+   `workCounter == 0` AND active-workers == 0.
+3. Reproduce MT-on 8× fresh renders; capture which invariant trips on a garbage render:
+   - counter==0 but active>0 ⟹ early barrier release.
+   - a machine never ran ⟹ skipped/stale wave from the gate clobber.
+4. Fix accordingly — likely rework the start gate so the DISPATCHER owns it (generation /
+   countdown design), retiring the worker-reset clobber race.
+
+---
+
+## CORRECTION: not the barrier — bug is common to ALL MT dispatch paths (2026-07-08)
+
+Differential test: algorithm **0 ("Recursive Task Groups")**, which joins with
+`Task.WaitAll` (not the custom barrier), MT on, 8× fresh renders:
+- 6/8 clean (`fe9b9252`); run6 = **garbage sub-chunk** (256 samples, native-scale,
+  2.370 s); run1 = lead-in-class anomaly. Garbage rate ~1/8 — same as algorithm 2.
+
+**Implication:** the garbage appears on the `Task.WaitAll` path too. `Task.WaitAll` is a
+correct join, so this is **not** a premature-release/barrier defect. The
+`WorkThreadEngine` start-gate reset/set race I found is real but is **NOT** the garbage
+root cause. Barrier is exonerated as the source.
+
+**Refocused hypothesis:** a race **common to all MT paths**, downstream of the join — the
+shared mix/accumulation. Prime suspects now:
+- `master.GetStereoSamples()` (the "input accumulation" B2 candidate) and the per-machine
+  output buffers it reads — concurrent access to a buffer the parallelization treats as
+  independent but isn't, or a shared scratch in the accumulation.
+- The **cached work order** (`perf/cached-work-order`, merged) occasionally mis-grouping
+  *dependent* machines to run in parallel → read/write race on a connection buffer.
+
+### Next differential (decides between the two)
+MT on, algorithm 2 or 0, **UseCachedWorkOrder OFF**, 8× fresh:
+- garbage vanishes ⟹ cached-order mis-parallelization; fix in the ordering.
+- garbage persists ⟹ fundamental shared-buffer/mix race (`GetStereoSamples` / machine
+  buffer ownership); instrument there.
+
+Both effects (garbage + lead-in) confirmed on algorithm 0 as well, consistent with Effect
+1 living in `MainAudioFillBuffer` (common to all paths).
+
+---
+
+## ISOLATED to UseCachedWorkOrder ON; concrete defect: missing Ready-gate (2026-07-08)
+
+Differential (algorithm 2 "Threads", MT ON, **UseCachedWorkOrder OFF**), 8× fresh:
+**8/8 byte-identical `fe9b9252`, zero garbage, zero lead-in.**
+
+Full table:
+| MT  | cached | result        |
+|-----|--------|---------------|
+| off | —      | 8/8 clean     |
+| on  | on (a2)| garbage ~1/8  |
+| on  | on (a0)| garbage ~1/8  |
+| on  | off(a2)| 8/8 clean     |
+
+Bug tracks **UseCachedWorkOrder = ON + MT** (both algorithms 0 and 2), i.e. the merged
+`perf/cached-work-order`. Join mechanism is NOT it (a0 uses Task.WaitAll, a2 the barrier;
+both fail with cached on, both clean with cached off / MT off).
+
+### Corrected: wave grouping is CORRECT (not a mis-grouping)
+`CachedWorkOrder` builds `AudioWaves` by Kahn topological layering over the master audio
+cone (CachedWorkOrder.cs 114-160). A machine's in-degree only reaches 0 after its inputs'
+wave completes, so a machine cannot share a wave with a transitive input. Earlier
+"mis-groups dependent machines" guess is disconfirmed.
+
+### Concrete defect found: audio-waves dispatch skips the Ready-gate
+- `FillAndSortDescFrom` (WorkManager.cs 922) copies ALL wave machines and dispatches them
+  unconditionally — **no `Ready` check**.
+- `DispatchPrefixCached` (949) DOES check `m.Ready && !m.workDone`; its comment: "Ready is
+  re-tested here (a native crash can clear it mid-buffer)."
+- Non-cached path gates on Ready via `CollectMachinesThatCanWork`.
+- So the cached AUDIO-WAVES dispatch is the only path that works a machine without
+  checking `Ready` (runtime-mutable). Working a not-Ready machine → reads unfilled/stale
+  input or mid-reset state → native-scale garbage sub-chunk. Intermittent (Ready
+  transitions are timing-dependent). Matches the cached-ON-only isolation.
+
+### Fix candidate (mirror existing code)
+Gate the audio-waves dispatch on `Ready` in BOTH cached paths
+(`HandleWorkAlgorithm2Cached` ~999-1005 and `HandleWorkAlgorithmGroupsCached` ~1039-1045):
+skip machines where `!Ready` (they keep last-chunk stale-but-valid output, as the other
+paths already do). Confirm first with instrumentation (log if a not-Ready machine is
+dispatched on a garbage render), then validate: MT on + cached on + fix, ~16× fresh
+renders all clean.
+
+### Workaround available now
+`UseCachedWorkOrder = Off` — proven 8/8 clean; reliable renders + valid byte-gates today,
+at the cost of the cached-order perf gain.
