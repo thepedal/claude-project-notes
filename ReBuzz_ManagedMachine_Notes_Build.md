@@ -21,10 +21,13 @@ conventions; no double quotes).
 Updated from Pedal Add-R v0.8 work (§3.1 amended — preset bundle filename
 `<MachineName>.prs.xml` (exact match) auto-loads on machine create; the
 legacy `_Presets` form remains importable but not auto-loaded).
-Updated from Pedal Juno106 v1.6 work (§3.1 — the auto-load filename is now a
-mandatory rule, not just the recommended form: preset bundles are always
-named `<MachineName>.prs.xml` and deployed alongside the DLL. Juno106 migrated
-off the legacy `Pedal Juno106_Presets.prs.xml` name).
+Updated from Pedal Juno106 v1.7 work: §3.1 — the auto-load filename is now a
+mandatory rule, not just the recommended form (preset bundles are always named
+`<MachineName>.prs.xml` and deployed alongside the DLL; Juno106 migrated off the
+legacy `Pedal Juno106_Presets.prs.xml` name). §3.5.1 added — the silent
+deploy-on-mismatch trap (a misnamed bundle + `ContinueOnError` swallows MSB3030),
+with the `Exists`-guard + `Warning` fix; also debunks the spaces / CWD red
+herrings via toolchain testing.
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -466,6 +469,106 @@ even when the bundle's filename has no space — applying it consistently
 means future machines that gain spaces in their preset filenames (most
 of them, given the §3.1 convention) won't trip the same wire, and the
 build log lines double as a sanity check that deployment actually ran.
+
+### 3.5.1 The silent-mismatch trap — guard the preset Copy with `Exists` + `Warning`
+
+**Symptom.** The build is green, the DLL deploys and the machine loads
+with fresh code, but no presets appear in ReBuzz and no `.prs.xml`
+shows up in `Gear\<subdir>\`.
+
+**Mechanism.** The preset `Copy` names a specific file (the §3.1
+auto-load form, `<MachineName>.prs.xml`). If the file at that path
+doesn't exist — most commonly because the bundle in the tree still has
+a different name (a leftover `<MachineName>_Presets.prs.xml` from before
+a §3.1 migration), or hasn't been generated yet — the `Copy` task emits:
+
+```
+warning MSB3030: Could not copy the file "…\<MachineName>.prs.xml"
+because it was not found.
+```
+
+and `ContinueOnError="true"` (which §3.5 requires for the ReBuzz
+file-lock case) **downgrades that error to a warning**. The build
+succeeds, the warning scrolls past unnoticed, and nothing is deployed.
+The DLL copies fine throughout because `$(TargetPath)` is always a valid
+absolute path — so the machine *looks* freshly deployed, which makes the
+missing presets easy to misattribute.
+
+**What it is NOT — two debunked red herrings.** Both were tested with a
+real MSBuild (`dotnet msbuild -t:<deployTarget>`) against dummy bundles:
+
+- *Spaces in the filename.* An item `Include` with a space
+  (`Pedal Juno106.prs.xml`) round-trips fine; the space is not an item
+  separator (semicolons are). The `@(Item)` → `SourceFiles` copy works.
+- *Current working directory.* MSBuild resolves a relative item `Include`
+  against `$(MSBuildProjectDirectory)`, **not** the process CWD. Building
+  from a solution, an IDE, or `dotnet build <path>` from elsewhere still
+  resolves the bundle correctly. Anchoring the `Include` with
+  `$(MSBuildProjectDirectory)` is harmless but wasn't the fix.
+
+The only thing that actually breaks deployment here is the **filename not
+matching** what the `Copy` asks for.
+
+**The fix — make the miss loud, not silent.** Guard the preset `Copy` on
+`Exists()` of the exact bundle path, and add an explicit `Warning` (a
+separate task, so `ContinueOnError` on the `Copy` can't swallow it) that
+names whatever `.prs.xml` *is* present. Keep `ContinueOnError` on the
+`Copy` itself for the genuine lock case.
+
+```xml
+<Target Name="DeployToReBuzz" AfterTargets="Build">
+  <PropertyGroup>
+    <_PresetPath>$(MSBuildProjectDirectory)\My Machine.prs.xml</_PresetPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <_AnyPreset Include="$(MSBuildProjectDirectory)\*.prs.xml" />
+  </ItemGroup>
+
+  <Message Text="Deploying $(TargetFileName) -> $(ReBuzzPath)\Gear\Generators\"
+           Importance="high" />
+  <Copy SourceFiles="$(TargetPath)"
+        DestinationFolder="$(ReBuzzPath)\Gear\Generators\"
+        ContinueOnError="true" />
+
+  <!-- Correct bundle present: deploy it. -->
+  <Message Condition="Exists('$(_PresetPath)')"
+           Text="Deploying preset bundle -> $(ReBuzzPath)\Gear\Generators\"
+           Importance="high" />
+  <Copy Condition="Exists('$(_PresetPath)')"
+        SourceFiles="$(_PresetPath)"
+        DestinationFolder="$(ReBuzzPath)\Gear\Generators\"
+        ContinueOnError="true" />
+
+  <!-- Missing under the exact §3.1 name: fail loudly, naming what IS there. -->
+  <Warning Condition="!Exists('$(_PresetPath)')"
+           Text="Preset bundle NOT deployed: '$(_PresetPath)' not found. Found instead: @(_AnyPreset). Per §3.1 it must be named 'My Machine.prs.xml' - rename it, or presets won't appear in ReBuzz." />
+</Target>
+```
+
+Verified behaviour (real toolchain, both cases): correct name → the
+`Deploying preset bundle` line prints and the file lands, zero warnings;
+wrong name → an unmissable `Preset bundle NOT deployed…` warning naming
+the offending file, and nothing stale is shipped.
+
+Note the `Warning` deliberately does **not** use the glob item
+`@(_AnyPreset)` as the copy source — that would "helpfully" deploy a
+misnamed bundle and mask the §3.1 violation. The glob is used only to
+*report* what's there. Enforce the name; don't paper over it.
+
+**Diagnostic checklist when presets don't appear:**
+1. Grep the build log for `MSB3030` or for the presence/absence of the
+   `Deploying preset bundle` message. Its absence (or the NOT-deployed
+   warning) means a name mismatch — check the actual filename next to the
+   `.csproj`.
+2. Confirm no stale `<MachineName>_Presets.prs.xml` is sitting in the gear
+   folder from before a migration (it'd load as a second, importable set —
+   §3.1).
+3. Only if the bundle is correctly named and still absent: check
+   `ReBuzzPath`, folder permissions, and that ReBuzz was closed during the
+   build (lock).
+
+**Immediate fallback:** the `.prs.xml` is a static file — copying it into
+`Gear\<subdir>\` by hand deploys it without a rebuild.
 
 ---
 
