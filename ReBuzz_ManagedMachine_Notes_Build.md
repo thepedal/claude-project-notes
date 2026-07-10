@@ -21,6 +21,10 @@ conventions; no double quotes).
 Updated from Pedal Add-R v0.8 work (§3.1 amended — preset bundle filename
 `<MachineName>.prs.xml` (exact match) auto-loads on machine create; the
 legacy `_Presets` form remains importable but not auto-loaded).
+Updated from Pedal Juno106 v1.6 work (§3.1 — the auto-load filename is now a
+mandatory rule, not just the recommended form: preset bundles are always
+named `<MachineName>.prs.xml` and deployed alongside the DLL. Juno106 migrated
+off the legacy `Pedal Juno106_Presets.prs.xml` name).
 
 Sections numbered locally. References to `Core §N` point to
 `ReBuzz_ManagedMachine_Notes_Core.md`. Internal cross-references use plain
@@ -230,6 +234,23 @@ produces files ReBuzz will accept.
 
 ### 3.1 File naming and encoding
 
+> **Rule (mandatory).** Every managed machine that ships a preset bundle
+> names it **`<MachineName>.prs.xml`** — the machine's `MachineDecl.Name`
+> plus the `.prs.xml` extension, with no `_Presets` (or any other) suffix —
+> and deploys it to the **same gear folder as the `.dll`** (`Gear\Generators`
+> for generators, `Gear\Effects` for effects). This is the auto-load form
+> (see below), so presets appear in the machine's right-click menu the
+> moment it is dropped into a song, with no import step.
+>
+> Applies to: any new machine; any existing machine whose presets or
+> `.csproj` are being modified for any reason; and any time a machine is
+> reviewed and found shipping under the legacy `_Presets` form — flag it and
+> migrate (rename the bundle, update the `.csproj` deploy item, the generator
+> script's output path, and any README/doc reference, then delete the stale
+> `_Presets` file from the gear folder so the menu does not double up — see
+> the migration note below). This mirrors the mandatory `.csproj` rules in
+> §1.2 and §1.3.
+
 - **Extension is `.prs.xml`**, not `.xml`. ReBuzz uses the double extension
   to distinguish preset bundles from arbitrary XML in the gear folder. A
   file named `MyMachine_Presets.xml` is silently ignored.
@@ -240,7 +261,7 @@ produces files ReBuzz will accept.
     `Pedal Comp.prs.xml`): ReBuzz auto-loads the bundle as the active
     preset set the moment the machine is dropped into a song. No import
     step needed; presets show up directly in the right-click menu. **This
-    is the recommended form for any new machine.**
+    is the required form (see the mandatory rule at the top of §3.1).**
   - **Any other base name** (the legacy convention being
     `<MachineName>_Presets.prs.xml`): the bundle is recognised and
     parseable by ReBuzz but only loads as importable presets, not as the
