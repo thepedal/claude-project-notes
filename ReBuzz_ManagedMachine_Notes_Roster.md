@@ -8,13 +8,49 @@ A directory of every public managed machine under
 This file is a derived snapshot — refresh it when machines are added,
 renamed, or archived.
 
-**Last refreshed:** 2026-05-24 — full GitHub API pull (38 repos).
+**Last refreshed:** 2026-07-12 (re-pulled after the pedal-folder v1.2 push) —
+full public-repo pull (45 machines).
+
+**Method caveat:** the GitHub API was rate-limited on both attempts (60/hr,
+unauthenticated, and the quota is consumed the moment it resets on a shared
+IP), so this pull was taken from the public repositories listing instead. The
+`<relative-time>` stamps there carry the same `pushed_at` dates; the pairing was
+spot-checked against individual repo pages, and pedal-folder's push was verified
+by confirming `DcBlocker.cs` and `LICENSE` are present in its tree. **Re-run
+against the API with a token when one is available** — that remains the source
+of truth.
+
+Changes this pull:
+- **Four machines were missing from the roster entirely** — added
+  **pedal-Add-R** (additive synth; already cited as the Build §3.1 source),
+  **pedal-auxbus** (aux send/return pair), **pedal-song-writer** (`.bmxml`
+  generation tooling), **pedal-stem-writer** (writes per-input wave files).
+- **pedal-drummatrix → `pedal-drum-matrix`** — the roster had the repo name
+  wrong; the actual GitHub repo is hyphenated.
+- Refreshed every `Last pushed` date.
+- Non-machine repos in the account, deliberately not listed: `ReBuzz` (fork of
+  wasteddesign/ReBuzz) and `claude-project-notes`.
+- `ReBuzz vs` is unaffected by the pull — it isn't carried by GitHub.
+
+All six machines audited in the licensing/About pass are now pushed:
+pedal-sh101, pedal-fft, pedal-hdist, pedal-plaits and pedal-folder at
+2026-07-11, pedal-juno106 at 2026-07-10. (pedal-folder's v1.2 landed after the
+first pull of the day, which had it at 2026-05-16.)
+
+**Prior refresh:** 2026-05-24 — full GitHub API pull (38 repos).
 Reconciled the list and every `Last pushed` against `pushed_at`. Changes
 this pull: added **pedal-juno106** (new); corrected **pedal-Faze-R** to its
 canonical GitHub casing; refreshed 9 stale push dates (chord, fm, invFFT,
 M1 and tracker had all been re-pushed since the prior snapshot). No
 deletions, archived repos, or forks. `ReBuzz vs` is unaffected by the
 pull — the API doesn't carry it.
+
+**Licensing & About (2026-07-12):** new section below tracks per-machine
+`LICENSE` and About-window status. Six machines audited and compliant
+(sh101 1.4, juno106 1.8, fft 2.1, folder 1.2, hdist 1.2, plaits 1.13); the
+other 35 are unaudited on both counts. See also
+`ReBuzz_ManagedMachine_Notes_Licensing.md` (the why) and
+`..._Notes_Renaming.md` (the trademark rename playbook).
 
 **Version stamps (2026-05-24):** pedal-fm, pedal-invFFT, pedal-M1,
 pedal-juno106 and pedal-tracker stamped **1827-preview** — their recent
@@ -44,7 +80,7 @@ on `performanceDataCurrent` (Core §40). README only, no dedicated addendum. `Re
 stamped 1827-preview (the build it was tested on). Single-machine edit, not a full
 GitHub pull — `Last refreshed` above is unchanged.
 
-**Manual add (2026-06-20):** added **pedal-drummatrix** (v1.3, new) — a
+**Manual add (2026-06-20):** added **pedal-drum-matrix** (v1.3, new) — a
 drum-centric 6-slot serial multi-effect built around a BCR2000, with a
 dedicated handoff (`drum_matrix_HANDOFF.md`, `Addendum=Y`). Ten effects per
 slot (Bitcrush/Drive/Filter/RingMod/Comb/Stutter/Delay/Reverb/Gate/Resonator),
@@ -52,9 +88,11 @@ click-free Mode crossfades, a global feedback loop, an envelope follower + a
 tempo-synced LFO routed per-slot to Char, a tuned Resonator slot type with
 global Key/Scale, and a live-anchored scene morph. Ships a 30-preset bank
 (`Pedal Drum Matrix.prs.xml`). Single-machine edit, not a full GitHub pull —
-`Last refreshed` above is unchanged. **Repo slug `pedal-drummatrix` assumed by
+`Last refreshed` above is unchanged. ~~**Repo slug `pedal-drummatrix` assumed by
 analogy to `pedal-drumgrid` — confirm against the actual push and correct if
-needed.** `ReBuzz vs` left `?` (no hard version pin — all params are appended,
+needed.**~~ → **Confirmed wrong and corrected in the 2026-07-12 pull: the actual
+repo is `pedal-drum-matrix` (hyphenated). The assumption stood unverified for
+three weeks — a reminder to resolve these flags at the next pull, not later.** `ReBuzz vs` left `?` (no hard version pin — all params are appended,
 no multi-track pvalues collision; stamp the build it was tested on). Perf was
 measured (PP2 ENGINE ~3% flat; the DSP is free next to the host floor).
 
@@ -93,49 +131,53 @@ below, separate from the dev/impact-analysis roster.
 
 ---
 
-## Roster (41 machines)
+## Roster (45 machines)
 
 | Repo                    | Type       | Last pushed | ReBuzz vs     | Addendum | Description                                                |
 |-------------------------|------------|-------------|---------------|----------|------------------------------------------------------------|
-| BTDSys-PeerCtrl-ReBuzz  | control    | 2026-05-21  | 1817-preview  | Y        | Port of BTDSys PeerCtrl                                    |
-| pedal-chord             | control    | 2026-05-23  | 1817-preview  |          | Chord peer controller with arpeggiation                    |
-| pedal-chorus            | effect     | 2026-05-02  | ?             |          | Chorus effect                                              |
-| pedal-comp              | effect     | 2026-05-02  | ?             | Y        | Compressor effect                                          |
+| BTDSys-PeerCtrl-ReBuzz  | control    | 2026-05-24  | 1817-preview  | Y        | Port of BTDSys PeerCtrl                                    |
+| pedal-Add-R             | generator  | 2026-06-05  | ?             |          | Additive synth (Build §3.1 source: v0.8 preset auto-load)  |
+| pedal-auxbus            | effect     | 2026-06-13  | ?             |          | Aux send/return pair                                       |
+| pedal-chord             | control    | 2026-06-07  | 1817-preview  |          | Chord peer controller with arpeggiation                    |
+| pedal-chorus            | effect     | 2026-05-24  | ?             |          | Chorus effect                                              |
+| pedal-comp              | effect     | 2026-05-24  | ?             | Y        | Compressor effect                                          |
 | pedal-converb           | effect     | 2026-05-07  | ?             |          | Convolution reverb (SIMD, wavefile IRs)                    |
-| pedal-dly-PCM41         | effect     | 2026-05-05  | 1819-preview  |          | PCM41-style tape delay                                     |
-| pedal-do-nuttin         | template   | 2026-05-12  | ?             |          | "Do nothing" machine — minimal scaffold                    |
+| pedal-dly-PCM41         | effect     | 2026-05-24  | 1819-preview  |          | PCM41-style tape delay                                     |
+| pedal-do-nuttin         | template   | 2026-05-24  | ?             |          | "Do nothing" machine — minimal scaffold                    |
 | pedal-drumgrid          | generator  | 2026-06-13  | ?             | Y        | Multi-out 16-lane drum sampler — routable buses, swing/humanize, embedded kits|
-| pedal-drummatrix        | effect     | 2026-06-20  | ?             | Y        | 6-slot drum multi-fx — feedback loop, env/LFO mod, tuned resonator, scene morph|
+| pedal-drum-matrix       | effect     | 2026-07-07  | ?             | Y        | 6-slot drum multi-fx — feedback loop, env/LFO mod, tuned resonator, scene morph|
 | pedal-eq                | effect     | 2026-05-17  | 1819-preview  |          | EQ effect (Core §33 source: v1.3 WM_NOIO handling)         |
-| pedal-Faze-R            | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
-| pedal-fft               | effect     | 2026-05-02  | ?             |          | FFT distortion with harmonics                              |
+| pedal-Faze-R            | generator  | 2026-05-25  | 1827-preview  | Y        | 8-voice phase-distortion synth (Casio CZ lineage)          |
+| pedal-fft               | effect     | 2026-07-11  | ?             |          | FFT distortion with harmonics                              |
 | pedal-filter            | effect     | 2026-05-19  | ?             |          | Filter effect                                              |
 | pedal-fm                | generator  | 2026-05-23  | 1827-preview  |          | FM synth                                                   |
-| pedal-folder            | effect     | 2026-05-16  | ?             |          | Wavefolding distortion                                     |
+| pedal-folder            | effect     | 2026-07-11  | ?             |          | Wavefolding distortion                                     |
 | pedal-follower          | control    | 2026-05-05  | ?             |          | Envelope follower → param assignment                       |
-| pedal-gain              | effect     | 2026-04-29  | ?             |          | Gain with mute and inertia                                 |
-| pedal-gain-multi        | effect     | 2026-04-25  | ?             |          | Multi-in gain with VU metering                             |
+| pedal-gain              | effect     | 2026-05-24  | ?             |          | Gain with mute and inertia                                 |
+| pedal-gain-multi        | effect     | 2026-06-17  | ?             |          | Multi-in gain with VU metering                             |
 | pedal-gate              | effect     | 2026-05-18  | 1819-preview  |          | Noise gate (Core §16.1 source: v1.3 sidechain build)       |
-| pedal-hallverb          | effect     | 2026-05-02  | ?             |          | Hall reverb                                                |
-| pedal-hdist             | effect     | 2026-05-16  | ?             |          | Harmonic distortion                                        |
+| pedal-hallverb          | effect     | 2026-05-24  | ?             |          | Hall reverb                                                |
+| pedal-hdist             | effect     | 2026-07-11  | ?             |          | Harmonic distortion                                        |
 | pedal-invFFT            | generator  | 2026-05-23  | 1827-preview  | Y        | Inverse-FFT additive synth (K5000-inspired)                |
-| pedal-juno106           | generator  | 2026-05-23  | 1827-preview  |          | Roland Juno-106 emulation                                  |
-| pedal-LFmono            | effect     | 2026-04-29  | ?             |          | Low-frequency mono-maker                                   |
+| pedal-juno106           | generator  | 2026-07-10  | 1827-preview  |          | Roland Juno-106 emulation                                  |
+| pedal-LFmono            | effect     | 2026-05-24  | ?             |          | Low-frequency mono-maker                                   |
 | pedal-lfo               | control    | 2026-05-05  | ?             |          | LFO → param assignment                                     |
-| pedal-limit             | effect     | 2026-04-17  | ?             |          | Limiter effect                                             |
+| pedal-limit             | effect     | 2026-05-24  | ?             |          | Limiter effect                                             |
 | pedal-M1                | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice poly dual-PCM-osc synth, Korg M1 voice architecture|
 | pedal-mcomp             | effect     | 2026-05-19  | 1819-preview  |          | Multi-band compressor (Core mentions v1.1 GUI build)       |
-| pedal-muter             | control    | 2026-05-14  | ?             | Y        | Mute other machines                                        |
-| pedal-plaits            | generator  | 2026-05-12  | 1819-preview  |          | Port of Mutable Instruments Plaits                         |
-| pedal-plate             | effect     | 2026-05-01  | ?             |          | Plate reverb                                               |
-| pedal-presetter         | control    | 2026-05-13  | ?             |          | Change presets on target machines                          |
-| pedal-profiler          | diagnostic | 2026-04-26  | ?             |          | Global CPU dashboard — v1                                  |
-| pedal-profiler2         | diagnostic | 2026-05-22  | 1827-preview  | Y        | Per-machine inspector — v2 (Core §§34–41 source)           |
-| pedal-ReBuzz-patcher    | utility    | 2026-04-08  | ?             |          | Patching machine                                           |
+| pedal-muter             | control    | 2026-06-17  | ?             | Y        | Mute other machines                                        |
+| pedal-plaits            | generator  | 2026-07-11  | 1819-preview  |          | Port of Mutable Instruments Plaits                         |
+| pedal-plate             | effect     | 2026-05-24  | ?             |          | Plate reverb                                               |
+| pedal-presetter         | control    | 2026-06-07  | ?             |          | Change presets on target machines                          |
+| pedal-profiler          | diagnostic | 2026-05-24  | ?             |          | Global CPU dashboard — v1                                  |
+| pedal-profiler2         | diagnostic | 2026-07-07  | 1827-preview  | Y        | Per-machine inspector — v2 (Core §§34–41 source)           |
+| pedal-ReBuzz-patcher    | utility    | 2026-05-24  | ?             |          | Patching machine                                           |
 | pedal-retrig            | effect     | 2026-05-16  | ?             |          | Port of 'genre' by intoxicated (retrigger)                 |
-| pedal-sh101             | generator  | 2026-05-06  | 1819-preview  | Y        | Monophonic Roland SH-101 emulation (synth-voice patterns)  |
+| pedal-sh101             | generator  | 2026-07-11  | 1819-preview  | Y        | Monophonic Roland SH-101 emulation (synth-voice patterns)  |
 | pedal-shaper            | effect     | 2026-05-16  | ?             |          | Waveshaper distortion                                      |
-| pedal-tracker           | tracker    | 2026-05-22  | 1827-preview  | Y        | Tracker machine — Matilde-compatible                       |
+| pedal-song-writer       | utility    | 2026-06-10  | ?             | Y        | Tooling to generate playable .bmxml song files             |
+| pedal-stem-writer       | utility    | 2026-06-09  | ?             |          | Writes separate wave files from connected inputs           |
+| pedal-tracker           | tracker    | 2026-05-24  | 1827-preview  | Y        | Tracker machine — Matilde-compatible                       |
 | pedal-zplane            | effect     | 2026-05-07  | ?             |          | Z-Plane filter (4-corner morph)                            |
 | pedal-bench             | diagnostic | 2026-06-16  | 1827-preview  |          | A/B benchmark harness — runs the song 5 min, emits a matrix row |
 
@@ -146,6 +188,76 @@ recorded in PeerCtrl §16), or from an explicit version reference in the
 machine's commit history (e.g. the five 1827 "pvalues" multi-track fixes).
 Remaining `?` rows just weren't stamped — that's a gap to fill in over
 time, not evidence the machines are stale.
+
+---
+
+---
+
+## Licensing & About-window status
+
+Tracks two per-machine compliance items introduced during the 2026-07 work:
+
+1. **Licence** — a `LICENSE` file with the full licence text is present in the
+   repo root, the README states the same licence, and any third-party code
+   carries the upstream notice it requires (Licensing §2, §4, §5).
+2. **About** — the right-click `About...` window is wired up (AboutWindow §1.4)
+   showing name, version, description, author, repo URL, licence, and — for
+   emulations — the trademark disclaimer (Licensing §3.1).
+
+House default is **GPL-3.0**, except where a machine derives from third-party
+code under another licence (Licensing §2, §4).
+
+### Audited and compliant
+
+| Repo | Ver | Licence | About | Notes |
+|---|---|---|---|---|
+| pedal-sh101   | 1.4  | GPL-3.0 | Y | Roland trademark disclaimer in About + README |
+| pedal-juno106 | 1.8  | GPL-3.0 | Y | Roland trademark disclaimer in About + README |
+| pedal-fft     | 2.1  | GPL-3.0 | Y | Relicensed from MIT (README had said MIT; prior MIT releases stay MIT). `Author` corrected from the `WDE` template leftover |
+| pedal-folder  | 1.2  | GPL-3.0 | Y | Fold algorithm credited to Jatin Chowdhury in About + README |
+| pedal-hdist   | 1.2  | GPL-3.0 | Y | `Author` corrected from the `WDE` template leftover |
+| pedal-plaits  | 1.13 | **MIT** | Y | **Not GPL** — derives from MIT Plaits. `LICENSE` carries Émilie Gillet's 2016 copyright verbatim plus third-party notices for `PlaitsWavetables.cs` and `Resources/waves.bin`; MIT notice added to the direct-port file; Mutable credit surfaced in About. This closed a real MIT violation (the notice was missing entirely) |
+
+### Not yet audited (39 machines)
+
+Every other machine in the roster is **unaudited on both counts** — assume no
+`LICENSE` file and no About window until checked. This is a gap to work through,
+not a claim that they're non-compliant:
+
+`BTDSys-PeerCtrl-ReBuzz`, `pedal-Add-R`, `pedal-auxbus`, `pedal-bench`,
+`pedal-chord`, `pedal-chorus`, `pedal-comp`, `pedal-converb`, `pedal-dly-PCM41`,
+`pedal-do-nuttin`, `pedal-drum-matrix`, `pedal-drumgrid`, `pedal-eq`,
+`pedal-Faze-R`, `pedal-filter`, `pedal-fm`, `pedal-follower`, `pedal-gain`,
+`pedal-gain-multi`, `pedal-gate`, `pedal-hallverb`, `pedal-invFFT`,
+`pedal-LFmono`, `pedal-lfo`, `pedal-limit`, `pedal-M1`, `pedal-mcomp`,
+`pedal-muter`, `pedal-plate`, `pedal-presetter`, `pedal-profiler`,
+`pedal-profiler2`, `pedal-ReBuzz-patcher`, `pedal-retrig`, `pedal-shaper`,
+`pedal-song-writer`, `pedal-stem-writer`, `pedal-tracker`, `pedal-zplane`
+
+### Priority gaps
+
+**Port attributions — highest value.** These carry other authors' code, so the
+same class of issue that turned out to be a real violation in Plaits (Licensing
+§4). Audit before anything else:
+
+- `BTDSys-PeerCtrl-ReBuzz` — port of BTDSys PeerCtrl. Confirm the original's
+  licence or that permission exists; credit the author either way.
+- `pedal-retrig` — port of *genre* by intoxicated. Same.
+- `pedal-tracker` — "Matilde-compatible". The addendum references a **BSD**
+  mirror of Matilde; record whether code was reused (keep the BSD notice) or
+  whether it's clean-room behaviour.
+
+**Trademark names (Licensing §3.2).** Model names used as the product name;
+rename decision outstanding (see `..._Notes_Renaming.md`): `pedal-juno106`,
+`pedal-sh101`, `pedal-M1`, `pedal-dly-PCM41`, `pedal-zplane`. The two audited
+Roland machines already carry the disclaimer, which mitigates but does not cure
+this.
+
+**`Author` field.** Two machines shipped with `Author = "WDE"` as a template
+leftover (`pedal-fft`, `pedal-hdist`, both now corrected). Worth grepping the
+rest — it's what ReBuzz displays as the machine's author.
+
+**GPL linking exception.** Not yet added to any GPL-3.0 machine (Licensing §2.1).
 
 ---
 
@@ -189,7 +301,7 @@ out from each addendum as time allows.
   Not pinned to 1827 (global triggers don't collide; the pvalues recovery was
   removed) — stamp the actual build.
 
-### pedal-drummatrix — `drum_matrix_HANDOFF.md`
+### pedal-drum-matrix — `drum_matrix_HANDOFF.md`
 - Drum-centric 6-slot serial multi-effect (one stereo `Work`). Each slot runs
   one of ten effects (Bitcrush/Drive/Filter/RingMod/Comb/Stutter/Delay/Reverb/
   Gate/Resonator) with Amount/Char/Mode macros; Mode is a click-free crossfade
