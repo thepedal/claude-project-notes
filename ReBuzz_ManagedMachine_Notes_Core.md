@@ -25,6 +25,13 @@ Updated with findings from the ReBuzz 1827 `pvalues` field-shape change
 to `int[256]`, silently nulling the §14 multi-track poll; fixed across
 pedal-fm/M1/invFFT/juno106/tracker).
 These details are absent from official documentation.
+Updated from the 2026-07 DC sweep (§43 substantially rewritten and
+broadened from oscillators to the whole signal path — adds the odd-function
+test, the closed-form DC catalogue, and three traps: static compensation
+cannot track a nonlinearity (HDist), feedback loops amplify DC (Folder,
+Karplus-Strong), and do NOT reflexively skip the DC bin in an STFT processor
+(FFT). Sources: pedal-sh101 v1.4, pedal-juno106 v1.7, pedal-fft v2.1,
+pedal-plaits v1.13, pedal-folder v1.2, pedal-hdist v1.2.)
 
 Sections 1–42 are general findings that apply across managed machines.
 Machine-specific addenda live in separate files (Pedal Comp, Pedal Tracker,
@@ -3349,67 +3356,114 @@ Pedal Tracker addendum §16. (ReBuzz 1827-preview.)
 
 ---
 
-## 43. DC-blocking a raw-oscillator output — AC-couple the analog way
+## 43. DC in the signal path — where it comes from, and how to remove it
 
-Any analog-style oscillator that isn't symmetric carries a DC offset, and
-ReBuzz has no output-stage capacitor to remove it. A voice built the naive
-way sends that DC straight to the master. This section is the reusable
-pattern for removing it: where the DC comes from, the two ways to kill it,
-and the placement/state rules that keep the fix click-free.
+DC offset is the most common defect this project has found in its own DSP. It
+has bitten oscillators, waveshapers, distortion units, spectral processors and
+feedback loops — five machines in one sweep (§43.9), with offsets from a
+harmless 0.004 up to a catastrophic **1.34, past full scale on its own**.
 
-### 43.1 Where the DC comes from, and why the filter doesn't stop it
+This section is the reusable playbook: how to *test* for DC, the two ways to
+remove it, where to put the removal, and the four traps that made the obvious
+fix the wrong one.
 
-- **PWM pulse.** A pulse of width `pw` spends `pw` of each cycle high and
-  `1−pw` low, so its mean is `2·pw − 1`. A 50% pulse is zero-mean; anything
-  else isn't. A narrow-PWM bass patch (`pw ≈ 0.26`) sits at ≈ −0.5 of full
-  scale. Under LFO→PWM the width sweeps, so the offset **wanders** at the LFO
-  rate rather than sitting still.
-- **Narrow sub / any rectangular source.** Same `2·w − 1` rule for a
-  sub-oscillator run at 25% (mean −0.5) or any non-50% square.
-- **Asymmetric waveshapers.** Tube/asymmetric-clip transfer functions and
-  any nonlinearity with an even-order term generate DC proportional to level.
-- **Not from:** band-limited saw or triangle (zero-mean over a cycle; the
-  PolyBLEP correction leaves only a negligible `~dt`-order residue), a 50%
-  square, sine-operator FM (PM/FM of a sine stays zero-mean), or additive/iFFT
-  synths that skip the DC bin (§ InvFFT addendum — the `k=0` guard).
+**The single most useful lesson from the sweep: measure, don't assume.** In
+three of five machines the intuitive fix was wrong — one engine that looked
+guilty was spotless, one machine's existing "DC fix" was *creating* the DC, and
+one obvious fix would have gutted the machine's sound. Port the transfer
+function into a script, feed it a symmetric input, and take the mean. It takes
+ten minutes and it is never wrong.
 
-The trap is that the synth's own filter doesn't remove it. A low-pass VCF —
-Moog ladder, TPT, Chamberlin LP — has **unity gain at DC**, so the offset
-passes through untouched (a resonant ladder still has unity DC gain;
-resonance lifts the region near cutoff, not DC). On real hardware a series
-capacitor / fixed HPF at the output AC-couples the signal and the DC never
-reaches the converters. A software port has no such cap unless you add one.
+### 43.1 The odd-function test — the one diagnostic worth memorising
 
-**Consequences if you don't.** The offset (a) eats headroom asymmetrically —
-a −0.5 pedestal plus a ±0.5 AC swing clips one rail at −1 dBFS while the
-other never gets near it, costing ~4 dB and intermittently clipping; (b)
-clicks/thumps on bypass toggles and mute transitions as the DC steps; and
-(c) under LFO→PWM, produces a sub-audible DC *wander* that pumps the woofer.
+A memoryless nonlinearity `f` fed a **symmetric, zero-mean** input produces a
+zero-mean output **iff `f` is odd** (`f(−x) = −f(x)`). That single test
+classifies most of the project's DSP at a glance:
 
-### 43.2 Two ways to remove it
+**Odd → no DC, no blocker needed:**
+`tanh`, `atan`, `sin(kx)`, hard clip, cubic `1.5x − 0.5x³`, sign-based
+saturation, triangle/mirror wavefolds, sawtooth wrap. Band-limited saw and
+triangle, 50% square, sine-FM/PM, sums of sines.
 
-**(a) Analytic removal at the source — exact, stateless, rate-independent.**
-When the waveform's DC has a closed form, subtract it where you generate the
-sample. For the pulse:
+**Not odd → DC, proportional to level:**
+Any asymmetric clip (a "tube" stage compressing one half harder), mismatched-
+diode curves, **any even-order term** (`x²`, or an even harmonic in the output
+spectrum), and — the big one — **any bias/offset added before a nonlinearity**:
 
-```csharp
-pulse = (_phase < pw) ? 1f : -1f;
-pulse += PolyBlep(_phase, dt);           // rising edge
-pulse -= PolyBlep(fallEdge, dt);         // falling edge
-pulse -= (2f * pw - 1f);                 // <-- remove the pulse's own DC
+```
+x_drv = x · drive + bias        // bias breaks the symmetry ON PURPOSE
+y     = f(x_drv)                // f odd, but the input is no longer symmetric
 ```
 
-This makes the pulse zero-mean **by construction, every sample**. It tracks a
-swept `pw` exactly and instantly — no filter, no state, no settle, and (unlike
-the blocker below) no corner-frequency tradeoff, so it kills LFO→PWM wander at
-any rate. The cost is that it's waveform-specific: you must know the mean
-(`2·pw − 1` for a width-`pw` pulse or `2·w − 1` for a duty-`w` square). Prefer
-this for the dominant, known DC source.
+That is not a bug; asymmetry is *how you make even harmonics*, and Bias controls
+exist for exactly that. **The even harmonics are the feature; the DC is the
+by-product.** A blocker removes only 0 Hz and leaves the harmonics completely
+intact (measured: Diode 2nd harmonic 3378.1 → 3379.4 through a 10 Hz blocker),
+so removing DC never defeats the control's purpose. Say this out loud before
+anyone objects that "the DC *is* the effect" — it isn't.
 
-**(b) One-pole DC-blocking high-pass — general catch-all.**
+**Watch for asymmetry in TIME being mistaken for asymmetry in AMPLITUDE.**
+Pedal Plaits' WaveshapingEngine has a MORPH control literally called
+`asymmetry`, which skews a triangle from fast-rise/slow-fall to the reverse. It
+looks like a prime suspect and it is *completely DC-free* — an asymmetric
+triangle still has a **symmetric, uniform value distribution**, and every stage
+after it (tanh, cubic, `sin()`, TriFold) is odd. Verified numerically across the
+whole TIMBRE × MORPH × HARMONICS space: DC = 0.00000 everywhere. Skewing *when*
+the waveform reaches a value doesn't change *which* values it visits.
+
+### 43.2 The DC sources, catalogued
+
+- **Rectangular waveforms.** A pulse of width `w` has mean `2w − 1`. This is the
+  most common source and the largest: a 26% pulse sits at −0.48; Pedal Plaits'
+  VA pulse bottoms out at 5% width → **−0.9**. Applies equally to sub-oscillators
+  (a 25%-duty "narrow sub" carries −0.5) and to any non-50% square.
+- **Notched / gated saws.** Pedal Plaits' VA "notched saw" holds +1 over the last
+  `w` of the period and follows the saw elsewhere, integrating to `w²` (+0.16 at
+  MORPH=1).
+- **Asymmetric nonlinearities** — see §43.1. Level-dependent, not a constant.
+- **Bias before a nonlinearity** — the deliberate case; also level-dependent.
+- **Phase-accumulator mistakes.** Pedal Plaits' FM "sub-oscillator" was
+  `sin(2π · (phase · 0.5))`. Since `phase` wraps 0→1, the argument only ever
+  sweeps 0→π: an always-positive half-sine hump at the *same* frequency as the
+  carrier, mean **2/π ≈ 0.637**. It was not a sub-octave at all. If a "half
+  frequency" oscillator is derived by halving a wrapping phase rather than
+  running its own accumulator, it is rectified, not divided. **A large DC often
+  means a bug, not a tone — look for the bug first.**
+- **Not from:** band-limited saw/tri, 50% square, sine-FM, additive/iFFT engines
+  that skip the DC bin, or linear filters/EQ/dynamics (unipolar gain × a
+  zero-mean signal stays zero-mean).
+
+**And why the synth's own filter won't save you:** a low-pass VCF — Moog ladder,
+TPT, Chamberlin — has **unity gain at DC**, so the offset passes straight
+through. Resonance lifts the region near cutoff, not DC. On real hardware a
+series capacitor AC-couples the output and the DC never reaches the converters.
+A software port has no such cap unless you add one.
+
+**Consequences.** The offset (a) eats headroom asymmetrically — a −0.5 pedestal
+plus a ±0.5 swing clips one rail while the other never gets near it, costing
+~4 dB (Pedal SH101, measured, was clipping at −1.0 dBFS with the positive rail
+idle); (b) thumps on bypass, mute and note transitions as the DC steps; and (c)
+under a swept width/bias, produces sub-audible DC *wander* that pumps the woofer.
+
+### 43.3 Two ways to remove it
+
+**(a) Analytic removal at the source — exact, stateless, rate-independent.**
+When the DC has a closed form, subtract it where the sample is generated:
 
 ```csharp
-// y[n] = x[n] - x[n-1] + R*y[n-1] ;  zero at DC (z=1), pole at z=R.
+pulse -= (2f * pw - 1f);            // pulse of width pw
+sub   -= (2f * subWidth - 1f);      // same rule for a sub / any square
+morph -= wNotch * notchWidth * notchWidth;   // notched saw: mean w²
+```
+
+Zero-mean **by construction, every sample**. It tracks a swept width exactly and
+instantly — no filter, no state, no settle, **no corner-frequency tradeoff**, so
+it kills PWM wander at any LFO rate. Prefer this for the dominant, known source.
+
+**(b) One-pole DC-blocking high-pass — the general catch-all.**
+
+```csharp
+// y[n] = x[n] - x[n-1] + R*y[n-1];  zero at DC (z=1), pole at z=R.
 float y = x - _xPrev + _r * _yPrev;
 _xPrev = x;
 if (y > -1e-20f && y < 1e-20f) y = 0f;   // denormal flush (§30)
@@ -3417,78 +3471,181 @@ _yPrev = y;
 // _r = MathF.Exp(-2f*MathF.PI*fcHz/sr), recomputed on sample-rate change (§29)
 ```
 
-Corner `fc ≈ 5–10 Hz`: low enough to leave the lowest musical fundamentals
-(and all but sub-sonic sub-osc content) intact, high enough to settle quickly.
-It removes **true DC completely** regardless of source — so it also mops up
-waveshaper DC, filter-init transients, and PolyBLEP residue that (a) misses.
-Its one limit: it's first-order, `|H(f)| = f/√(f² + fc²)`, so a *fast* LFO→PWM
-wander whose fundamental sits near or above the corner is only partly removed
-(at ~1 Hz it passes ~10%; at ~9 Hz, ~65%). That residual is subsonic — cone
-excursion, not tone — so it's usually a non-issue, but it's why (a) is worth
-adding when the source is a swept pulse.
+Corner `fc ≈ 10 Hz` (5 Hz if a deep sub matters): low enough to leave the lowest
+musical fundamentals intact (~0.1 dB at 60 Hz), high enough to settle in ~16 ms.
+Removes **true DC completely, regardless of source** — which is why it's the
+*only* option for level-dependent DC, where there is no constant to subtract.
 
-**Recommended: use both.** Analytic removal at the source for the dominant
-known component, the blocker downstream as the safety net for everything else.
+Its one limit is that it's first-order: `|H(f)| = f/√(f² + fc²)`, so a *fast*
+swept-width wander whose fundamental approaches the corner is only partly
+removed (at ~1 Hz it passes ~10%; at ~9 Hz, ~65%). That residual is subsonic —
+cone excursion, not tone — but it's precisely why (a) is worth adding when the
+source is a swept pulse.
 
-### 43.3 Placement — before the VCA, and per voice
+**Use both.** Analytic at the source for the dominant known component, blocker
+downstream as the safety net. Measured on Pedal Juno106 at a deliberately hard
+3.6 Hz PWM rate: blocker alone left 0.115 RMS of sub-20 Hz wander; adding the
+analytic term cut it to 0.0018 — a further 65×.
 
-Block the DC **before the amplitude stage**, not after. The offset is a
-property of the *tone*, not the envelope, so pre-VCA the blocker strips a
-constant DC from a constant-DC signal and stays at steady state across
-attack/decay/sustain/release. Post-VCA it would instead see `DC·gain(t)` —
-an envelope-shaped ramp from 0 to `−C·peak` and back — and high-pass *that*,
-clicking on every note-on/off.
+### 43.4 TRAP: a static compensation constant cannot track a nonlinearity
 
-In a **polyphonic** synth put one blocker in each voice, on that voice's
-filter output before its VCA — not a single blocker on the summed bus. The
-bus DC is `Σ (voice_DC × voice_env)`, which pumps as voices enter and leave;
-a per-voice blocker removes each voice's DC while it's still a clean constant.
+Pedal HDist tried to cancel its bias-induced DC like this:
 
-### 43.4 State handling — run it continuously, don't reset per note
+```csharp
+_biasComp = Shapers.Apply(_biasOffset, Type);   // the shape of the bias ALONE
+shaped   -= _biasComp;
+```
 
-Do **not** clear the blocker state on note-on. Resetting to zero makes the
-first sample pass the full DC, which then decays over the corner's time
-constant (~16 ms at 10 Hz) — an audible note-on "whoomp" under a fast attack.
-Left running, the state carries the previous note's steady-state DC removal;
-since successive notes carry a similar offset, the transition is seamless.
-This mirrors the hardware cap holding its charge between notes.
+That is the shaper's output at the bias point **with no signal present** — a
+"centre the resting operating point" gesture. It is correct only in silence.
+Under signal the true offset is `E[ f(x·drive + bias) ]` taken over the input's
+own distribution, and **for a nonlinear `f`, `E[f(x+b)] ≠ f(b)`**. So the static
+term mis-tracks, and at high drive it *overshoots so badly it creates most of the
+DC it was meant to remove*:
 
-- Reset the state only on a **full/panic reset** or machine init — and
-  because the oscillator/filter are typically reset there too, that's the one
-  place a fresh settle is fine (and masked by any note-on anti-click ramp).
+| Sine shaper, drive 4, max bias | DC |
+|---|---|
+| raw | −0.28 |
+| **after the static "correction"** | **−1.09** ← past full scale |
+
+And because `Apply(0, type) == 0` for every shaper, at bias = 0 the term was
+*identically zero* — so it never touched the DC from the two intentionally
+asymmetric shapers (Tube +0.07, Diode +0.13) at all. Wrong in both directions.
+
+**Rule: if the DC depends on the signal, only a blocker can remove it.** Any
+"subtract a constant computed from the parameters" scheme is a static
+approximation of a dynamic quantity, and it will be wrong exactly when the
+machine is working hardest. A blocker after the nonlinearity took all eight
+shapers to **0.00000** at every bias and drive.
+
+### 43.5 TRAP: feedback loops AMPLIFY DC
+
+A DC offset inside a feedback path doesn't just persist, it *accumulates*. Two
+instances from the sweep:
+
+- **Pedal Folder.** The wavefolder's loop is `z = tanh(x_drv) + fb · tanh(y_prev)`.
+  With Bias engaged the loop re-injects the offset each sample; at `fb = 0.9` and
+  max bias the DC reached **1.34 — beyond full scale before the audio is even
+  added**, versus ~0.72 with feedback off.
+- **Karplus-Strong** (Pedal Plaits' InharmonicString). The loop's one-pole LP has
+  **unity gain at DC**, so with feedback `g ≈ 0.999` any DC in the noise-burst
+  exciter is amplified by roughly `g/(1−g)` — hundreds of times — and decays only
+  slowly. Each burst's mean is random, so there's no constant to subtract; this
+  is blocker territory. (Ideally the blocker goes *in* the loop, but that alters
+  the tuning/tone, so an output blocker is the conservative choice unless the
+  loop is visibly sagging.)
+
+When auditing, always ask: *does any DC here land back on the input of the thing
+that made it?*
+
+### 43.6 TRAP: in an STFT, do NOT reflexively "skip the DC bin"
+
+The additive/iFFT precedent (Pedal invFFT guards `k = 0` in its deposit loop) is
+about a **synth** that never *writes* to bin 0. A **processor** that must
+reconstruct an input is a completely different situation, and copying the
+guard blindly will wreck it.
+
+Pedal FFT's band-0 loop starts at `k = 0`, so the DC bin gets the band's tanh
+drive and tilt gain applied to it, and `re[0]` is never zeroed. Real, but the
+consequence is small: ~−0.004 residual DC. The natural fix — exclude bin 0 from
+the band loop — **is wrong**:
+
+> At the default FFT size (512 @ 44.1 kHz) the **bin width is ~86 Hz**, so bin 0
+> spans roughly **0–43 Hz** and a 60 Hz kick leaks heavily into it. Bin 0 is not
+> "just DC" — it carries real sub/kick energy, which is precisely what band 0
+> ("Sub/Kick") exists to saturate. Measured: skipping bin 0 changes the
+> 40–120 Hz band by **+21 dB**. That's a gross sonic regression, not a fix.
+
+**Rule: at short FFT sizes the DC bin contains musical sub-bass. Remove the DC
+in the TIME domain instead**, where 0 Hz separates cleanly from 43–86 Hz
+content. A 10 Hz blocker on the output took the residual DC to +0.00001 while
+changing the kick band by **−0.13 dB** (inaudible).
+
+The bin-domain guard is right only when nothing musical lives in bin 0 — i.e.
+in a *synthesis* engine that chooses what to put there.
+
+### 43.7 Placement — before the VCA, per voice, and wet-path-only for effects
+
+**Generators: block before the amplitude stage.** The offset is a property of
+the *tone*, not the envelope, so pre-VCA the blocker strips a constant DC from a
+constant-DC signal and stays at steady state across the whole envelope. Post-VCA
+it would instead see `DC · gain(t)` — an envelope-shaped ramp — and high-pass
+*that*, clicking on every note-on/off. The Plaits FM sub bug was this failure in
+the wild: a 0.637 pedestal enveloped by the LPG, thumping on every note.
+
+**Polyphonic: one blocker per voice**, on that voice's filter output before its
+VCA — not one on the summed bus. The bus DC is `Σ (voice_DC × voice_env)`, which
+pumps as voices enter and leave; per-voice, each offset is still a clean constant
+when it's removed. Cost is trivial (2 floats, ~2 flops per voice).
+
+**Effects: block the WET path only**, after the nonlinearity and before the
+dry/wet mix. The machine then removes only the DC *it* generates and stays
+transparent to the dry signal. An effect should not silently high-pass audio that
+is merely passing through it — that's the source's job, or a dedicated utility's.
+
+### 43.8 State handling — run it continuously, don't reset per note
+
+Do **not** clear the blocker state on note-on. Resetting to zero makes the first
+sample pass the full DC, which then decays over the corner's time constant
+(~16 ms at 10 Hz) — an audible note-on "whoomp" under a fast attack. Left
+running, the state carries the previous note's steady-state removal; successive
+notes carry a similar offset, so the transition is seamless. This mirrors the
+hardware cap holding its charge between notes.
+
+- Reset only on **full/panic reset**, machine init, or an **engine/algorithm
+  switch** (a stale DC from the previous engine shouldn't bleed into the new
+  one's first buffer).
 - On **sample-rate change** (§29) recompute `R` but *don't* clear state — the
-  held sample is a valid recent amplitude, so continuing avoids a settle
-  transient at the new rate.
-- **Flush denormals** on the output state (§30): the pole at `R < 1` decays
-  `y` toward zero when the voice quietens, so without the flush the tail can
-  slip into denormal range and trap.
+  held sample is a valid recent amplitude.
+- **Flush denormals** on the output state (§30): the pole at `R < 1` decays `y`
+  toward zero whenever the voice quietens, and these machines idle constantly.
 
-### 43.5 Measured evidence
+Note the cold-start settle is real but confined: measured on the SH101, the first
+note after a cold start shows a ~0.03 RMS sub-20 Hz blip for ~50 ms (subsonic,
+masked by the attack), and **every subsequent note has none**. That is the whole
+point of not resetting.
 
-- **Pedal SH101** (narrow pulse + 25% sub, live capture): raw output DC
-  −0.4985, clipping one rail at −1.0 dBFS with ~4 dB of headroom lost. A
-  10 Hz blocker pre-VCA took DC to −0.00005 and recovered the headroom (no
-  clipping). Confirmed against the same voice routed through Pedal Shaper —
-  whose own DC blocker independently read 0.0000 — isolating the source to the
-  dry oscillator path.
-- **Pedal Juno106** (PWM patch, `Lead — PWM`, C2, LFO pushed to ~3.6 Hz):
-  raw static +0.44 plus ±0.6 wander → blocker-only left ~0.11 RMS sub-20 Hz
-  wander → adding analytic `pulse -= 2·pw−1` cut it to ~0.0018 RMS (the
-  wander made sub-audible). Both together ship in v1.7.
+### 43.9 Measured evidence (the 2026-07 sweep)
 
-### 43.6 When to skip it
+| Machine | Before | After | Fix |
+|---|---|---|---|
+| **Pedal SH101** | **−0.9765** (26% pulse + 25% sub), clipping at −1.0 dBFS, ~4 dB headroom lost | +0.003 | [A] on pulse *and* sub, + [B] |
+| **Pedal Juno106** | −0.45 static, ±0.6 wander (PWM) | ~0, wander 0.0018 RMS | [A] `2·pw−1` + [B] per-voice |
+| **Pedal Plaits** (VA) | **−0.45 … +0.08** across TIMBRE×MORPH | 0.0000 | [A] pulse + notch `w²` |
+| **Pedal Plaits** (FM AUX) | **+0.637** — a bug, not a sub | 0 | real half-rate accumulator |
+| **Pedal Folder** | **+1.34** at max bias + feedback (past FS) | +0.00004 | [B] wet path |
+| **Pedal HDist** | **−1.09** — *created* by its own static "fix" | 0.00000 | [B] replacing the static term |
+| **Pedal FFT** | −0.004 | +0.00001 | [B] time-domain (NOT bin 0) |
 
-Don't add a blocker to a voice with no DC source — a symmetric oscillator
-(sine, 50% square, band-limited saw/tri), sine-FM, or an additive/iFFT engine
-that skips the DC bin is already zero-mean, and a spurious HP only thins the
-low end for nothing. Audit by the source, not reflexively.
+Audited **clean, no action**: Plaits' Waveshaping / Harmonic / PhaseDistortion /
+Wavetable; HDist's six odd shapers; Folder at bias = 0; all linear filters/EQ,
+dynamics, time-FX, sine-FM, and the utility/control machines.
 
-### 43.7 Discovered / cross-references
+### 43.10 When to skip it
 
-Written up from pedal-sh101 v1.3 (blocker) and pedal-juno106 v1.7 (blocker +
-analytic). Pedal Faze-R already carried a DC blocker in its tone-filter stage
-from v1.0 (its bend shapes are asymmetric); Pedal Shaper has an automatic
-~30 Hz output DC blocker for its Bias/asymmetric shapes; Pedal invFFT is
-DC-free by construction via the `k=0` bin guard. Depends on §29 (sample-rate
-change / coefficient recompute), §30 (denormal flush of the blocker state),
-and §38 (±32768 output scale, applied after DC removal).
+Don't add a blocker where there's no DC source. Apply the §43.1 odd-function test
+first: a symmetric oscillator (sine, 50% square, band-limited saw/tri), sine-FM,
+sums of sines, an additive/iFFT engine that skips the DC bin, or any purely
+linear stage is already zero-mean, and a spurious HP only thins the low end for
+nothing. **Audit by the source, not reflexively** — the sweep cleared as many
+engines as it fixed.
+
+Also skip it for **content-dependent** machines (samplers, convolution): they
+don't *create* DC, they only pass what's in the sample/IR. Fix the content.
+
+### 43.11 Discovered / cross-references
+
+Written from pedal-sh101 v1.3/v1.4, pedal-juno106 v1.7, and the 2026-07 DC sweep
+(pedal-fft v2.1, pedal-plaits v1.13, pedal-folder v1.2, pedal-hdist v1.2).
+
+Pre-existing good examples: **Pedal Shaper** has an automatic ~30 Hz output DC
+blocker for its Bias/asymmetric shapes (note the hardcoded `0.997` coefficient is
+tuned for 44.1 kHz — compute `R` from the actual rate, don't copy it); **Pedal
+Faze-R** carries a blocker in its tone-filter stage from v1.0; **Pedal invFFT** is
+DC-free by construction via its `k=0` guard (but see §43.6 before copying that
+idea into a processor); **Pedal Plaits' Wavetable** engine already subtracts the
+mean in `NormaliseRaw`, required for its integrated/cumsum tables.
+
+Depends on §29 (sample-rate change / coefficient recompute), §30 (denormal flush
+of the blocker state), §31 (SVF impulse-response normalisation — the same
+resonators), and §38 (±32768 output scale, applied after DC removal).
