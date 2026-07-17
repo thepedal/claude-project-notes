@@ -96,6 +96,17 @@ three weeks — a reminder to resolve these flags at the next pull, not later.**
 no multi-track pvalues collision; stamp the build it was tested on). Perf was
 measured (PP2 ENGINE ~3% flat; the DSP is free next to the host floor).
 
+**Manual add (2026-07-18):** added **pedal-osc** (v1.0, new) with a dedicated
+addendum (`ReBuzz_ManagedMachine_Notes_PedalOsc.md`, `Addendum=Y`). An
+effect-class tap: passes audio through unchanged, measures block RMS, and
+streams it as OSC/UDP to an external OpenGL renderer — Phase 1 of the
+ReBuzz→video bridge (`ReBuzz_Video_Bridge_Brief`). Surfaced a general load rule
+now recorded in the addendum §1: **a managed machine with zero `[ParameterDecl]`
+parameters is rejected at scan** (`"at least one parameter is required"`) — worth
+promoting to Build notes alongside the Core §9 declaration rules. `ReBuzz vs`
+left `?` — stamp the build it was tested on. Single-machine edit, not a full
+GitHub pull — `Last refreshed` above is unchanged.
+
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
 machines need touching?" by grepping for the relevant Core/Build
@@ -131,7 +142,7 @@ below, separate from the dev/impact-analysis roster.
 
 ---
 
-## Roster (45 machines)
+## Roster (46 machines)
 
 | Repo                    | Type       | Last pushed | ReBuzz vs     | Addendum | Description                                                |
 |-------------------------|------------|-------------|---------------|----------|------------------------------------------------------------|
@@ -166,6 +177,7 @@ below, separate from the dev/impact-analysis roster.
 | pedal-M1                | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice poly dual-PCM-osc synth, Korg M1 voice architecture|
 | pedal-mcomp             | effect     | 2026-05-19  | 1819-preview  |          | Multi-band compressor (Core mentions v1.1 GUI build)       |
 | pedal-muter             | control    | 2026-06-17  | ?             | Y        | Mute other machines                                        |
+| pedal-osc               | effect     | 2026-07-18  | ?             | Y        | Master RMS → OSC/UDP tap (audio-reactive video bridge, Phase 1) |
 | pedal-plaits            | generator  | 2026-07-11  | 1819-preview  |          | Port of Mutable Instruments Plaits                         |
 | pedal-plate             | effect     | 2026-05-24  | ?             |          | Plate reverb                                               |
 | pedal-presetter         | control    | 2026-06-07  | ?             |          | Change presets on target machines                          |
@@ -218,7 +230,7 @@ code under another licence (Licensing §2, §4).
 | pedal-hdist   | 1.2  | GPL-3.0 | Y | `Author` corrected from the `WDE` template leftover |
 | pedal-plaits  | 1.13 | **MIT** | Y | **Not GPL** — derives from MIT Plaits. `LICENSE` carries Émilie Gillet's 2016 copyright verbatim plus third-party notices for `PlaitsWavetables.cs` and `Resources/waves.bin`; MIT notice added to the direct-port file; Mutable credit surfaced in About. This closed a real MIT violation (the notice was missing entirely) |
 
-### Not yet audited (39 machines)
+### Not yet audited (40 machines)
 
 Every other machine in the roster is **unaudited on both counts** — assume no
 `LICENSE` file and no About window until checked. This is a gap to work through,
@@ -230,7 +242,7 @@ not a claim that they're non-compliant:
 `pedal-Faze-R`, `pedal-filter`, `pedal-fm`, `pedal-follower`, `pedal-gain`,
 `pedal-gain-multi`, `pedal-gate`, `pedal-hallverb`, `pedal-invFFT`,
 `pedal-LFmono`, `pedal-lfo`, `pedal-limit`, `pedal-M1`, `pedal-mcomp`,
-`pedal-muter`, `pedal-plate`, `pedal-presetter`, `pedal-profiler`,
+`pedal-muter`, `pedal-osc`, `pedal-plate`, `pedal-presetter`, `pedal-profiler`,
 `pedal-profiler2`, `pedal-ReBuzz-patcher`, `pedal-retrig`, `pedal-shaper`,
 `pedal-song-writer`, `pedal-stem-writer`, `pedal-tracker`, `pedal-zplane`
 
@@ -263,7 +275,7 @@ rest — it's what ReBuzz displays as the machine's author.
 
 ## Machines with detailed addenda
 
-Eleven machines have their own notes file, listed in table order. To support
+Twelve machines have their own notes file, listed in table order. To support
 impact analysis, each should grow a `## Depends on` section listing the
 Core/Build §-references it relies on. The lists below are seeds — flesh
 out from each addendum as time allows.
@@ -360,6 +372,20 @@ out from each addendum as time allows.
   (`SendControlChanges()` after writing to a target), §8 (control
   machines tick first).
 
+### pedal-osc — `ReBuzz_ManagedMachine_Notes_PedalOsc.md`
+- Effect-class tap: pass-through + block-RMS → OSC/UDP to an external OpenGL
+  renderer (Phase 1 of the ReBuzz→video bridge). Reusable findings: the
+  ≥1-parameter load rule (addendum §1), all-network-I/O-off-the-audio-thread
+  via a background sender thread (§3), and a hand-rolled single-dll OSC encoder
+  (§5).
+- Depends on: Build §1.2, §1.3 (deploy → `Gear\Effects` via `OutputPath`), §2,
+  §4 (`NoWarn MSB3277`), §6.2/§6.4 (both SDK usings — the
+  `BuzzGUI.Interfaces`-alone footgun), §7.2 (EffectBlock `Work`); Core §2
+  (effect classification), §8 (setters on the audio thread), §9 (`ParameterDecl`
+  + the ≥1-parameter load rule), §11 (`MachineDecl`), §34 (audio-thread budget →
+  I/O off-thread); PedalComp §1 (±32768 sample scale). net10.0-windows; not
+  pinned to a ReBuzz preview — stamp the build it was tested on.
+
 ### pedal-profiler2 — `ReBuzz_ManagedMachine_Notes_PedalProfiler2.md`
 - Per-machine inspector; the May 2026 dropout investigation.
 - Depends on: Core §§34–41 (audio-thread chunking,
@@ -438,7 +464,7 @@ block of each into the song-writer's `refs/`).
   findings worth recording, or when its setup deviates from Core/Build
   conventions in a way future-you will need to remember. (Newest without
   one: **pedal-bench**.)
-- **25 machines have an unknown ReBuzz version.** Not necessarily a
+- **26 machines have an unknown ReBuzz version.** Not necessarily a
   problem, but when ReBuzz changes in a way that might affect them,
   the answer to "is this still good?" is "build it and find out."
   Stamping the version in each machine's `README.md` would close this
