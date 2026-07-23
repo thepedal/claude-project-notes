@@ -685,6 +685,32 @@ host's object graph:
   ReBuzz uses to describe parameters
 - `BuzzNote` — the static constants helper for raw byte note values
 
+**Not in either namespace — `Global`.** `Global` (the static helper exposing
+`Global.Buzz`, used by some SDK examples for host-wide events such as
+`Song.MachineRemoved`) lives in a **third assembly**, `BuzzGUI.Common`
+(`BuzzGUI.Common/Global.cs`, namespace `BuzzGUI.Common`). The house csproj
+template does not reference `BuzzGUI.Common`, so `Global` fails to resolve with
+CS0103 no matter which of the two SDK usings are present — a confusing error,
+because the symbol looks like it should be part of the SDK surface.
+
+If a machine genuinely needs it, add the reference *and* the using:
+
+```xml
+<Reference Include="BuzzGUI.Common">
+  <HintPath>$(BuzzDir)\BuzzGUI.Common.dll</HintPath>
+  <Private>false</Private>
+</Reference>
+```
+
+```csharp
+using BuzzGUI.Common;   // Global
+```
+
+Note this pulls WPF types in transitively, which may mean `<UseWPF>true</UseWPF>`.
+Before reaching for it, check whether the need is real: machine teardown does
+**not** require `Global` — implementing `IDisposable` is the supported hook
+(§11.2). Pedal OSC dropped its `Global` dependency entirely for this reason.
+
 ### 6.2 The mandatory using directives
 
 Every managed machine's main file (the one with `[MachineDecl]` on a
@@ -1146,3 +1172,88 @@ The rule is conservative — even a single double quote in a commit
 message can trip the shell-escape path. Default to the alternatives;
 add quotes back only if there's a specific reason a particular phrase
 needs them, which is rare.
+
+---
+
+## 11. Load validation — why a machine can silently fail to appear
+
+A managed machine can compile cleanly, deploy to the right gear folder, and still
+never show up in the machine browser. ReBuzz validates each DLL as it scans, and
+a machine that fails validation is **dropped from the list with no dialog**. The
+only diagnostic is the Debug Console (**Ctrl+D**), which carries the exception.
+
+Symptom pattern to recognise: *build succeeds, dll is present and freshly
+timestamped in `Gear\…`, ReBuzz has been fully restarted, and the machine is
+still absent.* That is a validation rejection, not a deployment problem — go
+straight to the Debug Console.
+
+### 11.1 At least one parameter is required
+
+The rule that is easiest to trip because nothing in the SDK surface hints at it:
+
+> **Every managed machine must declare at least one `[ParameterDecl]` property.**
+
+A machine with none is rejected at scan time:
+
+```
+System.Exception: at least one parameter is required
+   at ReBuzz.ManagedMachine.ManagedMachineDLL.LoadManagedMachine(String path)
+   at ReBuzz.FileOps.MachineDLLScanner.ValidateDll(...)
+   at ReBuzz.FileOps.MachineDLLScanner.ValidateDlls(...)
+```
+
+This bites the machine classes that most naturally have nothing to expose:
+pass-through taps and analysers, pure routers, control machines driven entirely
+by peer state, and do-nothing scaffolds used to test the build pipeline.
+
+Rather than declaring a dummy parameter, prefer one that earns its place — an
+amount, a rate, a mode. It costs nothing and gives the machine a usable
+parameter window on day one. (Discovered building **pedal-osc**, a pass-through
+OSC tap that legitimately had no parameters; see that machine's addendum §1.)
+
+Related declaration rules that also cause silent rejection or silent
+misbehaviour are in Core §9 — `MinValue` must be ≥ 0, `MaxValue` ≤ 254 to avoid
+colliding with the NoValue sentinel, and `DefValue` must sit inside the declared
+range.
+
+### 11.2 Teardown — `IDisposable` is the supported hook
+
+Not a validation rule, but the same class of "confirmed from engine source rather
+than guessed" fact, and it belongs where machine authors will look for it.
+
+A machine holding a resource that outlives a `Work()` call — a background thread,
+socket, file handle, native allocation — needs a teardown hook. **Implement
+`IDisposable`.** Deleting a machine runs:
+
+```
+MachineManager.DeleteMachine(machine)
+  → ManagedMachineHost.Release()
+      → if (machine is IDisposable) ((IDisposable)machine).Dispose();
+```
+
+with a source comment stating that CLR/disposable machines must have `Dispose()`
+called to free their resources properly. So `Dispose()` is reliably invoked on
+removal, and no subscription to host events is needed. Background threads should
+still be created with `IsBackground = true` as a backstop for process exit.
+
+This supersedes any pattern based on subscribing to `Global.Buzz.Song.MachineRemoved`
+for cleanup — which additionally requires the `BuzzGUI.Common` reference the house
+template omits (§6.1).
+
+### 11.3 Checklist when a machine does not appear
+
+In order, cheapest first:
+
+1. **Fully restart ReBuzz.** Gear folders are scanned and managed assemblies
+   JIT-loaded once per session; a dll dropped in while ReBuzz is running is
+   invisible until restart. Reloading a song is not enough.
+2. **Confirm the dll is where you think, and fresh.**
+   `Get-ChildItem "$env:ProgramFiles\ReBuzz\Gear\Effects\<name>.NET.dll" | Select FullName, LastWriteTime`
+3. **Confirm the `.NET` AssemblyName suffix** — it routes the file to the managed
+   loader; without it ReBuzz attempts a native `LoadLibrary` which fails (§2).
+4. **Confirm the right category** — effects and generators scan different
+   folders, and the browser name comes from the filename, not `MachineDecl.Name`.
+5. **Open the Debug Console (Ctrl+D)** and look for a load exception — the
+   ≥1-parameter rejection above, a `ParameterDecl` range violation (Core §9), or
+   a type-load failure from a missing dependency dll.
+

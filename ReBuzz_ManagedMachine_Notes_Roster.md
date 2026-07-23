@@ -103,9 +103,15 @@ streams it as OSC/UDP to an external OpenGL renderer — Phase 1 of the
 ReBuzz→video bridge (`ReBuzz_Video_Bridge_Brief`). Surfaced a general load rule
 now recorded in the addendum §1: **a managed machine with zero `[ParameterDecl]`
 parameters is rejected at scan** (`"at least one parameter is required"`) — worth
-promoting to Build notes alongside the Core §9 declaration rules. `ReBuzz vs`
-left `?` — stamp the build it was tested on. Single-machine edit, not a full
-GitHub pull — `Last refreshed` above is unchanged.
+promoting to Build notes alongside the Core §9 declaration rules. Single-machine
+edit, not a full GitHub pull — `Last refreshed` above is unchanged.
+
+**Manual update (2026-07-24):** **pedal-osc** to **v1.1** — adds beat/bar phase
+(derived from `MasterInfo` + `Song.PlayPosition`) and moves the wire format to an
+OSC bundle of addressed floats. `ReBuzz vs` stamped **1835-preview**. The
+≥1-parameter load rule is now promoted to **Build §11**, and Build §6.1 records
+that `Global` lives in `BuzzGUI.Common` (a third assembly the house csproj does
+not reference). Addendum rewritten for v1.1.
 
 The point of this file is impact analysis. When something changes in
 ReBuzz, this file plus the per-machine addenda lets you answer "which
@@ -177,7 +183,7 @@ below, separate from the dev/impact-analysis roster.
 | pedal-M1                | generator  | 2026-05-23  | 1827-preview  | Y        | 8-voice poly dual-PCM-osc synth, Korg M1 voice architecture|
 | pedal-mcomp             | effect     | 2026-05-19  | 1819-preview  |          | Multi-band compressor (Core mentions v1.1 GUI build)       |
 | pedal-muter             | control    | 2026-06-17  | ?             | Y        | Mute other machines                                        |
-| pedal-osc               | effect     | 2026-07-18  | ?             | Y        | Master RMS → OSC/UDP tap (audio-reactive video bridge, Phase 1) |
+| pedal-osc               | effect     | 2026-07-24  | 1835-preview  | Y        | Level + beat/bar phase → OSC bridge for audio-reactive video |
 | pedal-plaits            | generator  | 2026-07-11  | 1819-preview  |          | Port of Mutable Instruments Plaits                         |
 | pedal-plate             | effect     | 2026-05-24  | ?             |          | Plate reverb                                               |
 | pedal-presetter         | control    | 2026-06-07  | ?             |          | Change presets on target machines                          |
@@ -373,18 +379,21 @@ out from each addendum as time allows.
   machines tick first).
 
 ### pedal-osc — `ReBuzz_ManagedMachine_Notes_PedalOsc.md`
-- Effect-class tap: pass-through + block-RMS → OSC/UDP to an external OpenGL
-  renderer (Phase 1 of the ReBuzz→video bridge). Reusable findings: the
-  ≥1-parameter load rule (addendum §1), all-network-I/O-off-the-audio-thread
-  via a background sender thread (§3), and a hand-rolled single-dll OSC encoder
-  (§5).
+- Effect-class tap: pass-through + level + **beat/bar phase** → OSC bundle to an
+  external OpenGL renderer (the ReBuzz→video bridge). Reusable findings: the
+  ≥1-parameter load rule (addendum §1, now Build §11); deriving continuous beat
+  phase from `MasterInfo` + `Song.PlayPosition`, and which host-graph getters are
+  audio-thread safe (§3); all-network-I/O-off-the-audio-thread via a background
+  sender fed by a 4-slot lock-free ring (§6); a hand-rolled single-dll OSC
+  message/bundle encoder (§5); and confirmation that `IDisposable` is the correct
+  teardown hook — `DeleteMachine` → `Release()` → `Dispose()` (§9).
 - Depends on: Build §1.2, §1.3 (deploy → `Gear\Effects` via `OutputPath`), §2,
-  §4 (`NoWarn MSB3277`), §6.2/§6.4 (both SDK usings — the
-  `BuzzGUI.Interfaces`-alone footgun), §7.2 (EffectBlock `Work`); Core §2
+  §4 (`NoWarn MSB3277`), §6.1/§6.2/§6.4 (both SDK usings; `Global` in
+  `BuzzGUI.Common`), §7.2 (EffectBlock `Work`), §11 (load validation); Core §2
   (effect classification), §8 (setters on the audio thread), §9 (`ParameterDecl`
-  + the ≥1-parameter load rule), §11 (`MachineDecl`), §34 (audio-thread budget →
-  I/O off-thread); PedalComp §1 (±32768 sample scale). net10.0-windows; not
-  pinned to a ReBuzz preview — stamp the build it was tested on.
+  rules), §11 (`MachineDecl`), §34 (audio-thread budget → I/O off-thread);
+  PedalComp §1 (±32768 sample scale). net10.0-windows; built and run against
+  1835-preview.
 
 ### pedal-profiler2 — `ReBuzz_ManagedMachine_Notes_PedalProfiler2.md`
 - Per-machine inspector; the May 2026 dropout investigation.
@@ -464,7 +473,7 @@ block of each into the song-writer's `refs/`).
   findings worth recording, or when its setup deviates from Core/Build
   conventions in a way future-you will need to remember. (Newest without
   one: **pedal-bench**.)
-- **26 machines have an unknown ReBuzz version.** Not necessarily a
+- **25 machines have an unknown ReBuzz version.** Not necessarily a
   problem, but when ReBuzz changes in a way that might affect them,
   the answer to "is this still good?" is "build it and find out."
   Stamping the version in each machine's `README.md` would close this
